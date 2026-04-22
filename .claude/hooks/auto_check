@@ -1,0 +1,5 @@
+#!/bin/bash
+FILE_PATH=$(jq -r '.tool_input.file_path // empty' <&0)
+[[ "$FILE_PATH" == *.rs ]] && cargo fmt && cargo clippy --all-targets --all-features -- -D warnings
+[[ "$FILE_PATH" == *.md ]] && command -v rumdl &>/dev/null && rumdl check .
+exit 0
