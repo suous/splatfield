@@ -98,8 +98,8 @@ The full projection from world-space covariance to screen space in a
 single equation:
 
 $$
-\boldsymbol{\Sigma}_{2d} = \mathbf{J}\, \boldsymbol{\Sigma_{cam}}\, \mathbf{J}^T =
-\mathbf{J}\, \mathbf{W}\, \boldsymbol{\Sigma_{3D}}\, \mathbf{W}^T \mathbf{J}^T
+\boldsymbol{\Sigma}_{2d} = \mathbf{J} \boldsymbol{\Sigma_{cam}} \mathbf{J}^T =
+\mathbf{J} \mathbf{W} \boldsymbol{\Sigma_{3D}} \mathbf{W}^T \mathbf{J}^T
 $$
 
 where $\mathbf{W} = \mathbf{R}_{view}$ is the view rotation.
@@ -110,7 +110,7 @@ This factors into two stages:
 First rotate the 3D covariance into camera coordinates:
 
 $$
-\boldsymbol{\Sigma}_{cam} = \mathbf{W}\, \boldsymbol{\Sigma_{3D}}\, \mathbf{W}^T
+\boldsymbol{\Sigma}_{cam} = \mathbf{W} \boldsymbol{\Sigma_{3D}} \mathbf{W}^T
 $$
 
 $$
@@ -132,11 +132,11 @@ Taking partial derivatives with respect to the camera-space coordinates:
 
 $$
 \mathbf{J} = \begin{pmatrix}
-\frac{\partial u}{\partial x} & \frac{\partial u}{\partial y} & \frac{\partial u}{\partial z} \\[6pt]
+\frac{\partial u}{\partial x} & \frac{\partial u}{\partial y} & \frac{\partial u}{\partial z} \\
 \frac{\partial v}{\partial x} & \frac{\partial v}{\partial y} & \frac{\partial v}{\partial z}
 \end{pmatrix}
 = \begin{pmatrix}
-\frac{f_x}{z} & 0 & -\frac{f_x x}{z^2} \\[6pt]
+\frac{f_x}{z} & 0 & -\frac{f_x x}{z^2} \\
 0 & \frac{f_y}{z} & -\frac{f_y y}{z^2}
 \end{pmatrix}
 $$
@@ -149,8 +149,11 @@ position — steeper at close range (small $z$), flatter at distance.
 Apply the Jacobian to $\boldsymbol{\Sigma}_{cam}$:
 
 $$
-\boldsymbol{\Sigma}_{2d} = \mathbf{J}\, \boldsymbol{\Sigma}_{cam}\, \mathbf{J}^T
-= \begin{bmatrix} \color{green}{a} & \color{green}{b} \\ b & \color{green}{c} \end{bmatrix}
+\boldsymbol{\Sigma}_{2d} = \mathbf{J} \boldsymbol{\Sigma}_{cam} \mathbf{J}^T
+= \begin{bmatrix} 
+\color{green}{a} & \color{green}{b} \\ 
+b & \color{green}{c} 
+\end{bmatrix}
 $$
 
 The rasterizer precomputes the **conic**

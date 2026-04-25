@@ -64,7 +64,7 @@ pixels: ABS_X 0~3      pixels: ABS_X 4~7
 │ C  │ D  │ E  │ F  │ │ C  │ D  │ E  │ F  │
 └────┴────┴────┴────┘ └────┴────┴────┴────┘
         Tile 2                    Tile 3
-tile_id=2                   tile_id=3
+tile_id=2              tile_id=3
 CUBE_POS: (X=0, Y=1)   CUBE_POS: (X=1, Y=1)
 pixels: ABS_X 4~7      pixels: ABS_X 4~7
         ABS_Y 0~3              ABS_Y 4~7
@@ -97,7 +97,10 @@ inversion.
 $$
 \mathbf{C} = \boldsymbol{\Sigma}_{2d}^{-1}
 = \frac{1}{ac - b^2}
-\begin{pmatrix} c & -b \\ -b & a \end{pmatrix}
+\begin{pmatrix} 
+c & -b \\ 
+-b & a 
+\end{pmatrix}
 $$
 
 ### Gaussian Power
@@ -105,8 +108,8 @@ $$
 The 2D Gaussian PDF is:
 
 $$
-f(\mathbf{x}) = \frac{1}{2\pi\,|\boldsymbol{\Sigma}_{2d}|^{1/2}}
-  \exp\!\left(-\frac{1}{2}\,\Delta^T\,\mathbf{C}\,\Delta\right)
+f(\mathbf{x}) = \frac{1}{2\pi|\boldsymbol{\Sigma}_{2d}|^{1/2}}
+  \exp \left(-\frac{1}{2}\Delta^T\mathbf{C}\Delta\right)
 $$
 
 3DGS drops the normalization constant and folds the peak height into
@@ -121,12 +124,21 @@ Expanding the quadratic form:
 
 $$
 \begin{aligned}
-\text{power} &= \frac{1}{2}\,\Delta^T\,\mathbf{C}\,\Delta \\[6pt]
-             &= \frac{1}{2}\begin{pmatrix} \Delta_x & \Delta_y \end{pmatrix}
-                \begin{pmatrix} a & b \\ b & c \end{pmatrix}
-                \begin{pmatrix} \Delta_x \\ \Delta_y \end{pmatrix} \\[6pt]
-             &= \frac{1}{2}(a\,\Delta_x^2 + c\,\Delta_y^2)
-                + b\,\Delta_x\,\Delta_y
+\text{power} &= \frac{1}{2}\Delta^T\mathbf{C}\Delta \\
+             &= \frac{1}{2}\begin{pmatrix} 
+             \Delta_x & \Delta_y 
+             \end{pmatrix}
+                \begin{pmatrix} 
+                a & b 
+                \\ 
+                b & c 
+                \end{pmatrix}
+                \begin{pmatrix} 
+                \Delta_x \\ 
+                \Delta_y 
+                \end{pmatrix} \\
+             &= \frac{1}{2}(a\Delta_x^2 + c\Delta_y^2)
+                + b\Delta_x\Delta_y
 \end{aligned}
 $$
 
@@ -141,7 +153,7 @@ $$
 ### Per-Gaussian Alpha
 
 $$
-\alpha = \min\!\Big(\text{opacity} \cdot e^{-\text{power}},\; 0.999\Big)
+\alpha = \min\Big(\text{opacity} \cdot e^{-\text{power}}, 0.999\Big)
 $$
 
 The $0.999$ cap prevents a single Gaussian from fully occluding everything
