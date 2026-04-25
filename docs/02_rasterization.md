@@ -142,10 +142,10 @@ $$
 \end{aligned}
 $$
 
-* The **diagonal** terms $a\,\Delta_x^2$ and $c\,\Delta_y^2$ control the
+* The **diagonal** terms $a\Delta_x^2$ and $c\Delta_y^2$ control the
   falloff along each axis — larger $a$ or $c$ means a tighter, sharper
   Gaussian in that direction.
-* The **off-diagonal** term $b\,\Delta_x\,\Delta_y$ introduces the
+* The **off-diagonal** term $b\Delta_x\Delta_y$ introduces the
   correlation between axes — this tilts/rotates the ellipse away from
   being axis-aligned. When $b = 0$ the ellipse axes are parallel to the
   pixel grid.
