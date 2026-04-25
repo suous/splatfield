@@ -31,12 +31,6 @@ available directly as builtins:
 | Tile ID | `CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X` | Linear tile index |
 | **Global pixel** | `(ABSOLUTE_POS_X, ABSOLUTE_POS_Y)` | Pixel coordinates |
 
-Pixel centers are offset by $+0.5$ to sample at the center of each pixel:
-
-$$
-(p_x,\; p_y) = \left(\texttt{ABSOLUTE\_POS\_X} + 0.5,\; \texttt{ABSOLUTE\_POS\_Y} + 0.5\right)
-$$
-
 Each tile has a precomputed range $[\text{start},\; \text{end})$ into the
 sorted intersection list, giving the Gaussians that overlap this tile.
 

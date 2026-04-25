@@ -4,7 +4,7 @@ A simple pure Rust 3D Gaussian Splatting viewer — under 1.3K lines of code.
 
 <!-- rumdl-disable MD033 -->
 <div align="center">
-<video src="assets/demo.mp4" controls="controls" muted="muted" loop="loop" autoplay="autoplay" playsinline="true" width="480">
+<video src="https://github.com/user-attachments/assets/34152477-4633-4d58-be98-b9e36abfb4df" controls="controls" muted="muted" loop="loop" autoplay="autoplay" playsinline="true" width="480">
 Should show demo.
 </video>
 </div>
