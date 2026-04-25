@@ -127,8 +127,8 @@ impl Splats {
         let bitmap = empty_tensor([img_size.y as usize, row_stride as usize], device, U32);
         rasterize_kernel::launch::<WgpuRuntime>(
             client,
-            CubeCount::Static(tile_bounds.x * tile_bounds.y, 1, 1),
-            CubeDim::new_1d(helpers::TILE_SIZE),
+            CubeCount::Static(tile_bounds.x, tile_bounds.y, 1),
+            CubeDim::new_2d(helpers::TILE_WIDTH, helpers::TILE_WIDTH),
             img_size.x,
             img_size.y,
             row_stride,
@@ -185,7 +185,9 @@ fn rasterize_kernel(
     depth_order: &Array<u32>,
     bitmap: &mut Array<u32>,
 ) {
-    let (px, py, tile_id) = helpers::map_1d_to_2d(ABSOLUTE_POS_X, img_size_x / helpers::TILE_WIDTH);
+    let px = ABSOLUTE_POS_X;
+    let py = ABSOLUTE_POS_Y;
+    let tile_id = CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X;
     if px < img_size_x && py < img_size_y {
         let pixel_x = px as f32 + 0.5f32;
         let pixel_y = py as f32 + 0.5f32;

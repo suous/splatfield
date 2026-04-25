@@ -60,14 +60,6 @@ pub fn quantize_u8(v: f32) -> u32 {
 }
 
 #[cube]
-pub fn map_1d_to_2d(idx: u32, tiles_x: u32) -> (u32, u32, u32) {
-    let (tile, cell) = (idx / TILE_SIZE, idx % TILE_SIZE);
-    let (tx, ty) = (tile % tiles_x, tile / tiles_x);
-    let (lx, ly) = (cell % TILE_WIDTH, cell / TILE_WIDTH);
-    (tx * TILE_WIDTH + lx, ty * TILE_WIDTH + ly, tile)
-}
-
-#[cube]
 pub fn tile_bbox(mean: Vec2F, ext: Vec2F, bounds: Vec2F) -> TileBBox {
     let inv_tile = 1.0 / TILE_WIDTH as f32;
     TileBBox {
