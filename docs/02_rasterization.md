@@ -34,7 +34,7 @@ available directly as builtins:
 Pixel centers are offset by $+0.5$ to sample at the center of each pixel:
 
 $$
-(p_x,\; p_y) = \left(\text{ABSOLUTE\_POS\_X} + 0.5,\; \text{ABSOLUTE\_POS\_Y} + 0.5\right)
+(p_x,\; p_y) = \left(\texttt{ABSOLUTE\_POS\_X} + 0.5,\; \texttt{ABSOLUTE\_POS\_Y} + 0.5\right)
 $$
 
 Each tile has a precomputed range $[\text{start},\; \text{end})$ into the
@@ -207,6 +207,5 @@ As $T \to 0$, subsequent Gaussians contribute vanishingly little
 Substituting $T_i$ back into the main equation, the full expansion looks like this:
 
 $$
-C = c_1 \alpha_1 + c_2 \alpha_2 (1 - \alpha_1) + c_3 \alpha_3 (1 - \alpha_1)(1 - \alpha_2)
- + \dots + c_N \alpha_N \prod_{j=1}^{N-1} (1 - \alpha_j)
+C = c_1 \alpha_1 + c_2 \alpha_2 (1 - \alpha_1) + c_3 \alpha_3 (1 - \alpha_1)(1 - \alpha_2) + \dots + c_N \alpha_N \prod_{j=1}^{N-1} (1 - \alpha_j) <!-- rumdl-disable-line MD013 -->
 $$
