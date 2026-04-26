@@ -1,23 +1,37 @@
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::{Arc, RwLock};
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::{AtomicBool, Ordering};
+
+#[cfg(target_arch = "wasm32")]
+use std::cell::Cell;
+
+#[cfg(target_arch = "wasm32")]
+use wasm_bindgen::JsCast;
+
 use cubecl::wgpu::{
     AutoGraphicsApi, GraphicsApi, MemoryConfiguration, RuntimeOptions, WgpuDevice, WgpuSetup,
     init_device,
 };
-use eframe::{NativeOptions, egui, egui_wgpu::WgpuSetupCreateNew};
+use eframe::egui;
 use egui::{Color32, Rect};
 use glam::{Quat, Vec3};
 use log::error;
 use splatfield::{camera, file, render, texture};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
 
 const UV_RECT: Rect = Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
 
 struct App {
-    backbuffer: texture::GpuTexture,
+    backbuffer: Rc<RefCell<texture::GpuTexture>>,
     controller: camera::Controller,
     device: WgpuDevice,
     splats: Arc<RwLock<Option<render::Splats>>>,
+    #[cfg(not(target_arch = "wasm32"))]
     reframe: Arc<AtomicBool>,
+    #[cfg(target_arch = "wasm32")]
+    rendering: Rc<Cell<bool>>,
 }
 
 impl App {
@@ -42,18 +56,22 @@ impl App {
         );
 
         Self {
-            backbuffer: texture::GpuTexture::new(
+            backbuffer: Rc::new(RefCell::new(texture::GpuTexture::new(
                 render_state.renderer.clone(),
                 render_state.device.clone(),
                 render_state.queue.clone(),
-            ),
+            ))),
             controller: camera::Controller::new(-Vec3::Z * 2.5, Quat::IDENTITY),
             device,
             splats: Arc::new(RwLock::new(None)),
+            #[cfg(not(target_arch = "wasm32"))]
             reframe: Arc::new(AtomicBool::new(false)),
+            #[cfg(target_arch = "wasm32")]
+            rendering: Rc::new(Cell::new(false)),
         }
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
     fn load_ply_file(&self, path: std::path::PathBuf, ctx: egui::Context) {
         let device = self.device.clone();
         let splats = Arc::clone(&self.splats);
@@ -74,6 +92,17 @@ impl App {
             }
         });
     }
+
+    #[cfg(target_arch = "wasm32")]
+    fn load(&mut self, bytes: &[u8]) {
+        match file::load_ply(bytes, &self.device) {
+            Ok(data) => {
+                self.controller.frame_bounds(data.bounds);
+                *self.splats.write().unwrap() = Some(data);
+            }
+            Err(e) => error!("Failed to load splat: {e:?}"),
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -81,6 +110,7 @@ impl eframe::App for App {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().inner_margin(0.0))
             .show_inside(ui, |ui| {
+                #[cfg(not(target_arch = "wasm32"))]
                 for file in ui.input(|i| i.raw.dropped_files.clone()) {
                     if let Some(path) = &file.path
                         && path.extension().is_some_and(|ext| ext == "ply")
@@ -89,35 +119,69 @@ impl eframe::App for App {
                     }
                 }
 
+                #[cfg(target_arch = "wasm32")]
+                for bytes in ui
+                    .input(|i| i.raw.dropped_files.clone())
+                    .into_iter()
+                    .filter(|f| f.name.ends_with(".ply"))
+                    .filter_map(|f| f.bytes)
+                {
+                    self.load(&bytes);
+                }
+
                 let binding = self.splats.read().unwrap();
                 let Some(splats) = binding.as_ref() else {
                     ui.centered_and_justified(|ui| ui.heading("Drag and drop a .ply file"));
                     return;
                 };
 
+                #[cfg(not(target_arch = "wasm32"))]
                 if self.reframe.swap(false, Ordering::AcqRel) {
                     self.controller.frame_bounds(splats.bounds);
                 }
 
                 let size = ui.available_size();
                 let (rect, response) = ui.allocate_exact_size(size, egui::Sense::drag());
-                let size = glam::vec2(size.x, size.y);
+                let pixel =
+                    (glam::vec2(size.x, size.y) * ui.ctx().pixels_per_point().round()).as_uvec2();
                 self.controller.tick(&response, ui);
-                self.controller.camera.fit_fov(size.round().as_uvec2());
+                self.controller.camera.fit_fov(pixel);
 
-                let pixel = (size * ui.ctx().pixels_per_point().round()).as_uvec2();
+                #[cfg(not(target_arch = "wasm32"))]
                 if pixel.x > 8 && pixel.y > 8 {
                     let img = pollster::block_on(splats.render(&self.controller.camera, pixel));
-                    if let Some(id) = self.backbuffer.update_texture(&img, pixel) {
-                        ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
-                        ui.painter().image(id, rect, UV_RECT, Color32::WHITE);
-                    }
+                    self.backbuffer.borrow_mut().update_texture(&img, pixel);
+                }
+
+                #[cfg(target_arch = "wasm32")]
+                if pixel.x > 8 && pixel.y > 8 && !self.rendering.get() {
+                    self.rendering.set(true);
+                    let splats = splats.clone();
+                    let camera = self.controller.camera.clone();
+                    let backbuffer = self.backbuffer.clone();
+                    let rendering = self.rendering.clone();
+                    let ctx = ui.ctx().clone();
+
+                    wasm_bindgen_futures::spawn_local(async move {
+                        let img = splats.render(&camera, pixel).await;
+                        backbuffer.borrow_mut().update_texture(&img, pixel);
+                        rendering.set(false);
+                        ctx.request_repaint();
+                    });
+                }
+
+                if let Some(id) = self.backbuffer.borrow().texture_id() {
+                    ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
+                    ui.painter().image(id, rect, UV_RECT, Color32::WHITE);
                 }
             });
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> anyhow::Result<()> {
+    use eframe::{NativeOptions, egui_wgpu::WgpuSetupCreateNew};
+
     env_logger::builder()
         .target(env_logger::Target::Stdout)
         .init();
@@ -157,4 +221,55 @@ fn main() -> anyhow::Result<()> {
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
     .map_err(|e| anyhow::anyhow!("Eframe error: {e}"))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    console_error_panic_hook::set_once();
+
+    let web_options = eframe::WebOptions {
+        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+            wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(
+                eframe::egui_wgpu::WgpuSetupCreateNew {
+                    device_descriptor: std::sync::Arc::new(|adapter: &eframe::wgpu::Adapter| {
+                        eframe::wgpu::DeviceDescriptor {
+                            label: Some("splatfield"),
+                            required_features: adapter
+                                .features()
+                                .difference(eframe::wgpu::Features::MAPPABLE_PRIMARY_BUFFERS),
+                            required_limits: adapter.limits(),
+                            memory_hints: eframe::wgpu::MemoryHints::MemoryUsage,
+                            trace: eframe::wgpu::Trace::Off,
+                            experimental_features: unsafe {
+                                eframe::wgpu::ExperimentalFeatures::enabled()
+                            },
+                        }
+                    }),
+                    ..eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle()
+                },
+            ),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    wasm_bindgen_futures::spawn_local(async {
+        let canvas = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .get_element_by_id("the_canvas_id")
+            .unwrap()
+            .dyn_into::<web_sys::HtmlCanvasElement>()
+            .unwrap();
+
+        eframe::WebRunner::new()
+            .start(
+                canvas,
+                web_options,
+                Box::new(|cc| Ok(Box::new(App::new(cc)))),
+            )
+            .await
+            .expect("failed to start");
+    });
 }

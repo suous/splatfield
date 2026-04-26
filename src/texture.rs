@@ -24,7 +24,11 @@ impl GpuTexture {
         }
     }
 
-    pub fn update_texture(&mut self, img: &GpuTensor, size: glam::UVec2) -> Option<TextureId> {
+    pub fn texture_id(&self) -> Option<TextureId> {
+        self.texture.as_ref().map(|(_, id)| *id)
+    }
+
+    pub fn update_texture(&mut self, img: &GpuTensor, size: glam::UVec2) {
         let _ = WgpuRuntime::client(&img.device).flush();
 
         let needs_resize = self
@@ -36,9 +40,8 @@ impl GpuTexture {
             self.texture = Some(self.ensure_texture(size));
         }
 
-        let (texture, id) = self.texture.as_ref()?;
+        let (texture, _) = self.texture.as_ref().unwrap();
         self.copy_to_texture(img, texture);
-        Some(*id)
     }
 
     fn ensure_texture(&mut self, size: glam::UVec2) -> (wgpu::Texture, TextureId) {

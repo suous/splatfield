@@ -1,6 +1,7 @@
 use egui::{CursorIcon, PointerButton, Response};
 use glam::{Affine3A, Quat, UVec2, Vec2, Vec3};
 
+#[derive(Clone)]
 pub struct Camera {
     pub fov: Vec2,
     pub position: Vec3,

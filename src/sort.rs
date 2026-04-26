@@ -11,6 +11,44 @@ const SORT_BINS: u32 = 16;
 const ELEMS_PER_THREAD: u32 = 32;
 const SORT_BLOCK: u32 = SORT_WG * ELEMS_PER_THREAD;
 
+// Custom plane functions using shared memory — cubecl's built-in plane_sum/
+// plane_exclusive_sum generate subgroup ops which aren't available on WASM.
+#[cube]
+fn plane_sum(value: u32) -> u32 {
+    let mut lds = SharedMemory::<u32>::new(SORT_WG as usize);
+    lds[UNIT_POS as usize] = value;
+    sync_cube();
+
+    let mut stride = 16u32;
+    for _ in 0..5 {
+        if UNIT_POS < stride {
+            lds[UNIT_POS as usize] += lds[(UNIT_POS + stride) as usize];
+        }
+        stride >>= 1;
+        sync_cube();
+    }
+
+    lds[0]
+}
+
+#[cube]
+fn plane_exclusive_sum(value: u32) -> u32 {
+    let mut lds = SharedMemory::<u32>::new(SORT_WG as usize);
+    lds[UNIT_POS as usize] = value;
+    sync_cube();
+
+    let mut sum = 0u32;
+    for i in 0u32..UNIT_POS {
+        sum += lds[i as usize];
+    }
+    sync_cube();
+
+    lds[UNIT_POS as usize] = sum;
+    sync_cube();
+
+    sum
+}
+
 #[cube(launch)]
 fn count_kernel(shift: u32, num_keys: u32, src: &Array<u32>, counts: &mut Array<u32>) {
     let num_wgs = num_keys.div_ceil(SORT_BLOCK);

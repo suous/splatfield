@@ -1,3 +1,4 @@
 /target
 .rumdl_cache
 .DS_Store
+dist

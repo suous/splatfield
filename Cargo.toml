@@ -8,14 +8,26 @@ cubecl = { version = "0.10.0-pre.3", features = ["wgpu", "std", "stdlib"] }
 bytemuck = { version = "1.25", features = ["derive"] }
 glam = "0.32.1"
 egui = "0.34"
-eframe = { version = "0.34", default-features = false, features = ["wgpu", "x11", "wayland"] }
 wgpu = { version = "29", default-features = false }
 serde = { version = "1.0.228", default-features = false, features = ["derive"] }
 serde-ply = "0.2.2"
 anyhow = "1.0.102"
-env_logger = "0.11.9"
-pollster = "0.4"
 log = "0.4"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+eframe = { version = "0.34", default-features = false, features = ["wgpu", "x11", "wayland"] }
+pollster = "0.4"
+env_logger = "0.11.9"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+cubecl-common = { version = "0.10.0-pre.3", features = ["serde"] }
+eframe = { version = "0.34", features = ["wgpu"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["HtmlCanvasElement", "Document", "Window"] }
+console_error_panic_hook = "0.1"
+getrandom = { version = "0.4", features = ["wasm_js"] }
+serde_json = { version = "1.0", features = ["alloc"] }
 
 [dev-dependencies]
 rand = "0.10"
