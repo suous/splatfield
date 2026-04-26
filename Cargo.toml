@@ -36,3 +36,9 @@ criterion = "0.5"
 [[bench]]
 name = "radix_sort"
 harness = false
+
+[profile.release]
+lto = true
+opt-level = 's'
+codegen-units = 1
+panic = "abort"
