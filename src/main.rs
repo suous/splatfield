@@ -34,6 +34,19 @@ struct App {
     rendering: Rc<Cell<bool>>,
 }
 
+fn device_descriptor(adapter: &eframe::wgpu::Adapter) -> eframe::wgpu::DeviceDescriptor<'static> {
+    eframe::wgpu::DeviceDescriptor {
+        label: Some("splatfield"),
+        required_features: adapter
+            .features()
+            .difference(eframe::wgpu::Features::MAPPABLE_PRIMARY_BUFFERS),
+        required_limits: adapter.limits(),
+        memory_hints: eframe::wgpu::MemoryHints::MemoryUsage,
+        trace: eframe::wgpu::Trace::Off,
+        experimental_features: unsafe { eframe::wgpu::ExperimentalFeatures::enabled() },
+    }
+}
+
 impl App {
     fn new(cc: &eframe::CreationContext) -> Self {
         let render_state = cc.wgpu_render_state.as_ref().expect("Must use wgpu");
@@ -194,21 +207,7 @@ fn main() -> anyhow::Result<()> {
                 display_handle: None,
                 native_adapter_selector: None,
                 power_preference: eframe::wgpu::PowerPreference::HighPerformance,
-                device_descriptor: std::sync::Arc::new(|adapter: &eframe::wgpu::Adapter| {
-                    eframe::wgpu::DeviceDescriptor {
-                        label: Some("egui+cube"),
-                        required_features: adapter
-                            .features()
-                            .difference(eframe::wgpu::Features::MAPPABLE_PRIMARY_BUFFERS),
-                        required_limits: adapter.limits(),
-                        memory_hints: eframe::wgpu::MemoryHints::MemoryUsage,
-                        trace: eframe::wgpu::Trace::Off,
-                        // SAFETY: wgpu requires ExperimentalFeatures::enabled() for experimental device features.
-                        experimental_features: unsafe {
-                            eframe::wgpu::ExperimentalFeatures::enabled()
-                        },
-                    }
-                }),
+                device_descriptor: std::sync::Arc::new(device_descriptor),
             }),
             ..Default::default()
         },
@@ -231,20 +230,7 @@ fn main() {
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
             wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(
                 eframe::egui_wgpu::WgpuSetupCreateNew {
-                    device_descriptor: std::sync::Arc::new(|adapter: &eframe::wgpu::Adapter| {
-                        eframe::wgpu::DeviceDescriptor {
-                            label: Some("splatfield"),
-                            required_features: adapter
-                                .features()
-                                .difference(eframe::wgpu::Features::MAPPABLE_PRIMARY_BUFFERS),
-                            required_limits: adapter.limits(),
-                            memory_hints: eframe::wgpu::MemoryHints::MemoryUsage,
-                            trace: eframe::wgpu::Trace::Off,
-                            experimental_features: unsafe {
-                                eframe::wgpu::ExperimentalFeatures::enabled()
-                            },
-                        }
-                    }),
+                    device_descriptor: std::sync::Arc::new(device_descriptor),
                     ..eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle()
                 },
             ),
