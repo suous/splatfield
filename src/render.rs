@@ -41,7 +41,7 @@ impl Splats {
     ///    (equivalent to the paper's single composite-key sort).
     /// 4. **Rasterize** — render sorted Gaussians per tile in parallel; each pixel
     ///    alpha-blends front-to-back through its tile's Gaussian list.
-    pub fn render(&self, camera: &Camera, img_size: glam::UVec2) -> GpuTensor {
+    pub async fn render(&self, camera: &Camera, img_size: glam::UVec2) -> GpuTensor {
         let client = &self.attributes.client;
         let device = &self.attributes.device;
         let total = self.attributes.shape[0];
@@ -85,7 +85,7 @@ impl Splats {
             gaussian_ids.as_array_arg(),
         );
 
-        let num_isects = isect_counter.read_u32_at(0);
+        let num_isects = isect_counter.read_u32_at(0).await;
         let (inv_perm, depth_order) = radix_argsort(depth_keys, depth_order, total as u32, 32);
 
         invert_permutation::launch::<WgpuRuntime>(

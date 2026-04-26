@@ -105,10 +105,10 @@ impl eframe::App for App {
                 self.controller.tick(&response, ui);
                 self.controller.camera.fit_fov(size.round().as_uvec2());
 
-                let pixel_size = (size * ui.ctx().pixels_per_point().round()).as_uvec2();
-                if pixel_size.x > 8 && pixel_size.y > 8 {
-                    let img = splats.render(&self.controller.camera, pixel_size);
-                    if let Some(id) = self.backbuffer.update_texture(&img, pixel_size) {
+                let pixel = (size * ui.ctx().pixels_per_point().round()).as_uvec2();
+                if pixel.x > 8 && pixel.y > 8 {
+                    let img = pollster::block_on(splats.render(&self.controller.camera, pixel));
+                    if let Some(id) = self.backbuffer.update_texture(&img, pixel) {
                         ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
                         ui.painter().image(id, rect, UV_RECT, Color32::WHITE);
                     }

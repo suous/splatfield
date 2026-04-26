@@ -66,8 +66,9 @@ impl GpuTensor {
         }
     }
 
-    pub fn read_u32_at(&self, index: usize) -> u32 {
-        bytemuck::cast_slice(&self.client.read_one_unchecked(self.handle.clone()))[index]
+    pub async fn read_u32_at(&self, index: usize) -> u32 {
+        let bytes = self.client.read_async(vec![self.handle.clone()]).await;
+        bytemuck::cast_slice(&bytes.unwrap()[0])[index]
     }
 
     pub fn as_array_arg(&self) -> ArrayArg<WgpuRuntime> {
