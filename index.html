@@ -19,9 +19,28 @@
             height: 100vh;
             display: block;
         }
+        .centered {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #f0f0f0;
+            font-size: 24px;
+            font-family: Helvetica, sans-serif;
+            text-align: center;
+        }
     </style>
 </head>
 <body>
     <canvas id="the_canvas_id"></canvas>
+    <div class="centered" id="loading_text">
+        <p>Loading SplatField...</p>
+    </div>
+    <script>
+        setTimeout(() => {
+            const el = document.getElementById("loading_text");
+            if (el) el.remove();
+        }, 3000);
+    </script>
 </body>
 </html>
