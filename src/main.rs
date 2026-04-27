@@ -36,14 +36,13 @@ struct App {
 
 fn device_descriptor(adapter: &eframe::wgpu::Adapter) -> eframe::wgpu::DeviceDescriptor<'static> {
     eframe::wgpu::DeviceDescriptor {
-        label: Some("splatfield"),
         required_features: adapter
             .features()
             .difference(eframe::wgpu::Features::MAPPABLE_PRIMARY_BUFFERS),
         required_limits: adapter.limits(),
         memory_hints: eframe::wgpu::MemoryHints::MemoryUsage,
-        trace: eframe::wgpu::Trace::Off,
         experimental_features: unsafe { eframe::wgpu::ExperimentalFeatures::enabled() },
+        ..Default::default()
     }
 }
 
@@ -193,22 +192,20 @@ impl eframe::App for App {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> anyhow::Result<()> {
-    use eframe::{NativeOptions, egui_wgpu::WgpuSetupCreateNew};
+    use eframe::NativeOptions;
 
     env_logger::builder()
         .target(env_logger::Target::Stdout)
         .init();
 
     let native_options = NativeOptions {
-        viewport: egui::ViewportBuilder::default(),
         wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
-            wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(WgpuSetupCreateNew {
-                instance_descriptor: wgpu::InstanceDescriptor::new_without_display_handle(),
-                display_handle: None,
-                native_adapter_selector: None,
-                power_preference: eframe::wgpu::PowerPreference::HighPerformance,
-                device_descriptor: std::sync::Arc::new(device_descriptor),
-            }),
+            wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(
+                eframe::egui_wgpu::WgpuSetupCreateNew {
+                    device_descriptor: std::sync::Arc::new(device_descriptor),
+                    ..eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle()
+                },
+            ),
             ..Default::default()
         },
         ..Default::default()
