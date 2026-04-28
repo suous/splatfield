@@ -46,6 +46,18 @@ fn device_descriptor(adapter: &eframe::wgpu::Adapter) -> eframe::wgpu::DeviceDes
     }
 }
 
+fn wgpu_config() -> eframe::egui_wgpu::WgpuConfiguration {
+    eframe::egui_wgpu::WgpuConfiguration {
+        wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(
+            eframe::egui_wgpu::WgpuSetupCreateNew {
+                device_descriptor: std::sync::Arc::new(device_descriptor),
+                ..eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle()
+            },
+        ),
+        ..Default::default()
+    }
+}
+
 impl App {
     fn new(cc: &eframe::CreationContext) -> Self {
         let render_state = cc.wgpu_render_state.as_ref().expect("Must use wgpu");
@@ -192,28 +204,16 @@ impl eframe::App for App {
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> anyhow::Result<()> {
-    use eframe::NativeOptions;
-
     env_logger::builder()
         .target(env_logger::Target::Stdout)
         .init();
 
-    let native_options = NativeOptions {
-        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
-            wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(
-                eframe::egui_wgpu::WgpuSetupCreateNew {
-                    device_descriptor: std::sync::Arc::new(device_descriptor),
-                    ..eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle()
-                },
-            ),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-
     eframe::run_native(
         "SplatField",
-        native_options,
+        eframe::NativeOptions {
+            wgpu_options: wgpu_config(),
+            ..Default::default()
+        },
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
     .map_err(|e| anyhow::anyhow!("Eframe error: {e}"))
@@ -222,19 +222,6 @@ fn main() -> anyhow::Result<()> {
 #[cfg(target_arch = "wasm32")]
 fn main() {
     console_error_panic_hook::set_once();
-
-    let web_options = eframe::WebOptions {
-        wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
-            wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(
-                eframe::egui_wgpu::WgpuSetupCreateNew {
-                    device_descriptor: std::sync::Arc::new(device_descriptor),
-                    ..eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle()
-                },
-            ),
-            ..Default::default()
-        },
-        ..Default::default()
-    };
 
     wasm_bindgen_futures::spawn_local(async {
         let canvas = web_sys::window()
@@ -249,7 +236,10 @@ fn main() {
         eframe::WebRunner::new()
             .start(
                 canvas,
-                web_options,
+                eframe::WebOptions {
+                    wgpu_options: wgpu_config(),
+                    ..Default::default()
+                },
                 Box::new(|cc| Ok(Box::new(App::new(cc)))),
             )
             .await
