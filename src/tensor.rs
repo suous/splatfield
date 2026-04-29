@@ -1,10 +1,8 @@
-use cubecl::client::ComputeClient;
-use cubecl::frontend::ArrayArg;
-use cubecl::ir::{ElemType, FloatKind, StorageType, UIntKind};
+use cubecl::ir::{ElemType, FloatKind, UIntKind};
+use cubecl::prelude::*;
 use cubecl::server::{CubeCountSelection, Handle};
 use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
 use cubecl::zspace::Shape;
-use cubecl::{CubeCount, Runtime};
 
 pub const F32: StorageType = StorageType::Scalar(ElemType::Float(FloatKind::F32));
 pub const U32: StorageType = StorageType::Scalar(ElemType::UInt(UIntKind::U32));

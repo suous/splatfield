@@ -11,10 +11,7 @@ use std::cell::Cell;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
 
-use cubecl::wgpu::{
-    AutoGraphicsApi, GraphicsApi, MemoryConfiguration, RuntimeOptions, WgpuDevice, WgpuSetup,
-    init_device,
-};
+use cubecl::wgpu::{MemoryConfiguration, RuntimeOptions, WgpuDevice, WgpuSetup, init_device};
 use eframe::egui;
 use egui::{Color32, Rect};
 use glam::{Quat, Vec3};
@@ -71,7 +68,7 @@ impl App {
                 adapter: render_state.adapter.clone(),
                 device: render_state.device.clone(),
                 queue: render_state.queue.clone(),
-                backend: AutoGraphicsApi::backend(),
+                backend: render_state.adapter.get_info().backend,
             },
             RuntimeOptions {
                 tasks_max: 64,

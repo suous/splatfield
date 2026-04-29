@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use crate::tensor::GpuTensor;
-use cubecl::Runtime;
+use cubecl::prelude::*;
 use cubecl::wgpu::WgpuRuntime;
 use eframe::egui_wgpu::Renderer;
 use egui::{TextureId, epaint::mutex::RwLock};
