@@ -5,7 +5,6 @@ use cubecl::Runtime;
 use cubecl::wgpu::WgpuRuntime;
 use eframe::egui_wgpu::Renderer;
 use egui::{TextureId, epaint::mutex::RwLock};
-use wgpu::{CommandEncoderDescriptor, TexelCopyBufferLayout};
 
 pub struct GpuTexture {
     device: wgpu::Device,
@@ -56,12 +55,10 @@ impl GpuTexture {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING
-                | wgpu::TextureUsages::COPY_DST
-                | wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
         });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = texture.create_view(&Default::default());
         let id = match &mut self.texture {
             Some((_, id)) => {
                 self.renderer.write().update_egui_texture_from_wgpu_texture(
@@ -85,14 +82,11 @@ impl GpuTexture {
         let resource = img.client.get_resource(img.handle.clone()).unwrap();
         let (buffer, offset) = (&resource.resource().buffer, resource.resource().offset);
 
-        let mut encoder = self
-            .device
-            .create_command_encoder(&CommandEncoderDescriptor::default());
-
+        let mut encoder = self.device.create_command_encoder(&Default::default());
         encoder.copy_buffer_to_texture(
             wgpu::TexelCopyBufferInfo {
                 buffer,
-                layout: TexelCopyBufferLayout {
+                layout: wgpu::TexelCopyBufferLayout {
                     offset,
                     bytes_per_row: Some(img.shape[1] as u32 * 4),
                     rows_per_image: None,
