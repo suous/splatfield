@@ -229,5 +229,14 @@ fn main() {
             )
             .await
             .expect("failed to start");
+
+        if let Some(el) = web_sys::window()
+            .unwrap()
+            .document()
+            .unwrap()
+            .get_element_by_id("loading_text")
+        {
+            el.remove();
+        }
     });
 }
