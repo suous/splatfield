@@ -213,7 +213,7 @@ pub(crate) fn project_splats(
             y: mean.y - camera_pos.y,
             z: mean.z - camera_pos.z,
         };
-        let (r, g, b) = helpers::sh_to_rgb(sh_per_ch, ABSOLUTE_POS_X, normalize(dir), sh_coeffs);
+        let (r, g, b) = helpers::sh_to_rgb(sh_per_ch, normalize(dir), sh_coeffs);
 
         let inv_cam_z = cam.z.recip();
         let mean2d = Vec2F {

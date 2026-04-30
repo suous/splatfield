@@ -58,8 +58,6 @@ fn wgpu_config() -> eframe::egui_wgpu::WgpuConfiguration {
 impl App {
     fn new(cc: &eframe::CreationContext) -> Self {
         let render_state = cc.wgpu_render_state.as_ref().expect("Must use wgpu");
-        cc.egui_ctx.set_visuals(egui::Visuals::dark());
-
         let device = init_device(
             WgpuSetup {
                 instance: wgpu::Instance::new(
@@ -186,7 +184,6 @@ impl eframe::App for App {
         }
 
         if let Some(id) = self.backbuffer.borrow().texture_id() {
-            ui.painter().rect_filled(rect, 0.0, Color32::BLACK);
             ui.painter().image(id, rect, UV_RECT, Color32::WHITE);
         }
     }

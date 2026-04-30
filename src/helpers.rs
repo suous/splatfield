@@ -1,20 +1,20 @@
 use cubecl::prelude::*;
 
 #[derive(CubeType, CubeLaunch, Clone, Copy)]
-pub struct Vec2F {
+pub(crate) struct Vec2F {
     pub x: f32,
     pub y: f32,
 }
 
 #[derive(CubeType, CubeLaunch, Clone, Copy)]
-pub struct Vec3F {
+pub(crate) struct Vec3F {
     pub x: f32,
     pub y: f32,
     pub z: f32,
 }
 
 #[derive(CubeType, CubeLaunch, Clone, Copy)]
-pub struct Vec4F {
+pub(crate) struct Vec4F {
     pub w: f32,
     pub x: f32,
     pub y: f32,
@@ -22,14 +22,14 @@ pub struct Vec4F {
 }
 
 #[derive(CubeType, Clone, Copy)]
-pub struct Mat3 {
+pub(crate) struct Mat3 {
     pub row0: Vec3F,
     pub row1: Vec3F,
     pub row2: Vec3F,
 }
 
 #[derive(CubeType, Clone, Copy)]
-pub struct Covariance3D {
+pub(crate) struct Covariance3D {
     pub xx: f32,
     pub xy: f32,
     pub xz: f32,
@@ -39,28 +39,28 @@ pub struct Covariance3D {
 }
 
 #[derive(CubeType, Clone, Copy)]
-pub struct TileBBox {
+pub(crate) struct TileBBox {
     pub min_x: u32,
     pub min_y: u32,
     pub max_x: u32,
     pub max_y: u32,
 }
 
-pub const TILE_WIDTH: u32 = 16;
-pub const TILE_SIZE: u32 = TILE_WIDTH * TILE_WIDTH;
+pub(crate) const TILE_WIDTH: u32 = 16;
+pub(crate) const TILE_SIZE: u32 = TILE_WIDTH * TILE_WIDTH;
 
 #[cube]
-pub fn sigmoid(x: f32) -> f32 {
+pub(crate) fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
 #[cube]
-pub fn quantize_u8(v: f32) -> u32 {
+pub(crate) fn quantize_u8(v: f32) -> u32 {
     (v * 255.0).clamp(0.0, 255.0) as u32
 }
 
 #[cube]
-pub fn tile_bbox(mean: Vec2F, ext: Vec2F, bounds: Vec2F) -> TileBBox {
+pub(crate) fn tile_bbox(mean: Vec2F, ext: Vec2F, bounds: Vec2F) -> TileBBox {
     let inv_tile = 1.0 / TILE_WIDTH as f32;
     TileBBox {
         min_x: ((mean.x - ext.x) * inv_tile).clamp(0.0, bounds.x) as u32,
@@ -79,8 +79,8 @@ const SH_C2_3: f32 = 0.546_274_24_f32;
 
 #[rustfmt::skip]
 #[cube]
-pub fn sh_to_rgb(chs: u32, gid: u32, dir: Vec3F, shs: &Array<f32>) -> (f32, f32, f32) {
-    let bi = (gid as usize) * chs as usize * 3;
+pub(crate) fn sh_to_rgb(chs: u32, dir: Vec3F, shs: &Array<f32>) -> (f32, f32, f32) {
+    let bi = (ABSOLUTE_POS_X as usize) * chs as usize * 3;
     let mut r = SH_C0 * shs[bi];
     let mut g = SH_C0 * shs[bi + 1];
     let mut b = SH_C0 * shs[bi + 2];

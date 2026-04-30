@@ -20,7 +20,7 @@ fn plane_sum(value: u32) -> u32 {
     sync_cube();
 
     let mut stride = 16u32;
-    for _ in 0..5 {
+    while stride > 0 {
         if UNIT_POS < stride {
             lds[UNIT_POS as usize] += lds[(UNIT_POS + stride) as usize];
         }
@@ -41,7 +41,6 @@ fn plane_exclusive_sum(value: u32) -> u32 {
     for i in 0u32..UNIT_POS {
         sum += lds[i as usize];
     }
-    sync_cube();
 
     lds[UNIT_POS as usize] = sum;
     sync_cube();

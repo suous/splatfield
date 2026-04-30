@@ -170,7 +170,7 @@ fn build_tile_ranges(ids: &Array<u32>, ranges: &mut Array<u32>, num_isects: u32)
 }
 
 #[cube]
-pub fn gaussian_power(conic: helpers::Vec3F, dx: f32, dy: f32) -> f32 {
+fn gaussian_power(conic: helpers::Vec3F, dx: f32, dy: f32) -> f32 {
     0.5 * (conic.x * dx * dx + conic.z * dy * dy) + conic.y * dx * dy
 }
 
