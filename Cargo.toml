@@ -24,7 +24,7 @@ cubecl-common = { version = "0.10.0-pre.3", features = ["serde"] }
 eframe = { version = "0.34", features = ["wgpu"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["HtmlCanvasElement", "Document", "Window"] }
+web-sys = { version = "0.3", features = ["HtmlCanvasElement", "Document", "Element", "Window"] }
 console_error_panic_hook = "0.1"
 getrandom = { version = "0.4", features = ["wasm_js"] }
 serde_json = { version = "1.0", features = ["alloc"] }
