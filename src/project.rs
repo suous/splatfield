@@ -180,7 +180,7 @@ pub(crate) fn project_splats(
     depth_order: &mut Array<u32>,
     depth_keys: &mut Array<u32>,
     projected_splats: &mut Array<f32>,
-    isect_counter: &Array<Atomic<u32>>,
+    counters: &Array<Atomic<u32>>,
     tile_ids: &mut Array<u32>,
     gaussian_ids: &mut Array<u32>,
 ) {
@@ -213,8 +213,9 @@ pub(crate) fn project_splats(
         let cov2d = compute_cov2d(cov3d, &rot, focal, cam, img_size);
         let conic = compute_conic(cov2d.x, cov2d.y, cov2d.z);
 
-        depth_order[ABSOLUTE_POS_X as usize] = ABSOLUTE_POS_X;
-        depth_keys[ABSOLUTE_POS_X as usize] = cam.z.to_bits();
+        let vis_slot = counters[1].fetch_add(1u32);
+        depth_order[vis_slot as usize] = vis_slot;
+        depth_keys[vis_slot as usize] = cam.z.to_bits();
 
         let dir = Vec3F {
             x: mean.x - camera_pos.x,
@@ -228,7 +229,7 @@ pub(crate) fn project_splats(
             x: focal.x * cam.x * inv_cam_z + pixel_center.x,
             y: focal.y * cam.y * inv_cam_z + pixel_center.y,
         };
-        let out_base = ABSOLUTE_POS_X as usize * 9;
+        let out_base = vis_slot as usize * 9;
         projected_splats[out_base] = mean2d.x;
         projected_splats[out_base + 1] = mean2d.y;
         projected_splats[out_base + 2] = conic.x;
@@ -247,9 +248,9 @@ pub(crate) fn project_splats(
         let tile_bbox = helpers::tile_bbox(mean2d, ext, tile_bounds);
         for ty in tile_bbox.min_y..tile_bbox.max_y {
             for tx in tile_bbox.min_x..tile_bbox.max_x {
-                let slot = isect_counter[0].fetch_add(1u32);
+                let slot = counters[0].fetch_add(1u32);
                 tile_ids[slot as usize] = tx + ty * tile_bounds.x as u32;
-                gaussian_ids[slot as usize] = ABSOLUTE_POS_X;
+                gaussian_ids[slot as usize] = vis_slot;
             }
         }
     }
