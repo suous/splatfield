@@ -116,8 +116,12 @@ fn compute_cov3d(scale: Vec3F, quat: Vec4F) -> Covariance3D {
 }
 
 #[cube]
-fn compute_cov2d(cov3d: Covariance3D, rot: &Mat3, focal: Vec2F, cam: Vec3F) -> Vec3F {
+fn compute_cov2d(cov3d: Covariance3D, rot: &Mat3, focal: Vec2F, cam: Vec3F, img: Vec2F) -> Vec3F {
     let inv_cam_z = cam.z.recip();
+    let lim_x = 1.3 * img.x / (2.0 * focal.x);
+    let lim_y = 1.3 * img.y / (2.0 * focal.y);
+    let u = (cam.x * inv_cam_z).clamp(-lim_x, lim_x);
+    let v = (cam.y * inv_cam_z).clamp(-lim_y, lim_y);
     let rc_r0 = sym_mul_row(rot.row0, cov3d);
     let rc_r1 = sym_mul_row(rot.row1, cov3d);
     let rc_r2 = sym_mul_row(rot.row2, cov3d);
@@ -133,12 +137,12 @@ fn compute_cov2d(cov3d: Covariance3D, rot: &Mat3, focal: Vec2F, cam: Vec3F) -> V
     let j_r0 = Vec3F {
         x: focal.x * inv_cam_z,
         y: 0.0f32,
-        z: -focal.x * inv_cam_z * cam.x * inv_cam_z,
+        z: -focal.x * u * inv_cam_z,
     };
     let j_r1 = Vec3F {
         x: 0.0f32,
         y: focal.y * inv_cam_z,
-        z: -focal.y * inv_cam_z * cam.y * inv_cam_z,
+        z: -focal.y * v * inv_cam_z,
     };
 
     let jc_r0 = sym_mul_row(j_r0, cc);
@@ -152,7 +156,7 @@ fn compute_cov2d(cov3d: Covariance3D, rot: &Mat3, focal: Vec2F, cam: Vec3F) -> V
 
 #[cube]
 fn compute_conic(a: f32, b: f32, c: f32) -> Vec3F {
-    let det = a * c - b * b;
+    let det = (a * c - b * b).max(1e-6);
     let inv_det = det.recip();
     Vec3F {
         x: c * inv_det,
@@ -172,10 +176,11 @@ pub(crate) fn project_splats(
     sh_coeffs: &Array<f32>,
     sh_per_ch: u32,
     tile_bounds: Vec2F,
+    img_size: Vec2F,
     depth_order: &mut Array<u32>,
     depth_keys: &mut Array<u32>,
     projected_splats: &mut Array<f32>,
-    isect_counter: &Array<Atomic<u32>>,
+    counters: &Array<Atomic<u32>>,
     tile_ids: &mut Array<u32>,
     gaussian_ids: &mut Array<u32>,
 ) {
@@ -201,12 +206,16 @@ pub(crate) fn project_splats(
         let opacity = helpers::sigmoid(attributes[base + 10]);
 
         let (cam, rot) = to_camera_space(viewmat, mean);
+        if cam.z <= 0.1f32 {
+            terminate!();
+        }
         let cov3d = compute_cov3d(scale, quat);
-        let cov2d = compute_cov2d(cov3d, &rot, focal, cam);
+        let cov2d = compute_cov2d(cov3d, &rot, focal, cam, img_size);
         let conic = compute_conic(cov2d.x, cov2d.y, cov2d.z);
 
-        depth_order[ABSOLUTE_POS_X as usize] = ABSOLUTE_POS_X;
-        depth_keys[ABSOLUTE_POS_X as usize] = cam.z.to_bits();
+        let vis_slot = counters[1].fetch_add(1u32);
+        depth_order[vis_slot as usize] = vis_slot;
+        depth_keys[vis_slot as usize] = cam.z.to_bits();
 
         let dir = Vec3F {
             x: mean.x - camera_pos.x,
@@ -220,7 +229,7 @@ pub(crate) fn project_splats(
             x: focal.x * cam.x * inv_cam_z + pixel_center.x,
             y: focal.y * cam.y * inv_cam_z + pixel_center.y,
         };
-        let out_base = ABSOLUTE_POS_X as usize * 9;
+        let out_base = vis_slot as usize * 9;
         projected_splats[out_base] = mean2d.x;
         projected_splats[out_base + 1] = mean2d.y;
         projected_splats[out_base + 2] = conic.x;
@@ -239,9 +248,9 @@ pub(crate) fn project_splats(
         let tile_bbox = helpers::tile_bbox(mean2d, ext, tile_bounds);
         for ty in tile_bbox.min_y..tile_bbox.max_y {
             for tx in tile_bbox.min_x..tile_bbox.max_x {
-                let slot = isect_counter[0].fetch_add(1u32);
+                let slot = counters[0].fetch_add(1u32);
                 tile_ids[slot as usize] = tx + ty * tile_bounds.x as u32;
-                gaussian_ids[slot as usize] = ABSOLUTE_POS_X;
+                gaussian_ids[slot as usize] = vis_slot;
             }
         }
     }

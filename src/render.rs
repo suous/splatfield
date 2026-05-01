@@ -59,7 +59,7 @@ impl Splats {
         let depth_order = empty_tensor([total], device, U32);
         let depth_keys = empty_tensor([total], device, U32);
         let projected = empty_tensor([total, 9], device, F32);
-        let isect_counter = create_tensor_from_data([1], device, U32, &[0u32]);
+        let counters = create_tensor_from_data([2], device, U32, &[0u32, 0u32]);
         let tile_ids = empty_tensor([max_isects], device, U32);
         let gaussian_ids = empty_tensor([max_isects], device, U32);
         let viewmat = create_tensor_from_data([16], device, F32, &viewmat);
@@ -77,24 +77,25 @@ impl Splats {
             self.sh_coeffs.as_array_arg(),
             sh_per_ch,
             helpers::Vec2FLaunch::new(tile_bounds.x as f32, tile_bounds.y as f32),
+            helpers::Vec2FLaunch::new(img_size.x as f32, img_size.y as f32),
             depth_order.as_array_arg(),
             depth_keys.as_array_arg(),
             projected.as_array_arg(),
-            isect_counter.as_array_arg(),
+            counters.as_array_arg(),
             tile_ids.as_array_arg(),
             gaussian_ids.as_array_arg(),
         );
 
-        let num_isects = isect_counter.read_u32_at(0).await;
-        let (inv_perm, depth_order) = radix_argsort(depth_keys, depth_order, total as u32, 32);
+        let [num_isects, num_visible] = counters.read_pair().await;
+        let (inv_perm, depth_order) = radix_argsort(depth_keys, depth_order, num_visible, 32);
 
         invert_permutation::launch::<WgpuRuntime>(
             client,
-            cube_count_1d(client, total as u32, helpers::TILE_SIZE),
+            cube_count_1d(client, num_visible, helpers::TILE_SIZE),
             CubeDim::new_1d(helpers::TILE_SIZE),
             depth_order.as_array_arg(),
             inv_perm.as_array_arg(),
-            total as u32,
+            num_visible,
         );
 
         remap_global_ids::launch::<WgpuRuntime>(
@@ -108,7 +109,7 @@ impl Splats {
 
         // Two stable radix sorts equivalent to the paper's single composite key
         // (tile_id << depth_bits) | depth_id: first sort by depth, then by tile.
-        let gid_bits = u32::BITS - (total as u32).leading_zeros().max(1);
+        let gid_bits = u32::BITS - num_visible.leading_zeros().max(1);
         let (gaussian_ids, tile_ids) = radix_argsort(gaussian_ids, tile_ids, num_isects, gid_bits);
         let tile_bits = u32::BITS - (tile_bounds.x * tile_bounds.y).leading_zeros();
         let (tile_ids, gaussian_ids) = radix_argsort(tile_ids, gaussian_ids, num_isects, tile_bits);
