@@ -77,6 +77,7 @@ impl Splats {
             self.sh_coeffs.as_array_arg(),
             sh_per_ch,
             helpers::Vec2FLaunch::new(tile_bounds.x as f32, tile_bounds.y as f32),
+            helpers::Vec2FLaunch::new(img_size.x as f32, img_size.y as f32),
             depth_order.as_array_arg(),
             depth_keys.as_array_arg(),
             projected.as_array_arg(),

@@ -116,8 +116,12 @@ fn compute_cov3d(scale: Vec3F, quat: Vec4F) -> Covariance3D {
 }
 
 #[cube]
-fn compute_cov2d(cov3d: Covariance3D, rot: &Mat3, focal: Vec2F, cam: Vec3F) -> Vec3F {
+fn compute_cov2d(cov3d: Covariance3D, rot: &Mat3, focal: Vec2F, cam: Vec3F, img: Vec2F) -> Vec3F {
     let inv_cam_z = cam.z.recip();
+    let lim_x = 1.3 * img.x / (2.0 * focal.x);
+    let lim_y = 1.3 * img.y / (2.0 * focal.y);
+    let u = (cam.x * inv_cam_z).clamp(-lim_x, lim_x);
+    let v = (cam.y * inv_cam_z).clamp(-lim_y, lim_y);
     let rc_r0 = sym_mul_row(rot.row0, cov3d);
     let rc_r1 = sym_mul_row(rot.row1, cov3d);
     let rc_r2 = sym_mul_row(rot.row2, cov3d);
@@ -133,12 +137,12 @@ fn compute_cov2d(cov3d: Covariance3D, rot: &Mat3, focal: Vec2F, cam: Vec3F) -> V
     let j_r0 = Vec3F {
         x: focal.x * inv_cam_z,
         y: 0.0f32,
-        z: -focal.x * inv_cam_z * cam.x * inv_cam_z,
+        z: -focal.x * u * inv_cam_z,
     };
     let j_r1 = Vec3F {
         x: 0.0f32,
         y: focal.y * inv_cam_z,
-        z: -focal.y * inv_cam_z * cam.y * inv_cam_z,
+        z: -focal.y * v * inv_cam_z,
     };
 
     let jc_r0 = sym_mul_row(j_r0, cc);
@@ -172,6 +176,7 @@ pub(crate) fn project_splats(
     sh_coeffs: &Array<f32>,
     sh_per_ch: u32,
     tile_bounds: Vec2F,
+    img_size: Vec2F,
     depth_order: &mut Array<u32>,
     depth_keys: &mut Array<u32>,
     projected_splats: &mut Array<f32>,
@@ -201,11 +206,11 @@ pub(crate) fn project_splats(
         let opacity = helpers::sigmoid(attributes[base + 10]);
 
         let (cam, rot) = to_camera_space(viewmat, mean);
-        if cam.z <= 0.2f32 {
+        if cam.z <= 0.1f32 {
             terminate!();
         }
         let cov3d = compute_cov3d(scale, quat);
-        let cov2d = compute_cov2d(cov3d, &rot, focal, cam);
+        let cov2d = compute_cov2d(cov3d, &rot, focal, cam, img_size);
         let conic = compute_conic(cov2d.x, cov2d.y, cov2d.z);
 
         depth_order[ABSOLUTE_POS_X as usize] = ABSOLUTE_POS_X;
@@ -236,8 +241,8 @@ pub(crate) fn project_splats(
 
         let cutoff = (255.0f32 * opacity).ln();
         let ext = Vec2F {
-            x: (2.0 * cutoff * cov2d.x).sqrt().clamp(0.0, 1e3),
-            y: (2.0 * cutoff * cov2d.z).sqrt().clamp(0.0, 1e3),
+            x: (2.0 * cutoff * cov2d.x).sqrt(),
+            y: (2.0 * cutoff * cov2d.z).sqrt(),
         };
         let tile_bbox = helpers::tile_bbox(mean2d, ext, tile_bounds);
         for ty in tile_bbox.min_y..tile_bbox.max_y {
