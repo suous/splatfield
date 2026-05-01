@@ -152,7 +152,7 @@ fn compute_cov2d(cov3d: Covariance3D, rot: &Mat3, focal: Vec2F, cam: Vec3F) -> V
 
 #[cube]
 fn compute_conic(a: f32, b: f32, c: f32) -> Vec3F {
-    let det = a * c - b * b;
+    let det = (a * c - b * b).max(1e-6);
     let inv_det = det.recip();
     Vec3F {
         x: c * inv_det,
@@ -201,6 +201,9 @@ pub(crate) fn project_splats(
         let opacity = helpers::sigmoid(attributes[base + 10]);
 
         let (cam, rot) = to_camera_space(viewmat, mean);
+        if cam.z <= 0.2f32 {
+            terminate!();
+        }
         let cov3d = compute_cov3d(scale, quat);
         let cov2d = compute_cov2d(cov3d, &rot, focal, cam);
         let conic = compute_conic(cov2d.x, cov2d.y, cov2d.z);
@@ -233,8 +236,8 @@ pub(crate) fn project_splats(
 
         let cutoff = (255.0f32 * opacity).ln();
         let ext = Vec2F {
-            x: (2.0 * cutoff * cov2d.x).sqrt(),
-            y: (2.0 * cutoff * cov2d.z).sqrt(),
+            x: (2.0 * cutoff * cov2d.x).sqrt().clamp(0.0, 1e3),
+            y: (2.0 * cutoff * cov2d.z).sqrt().clamp(0.0, 1e3),
         };
         let tile_bbox = helpers::tile_bbox(mean2d, ext, tile_bounds);
         for ty in tile_bbox.min_y..tile_bbox.max_y {
