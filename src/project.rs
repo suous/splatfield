@@ -204,6 +204,9 @@ pub(crate) fn project_splats(
             z: attributes[base + 9].exp(),
         };
         let opacity = helpers::sigmoid(attributes[base + 10]);
+        if opacity < 1.0 / 255.0 {
+            terminate!();
+        }
 
         let (cam, rot) = to_camera_space(viewmat, mean);
         if cam.z <= 0.1f32 {

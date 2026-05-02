@@ -6,7 +6,7 @@ use cubecl::prelude::*;
 use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
 
 // Safety cap: 2 * max_tiles_per_dim * max_splats
-const INTERSECTS_UPPER_BOUND: u32 = 2 * 512 * 65535;
+const INTERSECTS_UPPER_BOUND: usize = 2 * 512 * 65535;
 
 #[derive(Debug, Clone)]
 pub struct Splats {
@@ -46,9 +46,8 @@ impl Splats {
         let device = &self.attributes.device;
         let total = self.attributes.shape[0];
         let tile_bounds = img_size.map(|c| c.div_ceil(helpers::TILE_WIDTH));
-        let max_isects = (tile_bounds.x * tile_bounds.y)
-            .saturating_mul(total as u32)
-            .min(INTERSECTS_UPPER_BOUND) as usize;
+        let num_tiles = (tile_bounds.x * tile_bounds.y) as usize;
+        let max_isects = num_tiles.saturating_mul(total).min(INTERSECTS_UPPER_BOUND);
 
         let focal = camera.focal(img_size);
         let pixel_center = img_size.as_vec2() * 0.5;
@@ -87,6 +86,7 @@ impl Splats {
         );
 
         let [num_isects, num_visible] = counters.read_pair().await;
+        let num_isects = num_isects.min(max_isects as u32);
         let (inv_perm, depth_order) = radix_argsort(depth_keys, depth_order, num_visible, 32);
 
         invert_permutation::launch::<WgpuRuntime>(
@@ -111,10 +111,10 @@ impl Splats {
         // (tile_id << depth_bits) | depth_id: first sort by depth, then by tile.
         let gid_bits = u32::BITS - num_visible.leading_zeros().max(1);
         let (gaussian_ids, tile_ids) = radix_argsort(gaussian_ids, tile_ids, num_isects, gid_bits);
-        let tile_bits = u32::BITS - (tile_bounds.x * tile_bounds.y).leading_zeros();
+        let tile_bits = u32::BITS - (num_tiles as u32).leading_zeros();
         let (tile_ids, gaussian_ids) = radix_argsort(tile_ids, gaussian_ids, num_isects, tile_bits);
 
-        let tile_ranges = empty_tensor([(tile_bounds.x * tile_bounds.y) as usize, 2], device, U32);
+        let tile_ranges = empty_tensor([num_tiles * 2], device, U32);
         build_tile_ranges::launch::<WgpuRuntime>(
             client,
             cube_count_1d(client, num_isects, helpers::TILE_SIZE),
