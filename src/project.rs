@@ -169,7 +169,6 @@ fn compute_conic(a: f32, b: f32, c: f32) -> Vec3F {
 pub(crate) fn project_splats(
     viewmat: &Array<f32>,
     focal: Vec2F,
-    pixel_center: Vec2F,
     camera_pos: Vec3F,
     total_splats: u32,
     attributes: &Array<f32>,
@@ -229,8 +228,8 @@ pub(crate) fn project_splats(
 
         let inv_cam_z = cam.z.recip();
         let mean2d = Vec2F {
-            x: focal.x * cam.x * inv_cam_z + pixel_center.x,
-            y: focal.y * cam.y * inv_cam_z + pixel_center.y,
+            x: focal.x * cam.x * inv_cam_z + img_size.x * 0.5,
+            y: focal.y * cam.y * inv_cam_z + img_size.y * 0.5,
         };
         let out_base = vis_slot as usize * 9;
         projected_splats[out_base] = mean2d.x;

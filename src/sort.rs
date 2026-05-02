@@ -211,6 +211,13 @@ mod radix_sort_tests {
         indices
     }
 
+    fn assert_sorted(keys: &[u32], values: &[u32], ref_keys: &[u32], ref_values: &[u32]) {
+        for (((k, v), rk), rv) in keys.iter().zip(values).zip(ref_keys).zip(ref_values) {
+            assert_eq!(k, rk);
+            assert_eq!(v, rv);
+        }
+    }
+
     #[test]
     fn test_sorting() {
         for i in 0..128u32 {
@@ -243,19 +250,10 @@ mod radix_sort_tests {
             let ret_values = tensor_to_vec::<u32>(ret_values);
 
             let inds = argsort(&keys_inp);
-
             let ref_keys: Vec<u32> = inds.iter().map(|&i| keys_inp[i]).collect();
             let ref_values: Vec<u32> = inds.iter().map(|&i| values_inp[i]).collect();
 
-            for (((key, val), ref_key), ref_val) in ret_keys
-                .iter()
-                .zip(ret_values.iter())
-                .zip(ref_keys)
-                .zip(ref_values)
-            {
-                assert_eq!(*key, ref_key);
-                assert_eq!(*val, ref_val);
-            }
+            assert_sorted(&ret_keys, &ret_values, &ref_keys, &ref_values);
         }
     }
 
@@ -288,15 +286,7 @@ mod radix_sort_tests {
         let ref_keys: Vec<u32> = inds.iter().map(|&i| keys_inp[i]).collect();
         let ref_values: Vec<u32> = inds.iter().map(|&i| values_inp[i]).collect();
 
-        for (((key, val), ref_key), ref_val) in ret_keys
-            .iter()
-            .zip(ret_values.iter())
-            .zip(ref_keys)
-            .zip(ref_values)
-        {
-            assert_eq!(*key, ref_key);
-            assert_eq!(*val, ref_val);
-        }
+        assert_sorted(&ret_keys, &ret_values, &ref_keys, &ref_values);
     }
 
     #[test]

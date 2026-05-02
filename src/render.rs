@@ -50,7 +50,6 @@ impl Splats {
         let max_isects = num_tiles.saturating_mul(total).min(INTERSECTS_UPPER_BOUND);
 
         let focal = camera.focal(img_size);
-        let pixel_center = img_size.as_vec2() * 0.5;
         let camera_pos = camera.position;
         let viewmat = glam::Mat4::from(camera.w2c()).transpose().to_cols_array();
         let sh_per_ch = self.sh_coeffs.shape[1] as u32;
@@ -69,7 +68,6 @@ impl Splats {
             CubeDim::new_1d(helpers::TILE_SIZE),
             viewmat.as_array_arg(),
             helpers::Vec2FLaunch::new(focal.x, focal.y),
-            helpers::Vec2FLaunch::new(pixel_center.x, pixel_center.y),
             helpers::Vec3FLaunch::new(camera_pos.x, camera_pos.y, camera_pos.z),
             total as u32,
             self.attributes.as_array_arg(),
