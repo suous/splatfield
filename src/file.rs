@@ -40,48 +40,63 @@ fn interleave_coeffs(sh_dc: Vec3, sh_rest: &[f32], result: &mut Vec<f32>) {
 
 pub fn load_ply(mut reader: impl Read, device: &WgpuDevice) -> Result<Splats, DeserializeError> {
     let mut file = PlyChunkedReader::new();
-    reader.read_to_end(file.buffer_mut())?;
-    let header = file
-        .header()
-        .ok_or_else(|| DeserializeError::custom("Missing PLY header"))?;
+    let mut buf = [0u8; 64 * 1024];
 
-    let vertex = header
-        .get_element("vertex")
-        .ok_or_else(|| DeserializeError::custom("Missing vertex element"))?;
+    let (vertex_count, rest_keys) = loop {
+        if let Some(header) = file.header() {
+            let vertex = header
+                .get_element("vertex")
+                .ok_or_else(|| DeserializeError::custom("Missing vertex element"))?;
+            let rest_keys: Vec<_> = vertex
+                .properties
+                .iter()
+                .filter(|&p| p.name.starts_with("f_rest_"))
+                .map(|p| p.name.clone())
+                .collect();
+            break (vertex.count, rest_keys);
+        }
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            return Err(DeserializeError::custom("Unexpected EOF before PLY header"));
+        }
+        file.buffer_mut().extend_from_slice(&buf[..n]);
+    };
 
-    let total = vertex.count;
-    let sh_count = vertex
-        .properties
-        .iter()
-        .filter(|x| x.name.starts_with("f_rest_") || x.name.starts_with("f_dc_"))
-        .count();
-
-    let mut attributes = Vec::with_capacity(total * 11);
-    let mut shs = Vec::with_capacity(total * sh_count.max(3));
+    let mut attributes = Vec::with_capacity(vertex_count * 11);
+    let mut shs = Vec::with_capacity(vertex_count * (rest_keys.len() + 3));
     let mut min = Vec3::splat(f32::MAX);
     let mut max = Vec3::splat(f32::MIN);
+    let mut rb = Vec::with_capacity(rest_keys.len());
 
-    let rc = sh_count.saturating_sub(3);
-    let mut rb = Vec::with_capacity(rc);
-    let mut count = 0;
-    while count < total {
-        RowVisitor::new(|gs: PlyGaussian| {
-            count += 1;
-            let q = glam::Vec4::new(gs.rot_0, gs.rot_1, gs.rot_2, gs.rot_3);
-            let q = q.normalize_or(glam::Vec4::X);
-            let pos = Vec3::new(gs.x, gs.y, gs.z);
-            min = min.min(pos);
-            max = max.max(pos);
-            attributes.extend([
-                gs.x, gs.y, gs.z, q.x, q.y, q.z, q.w, gs.scale_0, gs.scale_1, gs.scale_2,
-                gs.opacity,
-            ]);
+    let mut row_visitor = RowVisitor::new(|gs: PlyGaussian| {
+        let q = glam::Vec4::new(gs.rot_0, gs.rot_1, gs.rot_2, gs.rot_3).normalize_or(glam::Vec4::X);
+        let pos = Vec3::new(gs.x, gs.y, gs.z);
+        min = min.min(pos);
+        max = max.max(pos);
 
-            rb.clear();
-            rb.extend((0..rc).map(|i| gs.sh.get(&format!("f_rest_{i}")).copied().unwrap_or(0.0)));
-            interleave_coeffs(Vec3::new(gs.f_dc_0, gs.f_dc_1, gs.f_dc_2), &rb, &mut shs);
-        })
-        .deserialize(&mut file)?;
+        attributes.extend([
+            gs.x, gs.y, gs.z, q.x, q.y, q.z, q.w, gs.scale_0, gs.scale_1, gs.scale_2, gs.opacity,
+        ]);
+
+        rb.clear();
+        rb.extend(
+            rest_keys
+                .iter()
+                .map(|k| gs.sh.get(k).copied().unwrap_or(0.0)),
+        );
+        interleave_coeffs(Vec3::new(gs.f_dc_0, gs.f_dc_1, gs.f_dc_2), &rb, &mut shs);
+    });
+
+    loop {
+        (&mut row_visitor).deserialize(&mut file)?;
+        if file.current_element().is_none() {
+            break;
+        }
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            return Err(DeserializeError::custom("Unexpected EOF while reading PLY"));
+        }
+        file.buffer_mut().extend_from_slice(&buf[..n]);
     }
 
     Ok(Splats::new(&attributes, &shs, device, (min, max)))
