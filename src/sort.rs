@@ -11,8 +11,9 @@ const SORT_BINS: u32 = 16;
 const ELEMS_PER_THREAD: u32 = 32;
 const SORT_BLOCK: u32 = SORT_WG * ELEMS_PER_THREAD;
 
-// Custom plane functions using shared memory — cubecl's built-in plane_sum/
-// plane_exclusive_sum generate subgroup ops which aren't available on WASM.
+// Shared memory fallbacks for WASM — cubecl's built-in plane ops generate
+// subgroup ops which aren't available on WebGPU. Native uses the built-ins.
+#[cfg(target_arch = "wasm32")]
 #[cube]
 fn plane_sum(value: u32) -> u32 {
     let mut lds = SharedMemory::<u32>::new(SORT_WG as usize);
@@ -31,6 +32,7 @@ fn plane_sum(value: u32) -> u32 {
     lds[0]
 }
 
+#[cfg(target_arch = "wasm32")]
 #[cube]
 fn plane_exclusive_sum(value: u32) -> u32 {
     let mut lds = SharedMemory::<u32>::new(SORT_WG as usize);
