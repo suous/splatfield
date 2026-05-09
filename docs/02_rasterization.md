@@ -97,9 +97,9 @@ inversion.
 $$
 \mathbf{C} = \boldsymbol{\Sigma}_{2d}^{-1}
 = \frac{1}{ac - b^2}
-\begin{pmatrix} 
-c & -b \\ 
--b & a 
+\begin{pmatrix}
+c & -b \\
+-b & a
 \end{pmatrix}
 $$
 
@@ -125,17 +125,17 @@ Expanding the quadratic form:
 $$
 \begin{aligned}
 \text{power} &= \frac{1}{2}\Delta^T\mathbf{C}\Delta \\
-             &= \frac{1}{2}\begin{pmatrix} 
-             \Delta_x & \Delta_y 
+             &= \frac{1}{2}\begin{pmatrix}
+             \Delta_x & \Delta_y
              \end{pmatrix}
-                \begin{pmatrix} 
-                a & b 
-                \\ 
-                b & c 
+                \begin{pmatrix}
+                a & b
+                \\
+                b & c
                 \end{pmatrix}
-                \begin{pmatrix} 
-                \Delta_x \\ 
-                \Delta_y 
+                \begin{pmatrix}
+                \Delta_x \\
+                \Delta_y
                 \end{pmatrix} \\
              &= \frac{1}{2}(a\Delta_x^2 + c\Delta_y^2)
                 + b\Delta_x\Delta_y

@@ -6,6 +6,8 @@
 use crate::helpers::{self, Covariance3D, Mat3, Vec2F, Vec3F, Vec4F};
 use cubecl::prelude::*;
 
+const ALPHA_CUTOFF: f32 = 10.0 / 255.0;
+
 #[cube]
 fn dot3(a: Vec3F, b: Vec3F) -> f32 {
     a.x * b.x + a.y * b.y + a.z * b.z
@@ -203,7 +205,7 @@ pub(crate) fn project_splats(
             z: attributes[base + 9].exp(),
         };
         let opacity = helpers::sigmoid(attributes[base + 10]);
-        if opacity < 1.0 / 255.0 {
+        if opacity < ALPHA_CUTOFF {
             terminate!();
         }
 
@@ -242,7 +244,7 @@ pub(crate) fn project_splats(
         projected_splats[out_base + 7] = b + 0.5f32;
         projected_splats[out_base + 8] = opacity;
 
-        let cutoff = (255.0f32 * opacity).ln();
+        let cutoff = (opacity / ALPHA_CUTOFF).ln();
         let ext = Vec2F {
             x: (2.0 * cutoff * cov2d.x).sqrt(),
             y: (2.0 * cutoff * cov2d.z).sqrt(),

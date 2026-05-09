@@ -4,7 +4,7 @@ version = "0.1.1"
 edition = "2024"
 
 [dependencies]
-cubecl = { version = "0.10.0-pre.3", features = ["wgpu", "std", "stdlib"] }
+cubecl = { version = "0.10.0", features = ["wgpu", "std", "stdlib"] }
 bytemuck = { version = "1.25", features = ["derive"] }
 glam = "0.32.1"
 egui = "0.34"
@@ -20,7 +20,7 @@ pollster = "0.4"
 env_logger = "0.11.9"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-cubecl-common = { version = "0.10.0-pre.3", features = ["serde"] }
+cubecl-common = { version = "0.10.0", features = ["serde"] }
 eframe = { version = "0.34", features = ["wgpu"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
