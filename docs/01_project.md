@@ -280,7 +280,7 @@ where $W = 16$ is the tile width and $(n_x, n_y)$ is the tile grid dimensions.
 
 The Gaussian emits one `(tile_id, gaussian_id)` intersection pair for every tile
 $(t_x, t_y)$ in this range, where
-$\text{tile\_id} = t_x + t_y \cdot n_x$. Gaussians spanning many tiles produce
+$\text{tile}_{\text{id}} = t_x + t_y \cdot n_x$. Gaussians spanning many tiles produce
 many intersections — this is the primary factor in intersection buffer sizing.
 
 ### Why the Conservative Bound?
