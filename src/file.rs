@@ -32,9 +32,9 @@ struct PlyGaussian {
     pub sh: HashMap<String, f32>,
 }
 
-fn interleave_coeffs(sh_dc: Vec3, sh_rest: &[f32], result: &mut Vec<f32>) {
+fn interleave_coeffs(sh_dc: &[f32], sh_rest: &[f32], result: &mut Vec<f32>) {
     let n = sh_rest.len() / 3;
-    result.extend([sh_dc.x, sh_dc.y, sh_dc.z]);
+    result.extend_from_slice(sh_dc);
     result.extend((0..n).flat_map(|i| (0..3).map(move |j| sh_rest[j * n + i])));
 }
 
@@ -74,7 +74,7 @@ pub fn load_ply(mut reader: impl Read, device: &WgpuDevice) -> Result<Splats, De
         min = min.min(pos);
         max = max.max(pos);
 
-        attributes.extend([
+        attributes.extend_from_slice(&[
             gs.x, gs.y, gs.z, q.x, q.y, q.z, q.w, gs.scale_0, gs.scale_1, gs.scale_2, gs.opacity,
         ]);
 
@@ -84,7 +84,7 @@ pub fn load_ply(mut reader: impl Read, device: &WgpuDevice) -> Result<Splats, De
                 .iter()
                 .map(|k| gs.sh.get(k).copied().unwrap_or(0.0)),
         );
-        interleave_coeffs(Vec3::new(gs.f_dc_0, gs.f_dc_1, gs.f_dc_2), &rb, &mut shs);
+        interleave_coeffs(&[gs.f_dc_0, gs.f_dc_1, gs.f_dc_2], &rb, &mut shs);
     });
 
     loop {
