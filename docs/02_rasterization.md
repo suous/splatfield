@@ -166,7 +166,7 @@ behind it. Gaussians with $\alpha < \frac{1}{255}$ are skipped entirely
 
 ![Alpha Compositing](../assets/composition.png)
 
-<sup>[Interactive version](compositing.svg)</sup>
+<sup>[Interactive version](https://suous.github.io/splatfield/docs/compositing.svg)</sup> <!-- rumdl-disable-line MD033 -->
 
 3DGS uses **front-to-back** volume rendering. The accumulated color at a
 pixel is:
