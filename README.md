@@ -21,6 +21,13 @@ Built to learn the details of [3D Gaussian Splatting](https://arxiv.org/abs/2308
 | [Projection](docs/01_project.md) | 3D covariance, local affine approximation, and 2D covariance projection |
 | [Rasterization](docs/02_rasterization.md) | Tile-based dispatch, per-pixel evaluation, and alpha compositing |
 
+### Interactive Diagrams
+
+| Diagram | Description |
+|---------|-------------|
+| [Tile Intersection](https://suous.github.io/splatfield/docs/intersects.svg) | Drag to reshape the Gaussian and see tile coverage change |
+| [Alpha Compositing](https://suous.github.io/splatfield/docs/compositing.svg) | Drag splats, adjust opacity and depth order, inspect pixel blending |
+
 ## Architecture
 
 6 GPU kernel passes per frame:
