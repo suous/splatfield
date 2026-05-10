@@ -288,7 +288,7 @@ many intersections — this is the primary factor in intersection buffer sizing.
 ![Bounding box vs. rotated ellipse](../assets/bounding.png)
 *Taken from [FastGS](https://fastgs.github.io/)*
 
-<sup>[Interactive version](https://suous.github.io/splatfield/docs/intersects.svg)</sup> <!-- rumdl-disable-line MD033 -->
+<sup>[Interactive version](https://suous.github.io/splatfield/intersects.svg)</sup> <!-- rumdl-disable-line MD033 -->
 
 Dropping the off-diagonal term $b$ means the bounding rectangle may cover tiles
 that the rotated ellipse doesn't actually reach. This wastes some intersection
