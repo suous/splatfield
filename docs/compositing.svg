@@ -1,0 +1,327 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="640" viewBox="0 0 960 640">
+    <defs>
+        <clipPath id="grid-clip">
+            <path d="M20 50h512v512H20z"/>
+        </clipPath>
+        <pattern id="grid" width="32" height="32" patternUnits="userSpaceOnUse">
+            <path fill="#fafafa" d="M0 0h32v32H0z"/>
+            <path fill="none" stroke="#d0d0d0" d="M32 0H0v32"/>
+        </pattern>
+        <filter id="panelShadow" width="104%" height="103%" x="-2%" y="-1%">
+            <feDropShadow dx="0" dy="1" flood-color="#00000018" stdDeviation="3"/>
+        </filter>
+    </defs>
+    <style>
+        text{font-family:'SF Mono','Menlo','Consolas',monospace}
+    </style>
+    <rect width="960" height="640" fill="#f8f8f6" rx="4"/>
+    <text x="276" y="30" fill="#3d3d3a" font-size="17" font-weight="bold" text-anchor="middle">Alpha Compositing</text>
+    <text x="276" y="45" fill="#87867f" font-size="10" text-anchor="middle">Drag splats to move · Click grid to inspect pixel</text>
+    <path fill="url(#grid)" stroke="#87867f" stroke-width="1.5" d="M20 50h512v512H20z"/>
+    <g id="splats-group" clip-path="url(#grid-clip)"></g>
+    <g id="crosshair" opacity=".8">
+        <line stroke="#333" stroke-dasharray="3,2"/>
+        <line stroke="#333" stroke-dasharray="3,2"/>
+        <circle r="4" fill="none" stroke="#333" stroke-width="1.5"/>
+    </g>
+    <rect width="395" height="610" x="550" y="15" fill="#fff" stroke="#d0cec8" stroke-width="1.5" filter="url(#panelShadow)" rx="6"/>
+    <g id="right-panel"></g>
+    <text x="565" y="523" fill="#3d3d3a" font-size="12" font-weight="bold">Algorithm</text>
+    <text x="569" y="539" fill="#5a5a58" font-size="10">T ← 1.0,  C ← (0, 0, 0)</text>
+    <text x="569" y="553" fill="#87867f" font-size="10">for each Gᵢ (front → back):</text>
+    <text x="583" y="567" fill="#87867f" font-size="10">αᵢ = opacityᵢ · exp(−½ dᵢᵀ C dᵢ)</text>
+    <text x="583" y="581" fill="#87867f" font-size="10">C ← C + cᵢ · αᵢ · T</text>
+    <text x="583" y="595" fill="#87867f" font-size="10">T ← T · (1 − αᵢ)</text>
+    <script type="text/javascript">
+        <![CDATA[
+    var NS = 'http://www.w3.org/2000/svg';
+    var svg = document.ownerSVGElement || document.documentElement;
+
+    // Grid geometry
+    var GX = 20, GY = 50, GW = 512, GH = 512;
+
+    // Gaussian definitions
+    var gaussians = [
+      { name:'G\u2081', color:[0.88,0.33,0.33], hex:'#E05555', opacity:0.70,
+        cx:170, cy:190, rx:130, ry:85,  angle:-15 },
+      { name:'G\u2082', color:[0.33,0.47,0.88], hex:'#5577E0', opacity:0.50,
+        cx:320, cy:170, rx:100, ry:100, angle:0 },
+      { name:'G\u2083', color:[0.33,0.72,0.33], hex:'#55B855', opacity:0.80,
+        cx:250, cy:320, rx:90,  ry:130, angle:20 },
+      { name:'G\u2084', color:[0.60,0.33,0.80], hex:'#9955CC', opacity:0.40,
+        cx:350, cy:350, rx:110, ry:75,  angle:-25 },
+      { name:'G\u2085', color:[0.88,0.63,0.19], hex:'#E0A030', opacity:0.60,
+        cx:140, cy:350, rx:85,  ry:95,  angle:10 }
+    ];
+
+    var order = [2, 0, 4, 1, 3];
+
+    // Generate gradients
+    var defs = svg.querySelector('defs');
+    gaussians.forEach(function(g, i) {
+      var grad = document.createElementNS(NS, 'radialGradient');
+      grad.id = 'grad' + i;
+      grad.setAttribute('cx', '50%');
+      grad.setAttribute('cy', '50%');
+      grad.setAttribute('r', '50%');
+      [1,.75,.32,.08,.01].forEach(function(op, j) {
+        var stop = document.createElementNS(NS, 'stop');
+        stop.setAttribute('offset', (j * 25) + '%');
+        stop.setAttribute('stop-color', g.hex);
+        stop.setAttribute('stop-opacity', String(op));
+        grad.appendChild(stop);
+      });
+      defs.insertBefore(grad, defs.firstChild);
+    });
+
+    // Cache DOM references
+    var splatsGroup = document.getElementById('splats-group');
+    var chLines = document.getElementById('crosshair').querySelectorAll('line');
+    var chCircle = document.getElementById('crosshair').querySelector('circle');
+    var rightPanel = document.getElementById('right-panel');
+
+    // Create splat ellipses once
+    var splatEls = gaussians.map(function(g, i) {
+      var e = document.createElementNS(NS, 'ellipse');
+      e.setAttribute('fill', 'url(#grad' + i + ')');
+      e.setAttribute('stroke', g.hex);
+      e.setAttribute('stroke-width', '1');
+      e.setAttribute('data-gi', i);
+      e.style.cursor = 'move';
+      splatsGroup.appendChild(e);
+      return e;
+    });
+
+    var crossX = 250, crossY = 260;
+
+    // Helpers
+    function el(tag, attrs, parent) {
+      var e = document.createElementNS(NS, tag);
+      for (var k in attrs) e.setAttribute(k, attrs[k]);
+      if (parent) parent.appendChild(e);
+      return e;
+    }
+    function clearEl(e) { e.replaceChildren(); }
+    function mousePos(evt) {
+      var pt = svg.createSVGPoint();
+      pt.x = evt.clientX; pt.y = evt.clientY;
+      return pt.matrixTransform(svg.getScreenCTM().inverse());
+    }
+    function rgbStr(c) {
+      return 'rgb(' + c.map(function(v) { return Math.round(Math.min(255, v * 255)); }) + ')';
+    }
+    function clamp(v,lo,hi) { return Math.max(lo,Math.min(hi,v)); }
+    function vscale(a,s) { return [a[0]*s, a[1]*s, a[2]*s]; }
+    function vadd(a,b) { return [a[0]+b[0], a[1]+b[1], a[2]+b[2]]; }
+
+    // Compute per-pixel alpha for a Gaussian at (px, py) in grid coords
+    function pixelAlpha(g, px, py) {
+      var dx = px - g.cx, dy = py - g.cy;
+      var a = g.angle * Math.PI / 180;
+      var ca = Math.cos(a), sa = Math.sin(a);
+      var lx = dx*ca + dy*sa;
+      var ly = -dx*sa + dy*ca;
+      var r2 = (lx/g.rx)*(lx/g.rx) + (ly/g.ry)*(ly/g.ry);
+      return g.opacity * Math.exp(-4.5 * r2);
+    }
+
+    function computeAtCrosshair() {
+      var px = crossX, py = crossY;
+      var T = 1.0, C = [0,0,0];
+      var steps = [];
+      for (var i = 0; i < order.length; i++) {
+        var g = gaussians[order[i]];
+        var alpha = Math.min(pixelAlpha(g, px, py), 0.999);
+        var contrib = vscale(g.color, alpha * T);
+        C = vadd(C, contrib);
+        steps.push({ gi:order[i], alpha:alpha, T:T, C:C.slice(), contrib:contrib.slice() });
+        T *= (1 - alpha);
+      }
+      return { steps:steps, finalC:C, finalT:T };
+    }
+
+    // ========== RENDER ==========
+    function renderAll() {
+      renderSplats();
+      renderCrosshair();
+      renderRight();
+    }
+
+    function renderSplats() {
+      for (var i = order.length - 1; i >= 0; i--) {
+        var gi = order[i];
+        var g = gaussians[gi];
+        var e = splatEls[gi];
+        e.setAttribute('cx', GX + g.cx);
+        e.setAttribute('cy', GY + g.cy);
+        e.setAttribute('rx', g.rx);
+        e.setAttribute('ry', g.ry);
+        e.setAttribute('transform', 'rotate(' + g.angle + ',' + (GX + g.cx) + ',' + (GY + g.cy) + ')');
+        e.setAttribute('opacity', g.opacity);
+        splatsGroup.appendChild(e);
+      }
+    }
+
+    function renderCrosshair() {
+      var sx = GX + crossX, sy = GY + crossY;
+      chLines[0].setAttribute('x1', sx); chLines[0].setAttribute('y1', GY);
+      chLines[0].setAttribute('x2', sx); chLines[0].setAttribute('y2', GY + GH);
+      chLines[1].setAttribute('x1', GX); chLines[1].setAttribute('y1', sy);
+      chLines[1].setAttribute('x2', GX + GW); chLines[1].setAttribute('y2', sy);
+      chCircle.setAttribute('cx', sx); chCircle.setAttribute('cy', sy);
+    }
+
+    function renderRight() {
+      clearEl(rightPanel);
+      var rx = 565, ry = 35;
+      var panelW = 365;
+
+      // Layer Order
+      el('text', { x:rx, y:ry, 'font-size':'13', 'font-weight':'bold', fill:'#3D3D3A' }, rightPanel)
+        .textContent = 'Layer Order (front \u2192 back)';
+      ry += 20;
+
+      for (var i = 0; i < order.length; i++) {
+        var gi = order[i];
+        var g = gaussians[gi];
+        var rowY = ry + i * 52;
+
+        el('rect', { x:rx-2, y:rowY-6, width:panelW+4, height:46, rx:4,
+          fill: i===0 ? '#f5f5f0' : '#fafaf8', stroke:'#e0dfd8', 'stroke-width':'1' }, rightPanel);
+        el('circle', { cx:rx+10, cy:rowY+10, r:6, fill:g.hex }, rightPanel);
+
+        var nt = el('text', { x:rx+24, y:rowY+14, 'font-size':'12', 'font-weight':'bold', fill:g.hex }, rightPanel);
+        nt.textContent = g.name + '  z=' + (i+1);
+        nt.setAttribute('data-gi', gi);
+        nt.style.cursor = 'pointer';
+
+        if (i > 0) {
+          var upBtn = el('text', { x:rx+100, y:rowY+14, 'font-size':'12', fill:'#87867F',
+            'data-action':'up', 'data-idx':i, style:'cursor:pointer' }, rightPanel);
+          upBtn.textContent = '\u25B2';
+        }
+        if (i < order.length - 1) {
+          var dnBtn = el('text', { x:rx+116, y:rowY+14, 'font-size':'12', fill:'#87867F',
+            'data-action':'down', 'data-idx':i, style:'cursor:pointer' }, rightPanel);
+          dnBtn.textContent = '\u25BC';
+        }
+
+        var slX = rx + 140, slW = 150;
+        el('rect', { x:slX, y:rowY+6, width:slW, height:6, rx:3, fill:'#e0dfd8' }, rightPanel);
+        el('rect', { x:slX, y:rowY+6, width:slW*g.opacity, height:6, rx:3, fill:g.hex, opacity:'0.6' }, rightPanel);
+        var thumb = el('circle', {
+          cx: slX + slW*g.opacity, cy: rowY+9, r:7,
+          fill:'#fff', stroke:g.hex, 'stroke-width':'2',
+          'data-role':'slider', 'data-gi':gi, style:'cursor:ew-resize'
+        }, rightPanel);
+        el('text', { x:slX+slW+8, y:rowY+14, 'font-size':'10', fill:'#87867F' }, rightPanel)
+          .textContent = '\u03B1=' + g.opacity.toFixed(2);
+        thumb.dataset.sx = slX;
+        thumb.dataset.sw = slW;
+      }
+
+      ry += order.length * 52 + 16;
+
+      // Pixel Inspector
+      el('text', { x:rx, y:ry, 'font-size':'13', 'font-weight':'bold', fill:'#3D3D3A' }, rightPanel)
+        .textContent = 'Pixel Inspector';
+      ry += 16;
+      el('text', { x:rx, y:ry, 'font-size':'10', fill:'#87867F' }, rightPanel)
+        .textContent = 'pos: (' + Math.round(crossX) + ', ' + Math.round(crossY) + ')  \u2014  click grid to move';
+      ry += 18;
+
+      var result = computeAtCrosshair();
+      for (var s = 0; s < result.steps.length; s++) {
+        var step = result.steps[s];
+        var sg = gaussians[step.gi];
+        var stepY = ry + s * 18;
+        el('circle', { cx:rx+6, cy:stepY-3, r:4, fill:sg.hex }, rightPanel);
+        var st = el('text', { x:rx+16, y:stepY+1, 'font-size':'10', fill:'#5a5a58' }, rightPanel);
+        st.textContent = sg.name + '  \u03B1=' + step.alpha.toFixed(3) +
+          '  T=' + step.T.toFixed(3) +
+          '  \u0394=' + rgbStr(step.contrib);
+      }
+
+      ry += result.steps.length * 18 + 12;
+
+      // Final color swatch
+      el('rect', { x:rx, y:ry, width:40, height:40, rx:5,
+        fill:rgbStr(result.finalC), stroke:'#5a5a58', 'stroke-width':'2' }, rightPanel);
+      el('text', { x:rx+50, y:ry+14, 'font-size':'11', 'font-weight':'bold', fill:'#3D3D3A' }, rightPanel)
+        .textContent = 'Final pixel';
+      el('text', { x:rx+50, y:ry+28, 'font-size':'10', fill:'#87867F' }, rightPanel)
+        .textContent = rgbStr(result.finalC) + '  T=' + result.finalT.toFixed(3);
+    }
+
+    // ========== INTERACTION ==========
+    var dragState = null;
+
+    svg.addEventListener('mousedown', function(evt) {
+      var target = evt.target;
+      var pos = mousePos(evt);
+
+      if (target.dataset.role === 'slider') {
+        evt.preventDefault();
+        dragState = { type:'slider', gi:parseInt(target.dataset.gi),
+          sx:parseFloat(target.dataset.sx), sw:parseFloat(target.dataset.sw) };
+        return;
+      }
+
+      if (target.dataset.action === 'up' || target.dataset.action === 'down') {
+        evt.preventDefault();
+        var idx = parseInt(target.dataset.idx);
+        var dir = target.dataset.action === 'up' ? -1 : 1;
+        var tmp = order[idx];
+        order[idx] = order[idx + dir];
+        order[idx + dir] = tmp;
+        renderAll();
+        return;
+      }
+
+      if (target.dataset.gi !== undefined && target.tagName === 'ellipse') {
+        evt.preventDefault();
+        var gi = parseInt(target.dataset.gi);
+        var g = gaussians[gi];
+        dragState = {
+          type:'splat', gi:gi,
+          offsetX: pos.x - (GX + g.cx),
+          offsetY: pos.y - (GY + g.cy)
+        };
+        return;
+      }
+
+      var gx = pos.x - GX, gy = pos.y - GY;
+      if (gx >= 0 && gx < GW && gy >= 0 && gy < GH) {
+        crossX = gx; crossY = gy;
+        renderAll();
+      }
+    });
+
+    document.addEventListener('mousemove', function(evt) {
+      if (!dragState) return;
+      evt.preventDefault();
+      var pos = mousePos(evt);
+
+      if (dragState.type === 'slider') {
+        var g = gaussians[dragState.gi];
+        var ratio = (pos.x - dragState.sx) / dragState.sw;
+        g.opacity = clamp(Math.round(ratio*100)/100, 0.05, 0.99);
+        renderAll();
+      }
+
+      if (dragState.type === 'splat') {
+        var g = gaussians[dragState.gi];
+        g.cx = clamp(pos.x - dragState.offsetX - GX, 0, GW);
+        g.cy = clamp(pos.y - dragState.offsetY - GY, 0, GH);
+        renderAll();
+      }
+    });
+
+    document.addEventListener('mouseup', function() {
+      dragState = null;
+    });
+
+    renderAll();
+  ]]>
+    </script>
+</svg>

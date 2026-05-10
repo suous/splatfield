@@ -164,6 +164,10 @@ behind it. Gaussians with $\alpha < \frac{1}{255}$ are skipped entirely
 
 ## 3. Alpha Compositing
 
+![Alpha Compositing](../assets/composition.png)
+
+<sup>[Interactive version](compositing.svg)</sup>
+
 3DGS uses **front-to-back** volume rendering. The accumulated color at a
 pixel is:
 
