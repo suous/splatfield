@@ -1,0 +1,218 @@
+<svg
+  width="720"
+  height="720"
+  viewBox="0 0 720 720"
+  xmlns="http://www.w3.org/2000/svg"
+>
+  <defs>
+    <pattern
+      id="grid"
+      width="32"
+      height="32"
+      patternUnits="userSpaceOnUse"
+      patternTransform="translate(80, 40)"
+    >
+      <rect width="32" height="32" fill="#fafafa" />
+      <path
+        d="M 32 0 L 0 0 0 32"
+        fill="none"
+        stroke="#d0d0d0"
+        stroke-width="1"
+      />
+    </pattern>
+
+    <radialGradient id="gaussianGradient" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#D97757" stop-opacity="0.90" />
+      <stop offset="25%" stop-color="#D97757" stop-opacity="0.67" />
+      <stop offset="50%" stop-color="#D97757" stop-opacity="0.31" />
+      <stop offset="75%" stop-color="#D97757" stop-opacity="0.08" />
+      <stop offset="100%" stop-color="#D97757" stop-opacity="0.01" />
+    </radialGradient>
+  </defs>
+
+  <rect
+    x="80"
+    y="40"
+    width="512"
+    height="512"
+    fill="url(#grid)"
+    stroke="#87867F"
+    stroke-width="1.5"
+  />
+
+  <clipPath id="grid-clip">
+    <rect x="80" y="40" width="512" height="512" />
+  </clipPath>
+
+  <g clip-path="url(#grid-clip)">
+    <rect
+      id="bbox"
+      x="144"
+      y="136"
+      width="384"
+      height="288"
+      fill="#F0EEE6"
+      fill-opacity="0.3"
+      stroke="#3D3D3A"
+      stroke-width="1.5"
+      stroke-dasharray="8,4"
+      rx="2"
+    />
+    <rect
+      id="tight-bbox"
+      x="144"
+      y="136"
+      width="384"
+      height="288"
+      fill="#E3DACC"
+      fill-opacity="0.6"
+      stroke="#788C5D"
+      stroke-width="2.5"
+      stroke-dasharray="4,3"
+      rx="1"
+    />
+    <ellipse
+      id="gaussian"
+      cx="336"
+      cy="280"
+      rx="190"
+      ry="75"
+      transform="rotate(30, 336, 280)"
+      fill="url(#gaussianGradient)"
+      stroke="#D97757"
+      stroke-width="2"
+      style="cursor: move"
+    />
+    <circle
+      id="handle-rx"
+      cx="0"
+      cy="0"
+      r="5"
+      fill="white"
+      stroke="#D97757"
+      stroke-width="1.5"
+      style="cursor: ew-resize"
+    />
+    <circle
+      id="handle-ry"
+      cx="0"
+      cy="0"
+      r="5"
+      fill="white"
+      stroke="#D97757"
+      stroke-width="1.5"
+      style="cursor: ns-resize"
+    />
+  </g>
+
+  <text
+    id="size-label"
+    x="336"
+    y="510"
+    text-anchor="middle"
+    font-family="monospace"
+    font-size="12"
+    fill="#D97757"
+    opacity="0"
+  >
+    rx=190 ry=75
+  </text>
+
+  <script type="text/javascript">
+    <![CDATA[
+        var el = document.getElementById('gaussian');
+        var hRx = document.getElementById('handle-rx');
+        var hRy = document.getElementById('handle-ry');
+        var label = document.getElementById('size-label');
+        var bbox = document.getElementById('bbox');
+        var tightBbox = document.getElementById('tight-bbox');
+        var svg = el.ownerSVGElement;
+        var cosA = Math.cos(30 * Math.PI / 180);
+        var sinA = Math.sin(30 * Math.PI / 180);
+        var TILE = 32, GX = 80, GY = 40, TIGHT = 0.5;
+
+        function update() {
+          var cx = +el.getAttribute('cx');
+          var cy = +el.getAttribute('cy');
+          var rx = +el.getAttribute('rx');
+          var ry = +el.getAttribute('ry');
+
+          hRx.setAttribute('cx', cx + rx * cosA);
+          hRx.setAttribute('cy', cy + rx * sinA);
+          hRy.setAttribute('cx', cx - ry * sinA);
+          hRy.setAttribute('cy', cy + ry * cosA);
+          label.textContent = 'rx=' + Math.round(rx) + '  ry=' + Math.round(ry);
+
+          var hw = Math.sqrt(rx*rx*cosA*cosA + ry*ry*sinA*sinA);
+          var hh = Math.sqrt(rx*rx*sinA*sinA + ry*ry*cosA*cosA);
+          var minX = Math.floor((cx - hw - GX) / TILE) * TILE + GX;
+          var minY = Math.floor((cy - hh - GY) / TILE) * TILE + GY;
+          var maxX = Math.ceil((cx + hw - GX) / TILE) * TILE + GX;
+          var maxY = Math.ceil((cy + hh - GY) / TILE) * TILE + GY;
+
+          bbox.setAttribute('x', minX);
+          bbox.setAttribute('y', minY);
+          bbox.setAttribute('width', maxX - minX);
+          bbox.setAttribute('height', maxY - minY);
+
+          tightBbox.setAttribute('x', cx - hw * TIGHT);
+          tightBbox.setAttribute('y', cy - hh * TIGHT);
+          tightBbox.setAttribute('width', 2 * hw * TIGHT);
+          tightBbox.setAttribute('height', 2 * hh * TIGHT);
+        }
+
+        update();
+
+        function mousePos(evt) {
+          var pt = svg.createSVGPoint();
+          pt.x = evt.clientX;
+          pt.y = evt.clientY;
+          return pt.matrixTransform(svg.getScreenCTM().inverse());
+        }
+
+        var dragging = null, startVal, startMouse;
+
+        function onHandle(axis, e) {
+          e.preventDefault(); e.stopPropagation();
+          dragging = axis; startVal = +el.getAttribute(axis); startMouse = mousePos(e);
+        }
+        hRx.addEventListener('mousedown', onHandle.bind(null, 'rx'));
+        hRy.addEventListener('mousedown', onHandle.bind(null, 'ry'));
+
+        el.addEventListener('mousedown', function(e) {
+          e.preventDefault(); e.stopPropagation();
+          dragging = 'move'; startMouse = mousePos(e); el.style.cursor = 'grabbing';
+        });
+
+        document.addEventListener('mousemove', function(e) {
+          if (!dragging) return;
+          var pos = mousePos(e);
+          var dx = pos.x - startMouse.x;
+          var dy = pos.y - startMouse.y;
+
+          if (dragging === 'rx') {
+            el.setAttribute('rx', Math.max(10, startVal + dx * cosA + dy * sinA));
+          } else if (dragging === 'ry') {
+            el.setAttribute('ry', Math.max(10, startVal - dx * sinA + dy * cosA));
+          } else {
+            el.setAttribute('cx', +el.getAttribute('cx') + dx);
+            el.setAttribute('cy', +el.getAttribute('cy') + dy);
+            el.setAttribute('transform', 'rotate(30,' + el.getAttribute('cx') + ',' + el.getAttribute('cy') + ')');
+            startMouse = pos;
+          }
+          update();
+          label.setAttribute('opacity', '1');
+          label.setAttribute('x', +el.getAttribute('cx'));
+          label.setAttribute('y', +el.getAttribute('cy') + +el.getAttribute('ry') + 30);
+        });
+
+        document.addEventListener('mouseup', function() {
+          if (dragging) {
+            dragging = null;
+            el.style.cursor = 'move';
+            setTimeout(function() { label.setAttribute('opacity', '0'); }, 1500);
+          }
+        });
+      ]]>
+  </script>
+</svg>
