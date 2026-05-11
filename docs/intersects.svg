@@ -4,6 +4,14 @@
   viewBox="0 0 720 720"
   xmlns="http://www.w3.org/2000/svg"
 >
+  <style>
+    svg,
+    #gaussian,
+    #handle-rx,
+    #handle-ry {
+      touch-action: none;
+    }
+  </style>
   <defs>
     <pattern
       id="grid"
@@ -163,7 +171,7 @@
 
         update();
 
-        function mousePos(evt) {
+        function pointerPos(evt) {
           var pt = svg.createSVGPoint();
           pt.x = evt.clientX;
           pt.y = evt.clientY;
@@ -174,19 +182,22 @@
 
         function onHandle(axis, e) {
           e.preventDefault(); e.stopPropagation();
-          dragging = axis; startVal = +el.getAttribute(axis); startMouse = mousePos(e);
+          svg.setPointerCapture(e.pointerId);
+          dragging = axis; startVal = +el.getAttribute(axis); startMouse = pointerPos(e);
         }
-        hRx.addEventListener('mousedown', onHandle.bind(null, 'rx'));
-        hRy.addEventListener('mousedown', onHandle.bind(null, 'ry'));
+        hRx.addEventListener('pointerdown', onHandle.bind(null, 'rx'));
+        hRy.addEventListener('pointerdown', onHandle.bind(null, 'ry'));
 
-        el.addEventListener('mousedown', function(e) {
+        el.addEventListener('pointerdown', function(e) {
           e.preventDefault(); e.stopPropagation();
-          dragging = 'move'; startMouse = mousePos(e); el.style.cursor = 'grabbing';
+          svg.setPointerCapture(e.pointerId);
+          dragging = 'move'; startMouse = pointerPos(e); el.style.cursor = 'grabbing';
         });
 
-        document.addEventListener('mousemove', function(e) {
+        svg.addEventListener('pointermove', function(e) {
           if (!dragging) return;
-          var pos = mousePos(e);
+          e.preventDefault();
+          var pos = pointerPos(e);
           var dx = pos.x - startMouse.x;
           var dy = pos.y - startMouse.y;
 
@@ -206,13 +217,14 @@
           label.setAttribute('y', +el.getAttribute('cy') + +el.getAttribute('ry') + 30);
         });
 
-        document.addEventListener('mouseup', function() {
+        svg.addEventListener('pointerup', function() {
           if (dragging) {
             dragging = null;
             el.style.cursor = 'move';
             setTimeout(function() { label.setAttribute('opacity', '0'); }, 1500);
           }
         });
+        svg.addEventListener('pointercancel', function() { dragging = null; });
       ]]>
   </script>
 </svg>
