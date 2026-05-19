@@ -172,7 +172,6 @@ pub(crate) fn project_splats(
     viewmat: &Array<f32>,
     focal: Vec2F,
     camera_pos: Vec3F,
-    total_splats: u32,
     attributes: &Array<f32>,
     sh_coeffs: &Array<f32>,
     sh_per_ch: u32,
@@ -185,7 +184,7 @@ pub(crate) fn project_splats(
     tile_ids: &mut Array<u32>,
     gaussian_ids: &mut Array<u32>,
 ) {
-    if ABSOLUTE_POS_X < total_splats {
+    if ABSOLUTE_POS_X < depth_order.len() as u32 {
         // Splat attributes layout: [x, y, z, qw, qx, qy, qz, sx, sy, sz, opacity]
         let base = (ABSOLUTE_POS_X * 11u32) as usize;
         let mean = Vec3F {

@@ -1,4 +1,5 @@
 use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
+use cubecl::Runtime;
 use rand::RngExt;
 use splatfield::sort::radix_argsort;
 use splatfield::tensor::{GpuTensor, U32, create_tensor_from_data};
@@ -21,6 +22,7 @@ fn make_data(n: usize, dist: &str) -> Vec<u32> {
 
 fn bench_size_sweep(c: &mut Criterion) {
     let device: cubecl::wgpu::WgpuDevice = Default::default();
+    let client = cubecl::wgpu::WgpuRuntime::client(&device);
 
     let mut group = c.benchmark_group("radix_argsort/size");
     group.sample_size(10);
@@ -39,8 +41,8 @@ fn bench_size_sweep(c: &mut Criterion) {
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| {
-                let k = create_tensor_from_data([n], &device, U32, &keys_data);
-                let v = create_tensor_from_data([n], &device, U32, &vals_data);
+                let k = create_tensor_from_data([n], &client, U32, &keys_data);
+                let v = create_tensor_from_data([n], &client, U32, &vals_data);
                 let (sorted_k, sorted_v) = radix_argsort(black_box(k), black_box(v), n as u32, 32);
                 readback_u32(sorted_k);
                 readback_u32(sorted_v);
@@ -52,6 +54,7 @@ fn bench_size_sweep(c: &mut Criterion) {
 
 fn bench_bits_sweep(c: &mut Criterion) {
     let device: cubecl::wgpu::WgpuDevice = Default::default();
+    let client = cubecl::wgpu::WgpuRuntime::client(&device);
 
     let mut group = c.benchmark_group("radix_argsort/bits");
     group.sample_size(10);
@@ -66,8 +69,8 @@ fn bench_bits_sweep(c: &mut Criterion) {
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(bits), &bits, |b, &bits| {
             b.iter(|| {
-                let k = create_tensor_from_data([n], &device, U32, &keys_data);
-                let v = create_tensor_from_data([n], &device, U32, &vals_data);
+                let k = create_tensor_from_data([n], &client, U32, &keys_data);
+                let v = create_tensor_from_data([n], &client, U32, &vals_data);
                 let (sorted_k, sorted_v) =
                     radix_argsort(black_box(k), black_box(v), n as u32, bits);
                 readback_u32(sorted_k);
@@ -80,6 +83,7 @@ fn bench_bits_sweep(c: &mut Criterion) {
 
 fn bench_distribution(c: &mut Criterion) {
     let device: cubecl::wgpu::WgpuDevice = Default::default();
+    let client = cubecl::wgpu::WgpuRuntime::client(&device);
 
     let mut group = c.benchmark_group("radix_argsort/distribution");
     group.sample_size(10);
@@ -98,8 +102,8 @@ fn bench_distribution(c: &mut Criterion) {
             &keys_data,
             |b, keys_data| {
                 b.iter(|| {
-                    let k = create_tensor_from_data([n], &device, U32, keys_data);
-                    let v = create_tensor_from_data([n], &device, U32, &vals_data);
+                    let k = create_tensor_from_data([n], &client, U32, keys_data);
+                    let v = create_tensor_from_data([n], &client, U32, &vals_data);
                     let (sorted_k, sorted_v) =
                         radix_argsort(black_box(k), black_box(v), n as u32, 32);
                     readback_u32(sorted_k);

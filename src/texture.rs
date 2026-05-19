@@ -1,8 +1,6 @@
 use std::sync::Arc;
 
 use crate::tensor::GpuTensor;
-use cubecl::prelude::*;
-use cubecl::wgpu::WgpuRuntime;
 use eframe::egui_wgpu::Renderer;
 use egui::{TextureId, epaint::mutex::RwLock};
 
@@ -28,7 +26,7 @@ impl GpuTexture {
     }
 
     pub fn update_texture(&mut self, img: &GpuTensor, size: glam::UVec2) {
-        let _ = WgpuRuntime::client(&img.device).flush();
+        let _ = img.client.flush();
 
         let needs_resize = self
             .texture
