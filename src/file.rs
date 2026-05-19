@@ -1,5 +1,5 @@
 use crate::render::Splats;
-use cubecl::wgpu::WgpuDevice;
+use cubecl::{client::ComputeClient, wgpu::WgpuRuntime};
 use glam::Vec3;
 use serde::{
     Deserialize,
@@ -38,7 +38,10 @@ fn interleave_coeffs(sh_dc: &[f32], sh_rest: &[f32], result: &mut Vec<f32>) {
     result.extend((0..n).flat_map(|i| (0..3).map(move |j| sh_rest[j * n + i])));
 }
 
-pub fn load_ply(mut reader: impl Read, device: &WgpuDevice) -> Result<Splats, DeserializeError> {
+pub fn load_ply(
+    mut reader: impl Read,
+    client: &ComputeClient<WgpuRuntime>,
+) -> Result<Splats, DeserializeError> {
     let mut file = PlyChunkedReader::new();
     let mut buf = [0u8; 64 * 1024];
 
@@ -99,5 +102,5 @@ pub fn load_ply(mut reader: impl Read, device: &WgpuDevice) -> Result<Splats, De
         file.buffer_mut().extend_from_slice(&buf[..n]);
     }
 
-    Ok(Splats::new(&attributes, &shs, device, (min, max)))
+    Ok(Splats::new(&attributes, &shs, client, (min, max)))
 }

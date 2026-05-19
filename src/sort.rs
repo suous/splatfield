@@ -169,7 +169,7 @@ pub fn radix_argsort(
 
         prefix_kernel::launch::<WgpuRuntime>(
             &client,
-            CubeCount::Static(1, 1, 1),
+            CubeCount::new_single(),
             cube_dim,
             n,
             count_buf.as_array_arg(),
@@ -221,6 +221,7 @@ mod radix_sort_tests {
 
     #[test]
     fn test_sorting() {
+        let client = WgpuRuntime::client(&WgpuDevice::default());
         for i in 0..128u32 {
             let keys_inp = [
                 5 + i * 4,
@@ -242,8 +243,6 @@ mod radix_sort_tests {
 
             let values_inp: Vec<_> = keys_inp.iter().copied().map(|x| x * 2 + 5).collect();
 
-            let device: WgpuDevice = Default::default();
-            let client = WgpuRuntime::client(&device);
             let keys = create_tensor_from_data([keys_inp.len()], &client, U32, &keys_inp);
             let values = create_tensor_from_data([values_inp.len()], &client, U32, &values_inp);
             let (ret_keys, ret_values) = radix_argsort(keys, values, keys_inp.len() as u32, 32);
@@ -261,6 +260,7 @@ mod radix_sort_tests {
 
     #[test]
     fn test_sorting_big() {
+        let client = WgpuRuntime::client(&WgpuDevice::default());
         let mut rng = rand::rng();
         let mut keys_inp = Vec::new();
         for i in 0..10000u32 {
@@ -275,9 +275,6 @@ mod radix_sort_tests {
         }
 
         let values_inp: Vec<_> = keys_inp.iter().map(|&x| x * 2 + 5).collect();
-
-        let device: WgpuDevice = Default::default();
-        let client = WgpuRuntime::client(&device);
         let keys = create_tensor_from_data([keys_inp.len()], &client, U32, &keys_inp);
         let values = create_tensor_from_data([values_inp.len()], &client, U32, &values_inp);
         let (ret_keys, ret_values) = radix_argsort(keys, values, keys_inp.len() as u32, 32);
@@ -296,6 +293,7 @@ mod radix_sort_tests {
     fn test_sorting_large() {
         const NUM_ELEMENTS: usize = 500_000;
 
+        let client = WgpuRuntime::client(&WgpuDevice::default());
         let mut rng = rand::rng();
 
         let keys_inp: Vec<u32> = (0..NUM_ELEMENTS)
@@ -303,8 +301,6 @@ mod radix_sort_tests {
             .collect();
         let values_inp: Vec<u32> = (0..NUM_ELEMENTS).map(|i| i as u32).collect();
 
-        let device: WgpuDevice = Default::default();
-        let client = WgpuRuntime::client(&device);
         let keys = create_tensor_from_data([NUM_ELEMENTS], &client, U32, &keys_inp);
         let values = create_tensor_from_data([NUM_ELEMENTS], &client, U32, &values_inp);
         let (ret_keys, ret_values) = radix_argsort(keys, values, NUM_ELEMENTS as u32, 32);

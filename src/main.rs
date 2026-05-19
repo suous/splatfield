@@ -11,7 +11,8 @@ use std::cell::Cell;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
 
-use cubecl::wgpu::{MemoryConfiguration, RuntimeOptions, WgpuDevice, WgpuSetup, init_device};
+use cubecl::prelude::*;
+use cubecl::wgpu::{MemoryConfiguration, RuntimeOptions, WgpuRuntime, WgpuSetup, init_device};
 use eframe::egui;
 use egui::{Color32, Rect};
 use glam::{Quat, Vec3};
@@ -23,7 +24,7 @@ const UV_RECT: Rect = Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0))
 struct App {
     backbuffer: Rc<RefCell<texture::GpuTexture>>,
     controller: camera::Controller,
-    device: WgpuDevice,
+    client: ComputeClient<WgpuRuntime>,
     splats: Arc<RwLock<Option<render::Splats>>>,
     #[cfg(not(target_arch = "wasm32"))]
     reframe: Arc<AtomicBool>,
@@ -81,7 +82,7 @@ impl App {
                 render_state.queue.clone(),
             ))),
             controller: camera::Controller::new(-Vec3::Z * 2.5, Quat::IDENTITY),
-            device,
+            client: WgpuRuntime::client(&device),
             splats: Arc::new(RwLock::new(None)),
             #[cfg(not(target_arch = "wasm32"))]
             reframe: Arc::new(AtomicBool::new(false)),
@@ -93,7 +94,7 @@ impl App {
     #[cfg(not(target_arch = "wasm32"))]
     fn load_first_ply(&self, file: egui::DroppedFile, ctx: egui::Context) {
         if let Some(path) = file.path {
-            let device = self.device.clone();
+            let client = self.client.clone();
             let splats = Arc::clone(&self.splats);
             let reframe = Arc::clone(&self.reframe);
 
@@ -102,7 +103,7 @@ impl App {
                     error!("Failed to open file: {path:?}");
                     return;
                 };
-                match file::load_ply(reader, &device) {
+                match file::load_ply(reader, &client) {
                     Ok(data) => {
                         *splats.write().unwrap() = Some(data);
                         reframe.store(true, Ordering::Release);
@@ -117,7 +118,7 @@ impl App {
     #[cfg(target_arch = "wasm32")]
     fn load_first_ply(&mut self, file: egui::DroppedFile, _ctx: egui::Context) {
         if let Some(bytes) = file.bytes {
-            match file::load_ply(std::io::Cursor::new(bytes), &self.device) {
+            match file::load_ply(std::io::Cursor::new(bytes), &self.client) {
                 Ok(data) => {
                     self.controller.frame_bounds(data.bounds);
                     *self.splats.write().unwrap() = Some(data);

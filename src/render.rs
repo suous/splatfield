@@ -3,7 +3,7 @@ use crate::helpers;
 use crate::sort::radix_argsort;
 use crate::tensor::{F32, GpuTensor, U32, create_tensor_from_data, cube_count_1d, empty_tensor};
 use cubecl::prelude::*;
-use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+use cubecl::wgpu::WgpuRuntime;
 
 // Safety cap: 2 * max_tiles_per_dim * max_splats
 const INTERSECTS_UPPER_BOUND: usize = 2 * 512 * 65535;
@@ -19,12 +19,11 @@ impl Splats {
     pub fn new(
         attributes: &[f32],
         sh_coeffs: &[f32],
-        device: &WgpuDevice,
+        client: &ComputeClient<WgpuRuntime>,
         bounds: (glam::Vec3, glam::Vec3),
     ) -> Self {
         let n = attributes.len() / 11;
         let n_coeffs = sh_coeffs.len() / n;
-        let client = &WgpuRuntime::client(device);
         Self {
             attributes: create_tensor_from_data([n, 11], client, F32, attributes),
             sh_coeffs: create_tensor_from_data([n, n_coeffs / 3, 3], client, F32, sh_coeffs),
@@ -125,7 +124,7 @@ impl Splats {
         let bitmap = empty_tensor([img_size.y as usize, row_stride as usize], client, U32);
         rasterize_kernel::launch::<WgpuRuntime>(
             client,
-            CubeCount::Static(tile_bounds.x, tile_bounds.y, 1),
+            CubeCount::new_2d(tile_bounds.x, tile_bounds.y),
             CubeDim::new_2d(helpers::TILE_WIDTH, helpers::TILE_WIDTH),
             img_size.x,
             img_size.y,
