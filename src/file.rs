@@ -1,105 +1,89 @@
 use crate::render::Splats;
+use anyhow::{Context, Result, anyhow};
 use cubecl::{client::ComputeClient, wgpu::WgpuRuntime};
-use glam::Vec3;
-use serde::{
-    Deserialize,
-    de::{DeserializeSeed, Error},
-};
-use serde_ply::{DeserializeError, PlyChunkedReader, RowVisitor};
-use std::collections::HashMap;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read};
 
-#[derive(Deserialize, Default)]
-struct PlyGaussian {
-    pub x: f32,
-    pub y: f32,
-    pub z: f32,
-    pub scale_0: f32,
-    pub scale_1: f32,
-    pub scale_2: f32,
-    pub opacity: f32,
-    pub rot_0: f32,
-    pub rot_1: f32,
-    pub rot_2: f32,
-    pub rot_3: f32,
-    #[serde(default)]
-    pub f_dc_0: f32,
-    #[serde(default)]
-    pub f_dc_1: f32,
-    #[serde(default)]
-    pub f_dc_2: f32,
-    #[serde(flatten)]
-    pub sh: HashMap<String, f32>,
-}
+pub fn load_ply(reader: impl Read, client: &ComputeClient<WgpuRuntime>) -> Result<Splats> {
+    let mut reader = BufReader::new(reader);
+    let mut vertex_count = 0;
+    let mut properties = Vec::new();
+    let mut line = String::new();
 
-fn interleave_coeffs(sh_dc: &[f32], sh_rest: &[f32], result: &mut Vec<f32>) {
-    let n = sh_rest.len() / 3;
-    result.extend_from_slice(sh_dc);
-    result.extend((0..n).flat_map(|i| (0..3).map(move |j| sh_rest[j * n + i])));
-}
-
-pub fn load_ply(
-    mut reader: impl Read,
-    client: &ComputeClient<WgpuRuntime>,
-) -> Result<Splats, DeserializeError> {
-    let mut file = PlyChunkedReader::new();
-    let mut buf = [0u8; 64 * 1024];
-
-    let (vertex_count, rest_keys) = loop {
-        if let Some(header) = file.header() {
-            let vertex = header
-                .get_element("vertex")
-                .ok_or_else(|| DeserializeError::custom("Missing vertex element"))?;
-            let rest_keys: Vec<_> = vertex
-                .properties
-                .iter()
-                .filter(|&p| p.name.starts_with("f_rest_"))
-                .map(|p| p.name.clone())
-                .collect();
-            break (vertex.count, rest_keys);
+    while reader.read_line(&mut line)? > 0 {
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        match tokens.as_slice() {
+            ["end_header", ..] => break,
+            ["element", "vertex", count] => {
+                vertex_count = count.parse().map_err(|_| anyhow!("Invalid vertex count"))?
+            }
+            ["property", "float", name] => properties.push(name.to_string()),
+            _ => {}
         }
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            return Err(DeserializeError::custom("Unexpected EOF before PLY header"));
-        }
-        file.buffer_mut().extend_from_slice(&buf[..n]);
+        line.clear();
+    }
+
+    let get_idx = |name: &str| {
+        properties
+            .iter()
+            .position(|p| p == name)
+            .ok_or_else(|| anyhow!("Missing property: {name}"))
     };
 
-    let mut attributes = Vec::with_capacity(vertex_count * 11);
-    let mut shs = Vec::with_capacity(vertex_count * (rest_keys.len() + 3));
-    let mut min = Vec3::splat(f32::MAX);
-    let mut max = Vec3::splat(f32::MIN);
-    let mut rb = Vec::with_capacity(rest_keys.len());
+    let idx_x = get_idx("x")?;
+    let idx_y = get_idx("y")?;
+    let idx_z = get_idx("z")?;
+    let idx_s0 = get_idx("scale_0")?;
+    let idx_s1 = get_idx("scale_1")?;
+    let idx_s2 = get_idx("scale_2")?;
+    let idx_op = get_idx("opacity")?;
+    let idx_r0 = get_idx("rot_0")?;
+    let idx_r1 = get_idx("rot_1")?;
+    let idx_r2 = get_idx("rot_2")?;
+    let idx_r3 = get_idx("rot_3")?;
+    let idx_dc0 = get_idx("f_dc_0")?;
+    let idx_dc1 = get_idx("f_dc_1")?;
+    let idx_dc2 = get_idx("f_dc_2")?;
 
-    let mut row_visitor = RowVisitor::new(|gs: PlyGaussian| {
-        let q = glam::Quat::from_xyzw(gs.rot_1, gs.rot_2, gs.rot_3, gs.rot_0).normalize();
-        let pos = Vec3::new(gs.x, gs.y, gs.z);
-        min = min.min(pos);
-        max = max.max(pos);
+    let mut rest_keys: Vec<usize> = properties
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| name.starts_with("f_rest_"))
+        .map(|(idx, _)| idx)
+        .collect();
 
-        attributes.extend_from_slice(&[
-            gs.x, gs.y, gs.z, q.w, q.x, q.y, q.z, gs.scale_0, gs.scale_1, gs.scale_2, gs.opacity,
-        ]);
-
-        rb.clear();
-        rb.extend(
-            rest_keys
-                .iter()
-                .map(|k| gs.sh.get(k).copied().unwrap_or(0.0)),
-        );
-        interleave_coeffs(&[gs.f_dc_0, gs.f_dc_1, gs.f_dc_2], &rb, &mut shs);
+    rest_keys.sort_by_key(|&idx| {
+        properties[idx]
+            .strip_prefix("f_rest_")
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0)
     });
 
-    loop {
-        (&mut row_visitor).deserialize(&mut file)?;
-        if file.current_element().is_none() {
-            break;
+    let stride = properties.len();
+    let mut buf = vec![0u8; vertex_count * stride * 4];
+    reader.read_exact(&mut buf).context("Failed read vertex")?;
+
+    let float_data: &[f32] = bytemuck::cast_slice(&buf);
+    let mut attributes = Vec::with_capacity(vertex_count * 11);
+    let mut shs = Vec::with_capacity(vertex_count * (rest_keys.len() + 3));
+    let mut min = glam::Vec3::splat(f32::MAX);
+    let mut max = glam::Vec3::splat(f32::MIN);
+    let n = rest_keys.len() / 3;
+
+    for v in 0..vertex_count {
+        let d = &float_data[v * stride..(v + 1) * stride];
+        let p = glam::Vec3::new(d[idx_x], d[idx_y], d[idx_z]);
+        let q = glam::Quat::from_xyzw(d[idx_r1], d[idx_r2], d[idx_r3], d[idx_r0]).normalize();
+        attributes.extend_from_slice(&[
+            p.x, p.y, p.z, q.w, q.x, q.y, q.z, d[idx_s0], d[idx_s1], d[idx_s2], d[idx_op],
+        ]);
+
+        shs.extend_from_slice(&[d[idx_dc0], d[idx_dc1], d[idx_dc2]]);
+        for i in 0..n {
+            shs.push(d[rest_keys[i]]);
+            shs.push(d[rest_keys[n + i]]);
+            shs.push(d[rest_keys[2 * n + i]]);
         }
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            return Err(DeserializeError::custom("Unexpected EOF while reading PLY"));
-        }
-        file.buffer_mut().extend_from_slice(&buf[..n]);
+        (min, max) = (min.min(p), max.max(p));
     }
 
     Ok(Splats::new(&attributes, &shs, client, (min, max)))

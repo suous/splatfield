@@ -9,8 +9,6 @@ bytemuck = { version = "1.25", features = ["derive"] }
 glam = "0.32.1"
 egui = "0.34"
 wgpu = "29"
-serde = { version = "1.0.228", default-features = false, features = ["derive"] }
-serde-ply = "0.2.2"
 anyhow = "1.0.102"
 log = "0.4"
 

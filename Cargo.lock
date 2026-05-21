@@ -615,12 +615,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "byteorder"
-version = "1.5.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
-
-[[package]]
 name = "byteorder-lite"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4520,17 +4514,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde-ply"
-version = "0.2.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df40fb29a8f8b021ecd9bddaeb09c9d86b6801ed020167b0e384560d5c9ce90b"
-dependencies = [
- "byteorder",
- "serde",
- "thiserror 2.0.18",
-]
-
-[[package]]
 name = "serde_bytes"
 version = "0.11.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4823,8 +4806,6 @@ dependencies = [
  "log",
  "pollster",
  "rand 0.10.1",
- "serde",
- "serde-ply",
  "serde_json",
  "wasm-bindgen",
  "wasm-bindgen-futures",
