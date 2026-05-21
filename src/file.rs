@@ -72,13 +72,13 @@ pub fn load_ply(
     let mut rb = Vec::with_capacity(rest_keys.len());
 
     let mut row_visitor = RowVisitor::new(|gs: PlyGaussian| {
-        let q = glam::Vec4::new(gs.rot_0, gs.rot_1, gs.rot_2, gs.rot_3).normalize_or(glam::Vec4::X);
+        let q = glam::Quat::from_xyzw(gs.rot_1, gs.rot_2, gs.rot_3, gs.rot_0).normalize();
         let pos = Vec3::new(gs.x, gs.y, gs.z);
         min = min.min(pos);
         max = max.max(pos);
 
         attributes.extend_from_slice(&[
-            gs.x, gs.y, gs.z, q.x, q.y, q.z, q.w, gs.scale_0, gs.scale_1, gs.scale_2, gs.opacity,
+            gs.x, gs.y, gs.z, q.w, q.x, q.y, q.z, gs.scale_0, gs.scale_1, gs.scale_2, gs.opacity,
         ]);
 
         rb.clear();
