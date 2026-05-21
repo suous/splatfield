@@ -2,7 +2,7 @@
 //!
 //! References:
 //! - <https://github.com/ArthurBrussee/brush/blob/main/crates/brush-sort/src/lib.rs>
-use crate::tensor::{GpuTensor, U32, cube_count_1d, empty_tensor};
+use crate::tensor::{GpuTensor, U32, cube_count_1d};
 use cubecl::prelude::*;
 use cubecl::wgpu::WgpuRuntime;
 
@@ -141,24 +141,24 @@ pub fn radix_argsort(
     n: u32,
     bits: u32,
 ) -> (GpuTensor, GpuTensor) {
-    let client = keys.client.clone();
+    let client = &keys.client.clone();
     let max_n = keys.shape[0] as u32;
     let max_wgs = max_n.div_ceil(SORT_BLOCK);
 
-    let num_wgs = cube_count_1d(&client, n, SORT_BLOCK);
+    let num_wgs = cube_count_1d(client, n, SORT_BLOCK);
     let cube_dim = CubeDim::new_1d(SORT_WG);
 
     let mut cur_keys = keys;
     let mut cur_vals = vals;
-    let count_buf = empty_tensor([(max_wgs as usize) * SORT_BINS as usize], &client, U32);
-    let mut dst_keys = empty_tensor([max_n as usize], &client, cur_keys.dtype);
-    let mut dst_vals = empty_tensor([max_n as usize], &client, cur_vals.dtype);
+    let count_buf = GpuTensor::empty(client, [(max_wgs as usize) * SORT_BINS as usize], U32);
+    let mut dst_keys = GpuTensor::empty(client, [max_n as usize], cur_keys.dtype);
+    let mut dst_vals = GpuTensor::empty(client, [max_n as usize], cur_vals.dtype);
 
     for pass in 0..bits.div_ceil(4) {
         let shift = pass * 4;
 
         count_kernel::launch::<WgpuRuntime>(
-            &client,
+            client,
             num_wgs.clone(),
             cube_dim,
             shift,
@@ -168,7 +168,7 @@ pub fn radix_argsort(
         );
 
         prefix_kernel::launch::<WgpuRuntime>(
-            &client,
+            client,
             CubeCount::new_single(),
             cube_dim,
             n,
@@ -176,7 +176,7 @@ pub fn radix_argsort(
         );
 
         scatter_kernel::launch::<WgpuRuntime>(
-            &client,
+            client,
             num_wgs.clone(),
             cube_dim,
             shift,
@@ -197,7 +197,6 @@ pub fn radix_argsort(
 #[cfg(test)]
 mod radix_sort_tests {
     use super::*;
-    use crate::tensor::create_tensor_from_data;
     use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
     use rand::RngExt;
 
@@ -243,8 +242,8 @@ mod radix_sort_tests {
 
             let values_inp: Vec<_> = keys_inp.iter().copied().map(|x| x * 2 + 5).collect();
 
-            let keys = create_tensor_from_data([keys_inp.len()], &client, U32, &keys_inp);
-            let values = create_tensor_from_data([values_inp.len()], &client, U32, &values_inp);
+            let keys = GpuTensor::from(&client, [keys_inp.len()], U32, &keys_inp);
+            let values = GpuTensor::from(&client, [values_inp.len()], U32, &values_inp);
             let (ret_keys, ret_values) = radix_argsort(keys, values, keys_inp.len() as u32, 32);
 
             let ret_keys = tensor_to_vec::<u32>(ret_keys);
@@ -275,8 +274,8 @@ mod radix_sort_tests {
         }
 
         let values_inp: Vec<_> = keys_inp.iter().map(|&x| x * 2 + 5).collect();
-        let keys = create_tensor_from_data([keys_inp.len()], &client, U32, &keys_inp);
-        let values = create_tensor_from_data([values_inp.len()], &client, U32, &values_inp);
+        let keys = GpuTensor::from(&client, [keys_inp.len()], U32, &keys_inp);
+        let values = GpuTensor::from(&client, [values_inp.len()], U32, &values_inp);
         let (ret_keys, ret_values) = radix_argsort(keys, values, keys_inp.len() as u32, 32);
 
         let ret_keys = tensor_to_vec::<u32>(ret_keys);
@@ -301,8 +300,8 @@ mod radix_sort_tests {
             .collect();
         let values_inp: Vec<u32> = (0..NUM_ELEMENTS).map(|i| i as u32).collect();
 
-        let keys = create_tensor_from_data([NUM_ELEMENTS], &client, U32, &keys_inp);
-        let values = create_tensor_from_data([NUM_ELEMENTS], &client, U32, &values_inp);
+        let keys = GpuTensor::from(&client, [NUM_ELEMENTS], U32, &keys_inp);
+        let values = GpuTensor::from(&client, [NUM_ELEMENTS], U32, &values_inp);
         let (ret_keys, ret_values) = radix_argsort(keys, values, NUM_ELEMENTS as u32, 32);
 
         let ret_keys = tensor_to_vec::<u32>(ret_keys);

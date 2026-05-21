@@ -1,7 +1,7 @@
 use crate::camera::Camera;
 use crate::helpers;
 use crate::sort::radix_argsort;
-use crate::tensor::{F32, GpuTensor, U32, create_tensor_from_data, cube_count_1d, empty_tensor};
+use crate::tensor::{F32, GpuTensor, U32, cube_count_1d};
 use cubecl::prelude::*;
 use cubecl::wgpu::WgpuRuntime;
 
@@ -25,8 +25,8 @@ impl Splats {
         let n = attributes.len() / 11;
         let n_coeffs = sh_coeffs.len() / n;
         Self {
-            attributes: create_tensor_from_data([n, 11], client, F32, attributes),
-            sh_coeffs: create_tensor_from_data([n, n_coeffs / 3, 3], client, F32, sh_coeffs),
+            attributes: GpuTensor::from(client, [n, 11], F32, attributes),
+            sh_coeffs: GpuTensor::from(client, [n, n_coeffs / 3, 3], F32, sh_coeffs),
             bounds,
         }
     }
@@ -53,13 +53,13 @@ impl Splats {
         let viewmat = glam::Mat4::from(camera.w2c()).transpose().to_cols_array();
         let sh_per_ch = self.sh_coeffs.shape[1] as u32;
 
-        let depth_order = empty_tensor([total], client, U32);
-        let depth_keys = empty_tensor([total], client, U32);
-        let projected = empty_tensor([total, 9], client, F32);
-        let counters = create_tensor_from_data([2], client, U32, &[0u32, 0u32]);
-        let tile_ids = empty_tensor([max_isects], client, U32);
-        let gaussian_ids = empty_tensor([max_isects], client, U32);
-        let viewmat = create_tensor_from_data([16], client, F32, &viewmat);
+        let depth_order = GpuTensor::empty(client, [total], U32);
+        let depth_keys = GpuTensor::empty(client, [total], U32);
+        let projected = GpuTensor::empty(client, [total, 9], F32);
+        let counters = GpuTensor::from(client, [2], U32, &[0u32, 0u32]);
+        let tile_ids = GpuTensor::empty(client, [max_isects], U32);
+        let gaussian_ids = GpuTensor::empty(client, [max_isects], U32);
+        let viewmat = GpuTensor::from(client, [16], F32, &viewmat);
 
         crate::project::project_splats::launch::<WgpuRuntime>(
             client,
@@ -110,7 +110,7 @@ impl Splats {
         let tile_bits = u32::BITS - (num_tiles as u32).leading_zeros();
         let (tile_ids, gaussian_ids) = radix_argsort(tile_ids, gaussian_ids, num_isects, tile_bits);
 
-        let tile_ranges = empty_tensor([num_tiles * 2], client, U32);
+        let tile_ranges = GpuTensor::empty(client, [num_tiles * 2], U32);
         build_tile_ranges::launch::<WgpuRuntime>(
             client,
             cube_count_1d(client, num_isects, helpers::TILE_SIZE),
@@ -121,7 +121,7 @@ impl Splats {
         );
 
         let row_stride = (img_size.x * 4).next_multiple_of(256) / 4;
-        let bitmap = empty_tensor([img_size.y as usize, row_stride as usize], client, U32);
+        let bitmap = GpuTensor::empty(client, [img_size.y as usize, row_stride as usize], U32);
         rasterize_kernel::launch::<WgpuRuntime>(
             client,
             CubeCount::new_2d(tile_bounds.x, tile_bounds.y),

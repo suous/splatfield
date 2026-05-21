@@ -11,26 +11,6 @@ pub fn cube_count_1d(client: &ComputeClient<WgpuRuntime>, length: u32, groups: u
     CubeCountSelection::new(client, length.div_ceil(groups)).cube_count()
 }
 
-pub fn empty_tensor(
-    shape: impl Into<Shape>,
-    client: &ComputeClient<WgpuRuntime>,
-    dtype: StorageType,
-) -> GpuTensor {
-    let shape = shape.into();
-    let buffer = client.empty(shape.iter().product::<usize>() * dtype.size());
-    GpuTensor::new(client.clone(), shape, buffer, dtype)
-}
-
-pub fn create_tensor_from_data<T: bytemuck::Pod>(
-    shape: impl Into<Shape>,
-    client: &ComputeClient<WgpuRuntime>,
-    dtype: StorageType,
-    data: &[T],
-) -> GpuTensor {
-    let buffer = client.create_from_slice(bytemuck::cast_slice(data));
-    GpuTensor::new(client.clone(), shape, buffer, dtype)
-}
-
 #[derive(Clone)]
 pub struct GpuTensor {
     pub client: ComputeClient<WgpuRuntime>,
@@ -61,6 +41,26 @@ impl GpuTensor {
             shape: shape.into(),
             dtype,
         }
+    }
+
+    pub fn empty(
+        client: &ComputeClient<WgpuRuntime>,
+        shape: impl Into<Shape>,
+        dtype: StorageType,
+    ) -> GpuTensor {
+        let shape = shape.into();
+        let buffer = client.empty(shape.iter().product::<usize>() * dtype.size());
+        Self::new(client.clone(), shape, buffer, dtype)
+    }
+
+    pub fn from<T: bytemuck::Pod>(
+        client: &ComputeClient<WgpuRuntime>,
+        shape: impl Into<Shape>,
+        dtype: StorageType,
+        data: &[T],
+    ) -> Self {
+        let buffer = client.create_from_slice(bytemuck::cast_slice(data));
+        Self::new(client.clone(), shape, buffer, dtype)
     }
 
     pub async fn read_pair(&self) -> [u32; 2] {

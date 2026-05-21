@@ -40,7 +40,7 @@ impl Controller {
             camera: Camera {
                 position,
                 rotation,
-                fov: glam::vec2(0.8, 0.8),
+                fov: Vec2::splat(0.8),
             },
             focus_distance: 2.5,
         }
