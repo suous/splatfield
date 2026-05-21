@@ -69,8 +69,7 @@ pub fn load_ply(reader: impl Read, client: &ComputeClient<WgpuRuntime>) -> Resul
     let mut max = glam::Vec3::splat(f32::MIN);
     let n = rest_keys.len() / 3;
 
-    for v in 0..vertex_count {
-        let d = &float_data[v * stride..(v + 1) * stride];
+    for d in float_data.chunks(stride).take(vertex_count) {
         let p = glam::Vec3::new(d[idx_x], d[idx_y], d[idx_z]);
         let q = glam::Quat::from_xyzw(d[idx_r1], d[idx_r2], d[idx_r3], d[idx_r0]).normalize();
         attributes.extend_from_slice(&[

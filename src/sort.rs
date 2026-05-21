@@ -108,18 +108,16 @@ fn scatter_kernel(
     out_values: &mut Array<u32>,
 ) {
     let num_wgs = num_keys.div_ceil(SORT_BLOCK);
-
-    let mut bin_offsets = SharedMemory::<u32>::new(SORT_BINS as usize);
-    let histogram = SharedMemory::<Atomic<u32>>::new(SORT_BINS as usize);
-    let base = SORT_BLOCK * CUBE_POS_X + UNIT_POS;
-
     if CUBE_POS_X < num_wgs {
+        let mut bin_offsets = SharedMemory::<u32>::new(SORT_BINS as usize);
+        let histogram = SharedMemory::<Atomic<u32>>::new(SORT_BINS as usize);
         if UNIT_POS < SORT_BINS {
             bin_offsets[UNIT_POS as usize] = counts[(UNIT_POS * num_wgs + CUBE_POS_X) as usize];
             histogram[UNIT_POS as usize].store(0u32);
         }
         sync_cube();
 
+        let base = SORT_BLOCK * CUBE_POS_X + UNIT_POS;
         for e in 0..ELEMS_PER_THREAD {
             let idx = base + e * SORT_WG;
             if idx < num_keys {
@@ -154,9 +152,7 @@ pub fn radix_argsort(
     let mut dst_keys = GpuTensor::empty(client, [max_n as usize], cur_keys.dtype);
     let mut dst_vals = GpuTensor::empty(client, [max_n as usize], cur_vals.dtype);
 
-    for pass in 0..bits.div_ceil(4) {
-        let shift = pass * 4;
-
+    for shift in (0..bits).step_by(4) {
         count_kernel::launch::<WgpuRuntime>(
             client,
             num_wgs.clone(),
