@@ -156,6 +156,63 @@ b & \color{green}{c}
 \end{bmatrix}
 $$
 
+### Combined Transformation (Optimization)
+
+By the associative property of matrix multiplication, we can group
+$\mathbf{J}$ and $\mathbf{W}$ into a single combined matrix:
+
+$$
+\boldsymbol{\Sigma}_{2d} = \mathbf{J}(\mathbf{W} \boldsymbol{\Sigma_{3D}} \mathbf{W}^T)\mathbf{J}^T
+= (\mathbf{J}\mathbf{W}) \boldsymbol{\Sigma_{3D}} (\mathbf{J}\mathbf{W})^T
+= \mathbf{T} \boldsymbol{\Sigma_{3D}} \mathbf{T}^T
+$$
+
+Since $\mathbf{J}$ is $2\times3$ and $\mathbf{W}$ is $3\times3$,
+the product $\mathbf{T} = \mathbf{J}\mathbf{W}$ is a compact $2\times3$ matrix.
+Expanding the matrix multiplication manually gives its two row vectors:
+
+$$
+\mathbf{t}_0 = \frac{f_x}{z} \cdot \mathbf{W}_0 - \frac{f_x \cdot u}{z} \cdot \mathbf{W}_2
+$$
+
+$$
+\mathbf{t}_1 = \frac{f_y}{z} \cdot \mathbf{W}_1 - \frac{f_y \cdot v}{z} \cdot \mathbf{W}_2
+$$
+
+where $\mathbf{W}_0, \mathbf{W}_1, \mathbf{W}_2$ are the rows of the view rotation.
+Sandwiching $\boldsymbol{\Sigma_{3D}}$ directly with $\mathbf{T}$ yields the same
+results while completely bypassing the intermediate $3\times3$ camera covariance:
+
+$$
+\mathbf{T} \boldsymbol{\Sigma}_{3D} \mathbf{T}^T =
+\begin{bmatrix}
+    \mathbf{t}_{0x} & \mathbf{t}_{0y} & \mathbf{t}_{0z} \\
+    \mathbf{t}_{1x} & \mathbf{t}_{1y} & \mathbf{t}_{1z}
+\end{bmatrix}
+\begin{bmatrix}
+    \Sigma_{xx} & \Sigma_{xy} & \Sigma_{xz} \\
+    \Sigma_{xy} & \Sigma_{yy} & \Sigma_{yz} \\
+    \Sigma_{xz} & \Sigma_{yz} & \Sigma_{zz}
+\end{bmatrix}
+\begin{bmatrix}
+    \mathbf{t}_{0x} & \mathbf{t}_{1x} \\
+    \mathbf{t}_{0y} & \mathbf{t}_{1y} \\
+    \mathbf{t}_{0z} & \mathbf{t}_{1z}
+\end{bmatrix}
+$$
+
+$$
+\boldsymbol{\Sigma}_{2D} =
+\begin{bmatrix}
+    \color{green}{a} & \color{green}{b} \\
+    b & \color{green}{c}
+\end{bmatrix} =
+\begin{bmatrix}
+    \mathbf{t}_0 \cdot \boldsymbol{\Sigma}_{3D} \cdot \mathbf{t}_0 & \mathbf{t}_0 \cdot \boldsymbol{\Sigma}_{3D} \cdot \mathbf{t}_1 \\
+    \mathbf{t}_1 \cdot \boldsymbol{\Sigma}_{3D} \cdot \mathbf{t}_0 & \mathbf{t}_1 \cdot \boldsymbol{\Sigma}_{3D} \cdot \mathbf{t}_1
+\end{bmatrix}
+$$
+
 The rasterizer precomputes the **conic**
 $\mathbf{C} = \boldsymbol{\Sigma}_{2d}^{-1}$
 to evaluate Gaussian contributions without per-pixel matrix inversion

@@ -124,35 +124,30 @@ fn compute_cov2d(cov3d: Covariance3D, rot: &Mat3, focal: Vec2F, cam: Vec3F, img:
     let lim_y = 1.3 * img.y / (2.0 * focal.y);
     let u = (cam.x * inv_cam_z).clamp(-lim_x, lim_x);
     let v = (cam.y * inv_cam_z).clamp(-lim_y, lim_y);
-    let rc_r0 = sym_mul_row(rot.row0, cov3d);
-    let rc_r1 = sym_mul_row(rot.row1, cov3d);
-    let rc_r2 = sym_mul_row(rot.row2, cov3d);
-    let cc = Covariance3D {
-        xx: dot3(rc_r0, rot.row0),
-        xy: dot3(rc_r0, rot.row1),
-        xz: dot3(rc_r0, rot.row2),
-        yy: dot3(rc_r1, rot.row1),
-        yz: dot3(rc_r1, rot.row2),
-        zz: dot3(rc_r2, rot.row2),
+
+    let fx_inv_z = focal.x * inv_cam_z;
+    let fu_inv_z = fx_inv_z * u;
+    let t_r0 = Vec3F {
+        x: fx_inv_z * rot.row0.x - fu_inv_z * rot.row2.x,
+        y: fx_inv_z * rot.row0.y - fu_inv_z * rot.row2.y,
+        z: fx_inv_z * rot.row0.z - fu_inv_z * rot.row2.z,
     };
 
-    let j_r0 = Vec3F {
-        x: focal.x * inv_cam_z,
-        y: 0.0f32,
-        z: -focal.x * u * inv_cam_z,
-    };
-    let j_r1 = Vec3F {
-        x: 0.0f32,
-        y: focal.y * inv_cam_z,
-        z: -focal.y * v * inv_cam_z,
+    let fy_inv_z = focal.y * inv_cam_z;
+    let fv_inv_z = fy_inv_z * v;
+    let t_r1 = Vec3F {
+        x: fy_inv_z * rot.row1.x - fv_inv_z * rot.row2.x,
+        y: fy_inv_z * rot.row1.y - fv_inv_z * rot.row2.y,
+        z: fy_inv_z * rot.row1.z - fv_inv_z * rot.row2.z,
     };
 
-    let jc_r0 = sym_mul_row(j_r0, cc);
-    let jc_r1 = sym_mul_row(j_r1, cc);
+    let jc_r0 = sym_mul_row(t_r0, cov3d);
+    let jc_r1 = sym_mul_row(t_r1, cov3d);
+
     Vec3F {
-        x: dot3(jc_r0, j_r0) + 0.3,
-        y: dot3(jc_r0, j_r1),
-        z: dot3(jc_r1, j_r1) + 0.3,
+        x: dot3(jc_r0, t_r0) + 0.3,
+        y: dot3(jc_r0, t_r1),
+        z: dot3(jc_r1, t_r1) + 0.3,
     }
 }
 
