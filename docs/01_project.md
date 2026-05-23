@@ -218,6 +218,93 @@ $\mathbf{C} = \boldsymbol{\Sigma}_{2d}^{-1}$
 to evaluate Gaussian contributions without per-pixel matrix inversion
 (see [02_rasterization.md](02_rasterization.md#2-per-pixel-evaluation)).
 
+### Direct 2D Projection (Implemented)
+
+Rather than materializing the intermediate
+$\boldsymbol{\Sigma}_{3D}$, the implementation projects
+$\mathbf{M}$ directly through $\mathbf{T}$. Substituting
+$\boldsymbol{\Sigma}_{3D} = \mathbf{M}\mathbf{M}^T$ and applying
+associativity:
+
+$$
+\boldsymbol{\Sigma}_{2d} = \mathbf{T}(\mathbf{M}\mathbf{M}^T)\mathbf{T}^T
+= (\mathbf{T}\mathbf{M})(\mathbf{T}\mathbf{M})^T = \mathbf{J'}\mathbf{J'}^T
+$$
+
+where $\mathbf{J'} = \mathbf{T}\mathbf{M}$ is a $2\times3$ matrix — the
+projection of the scaled rotation directly into the 2D tangent plane:
+
+$$
+\mathbf{J'} =
+\begin{bmatrix}
+\mathbf{t}_0 \\[2pt] \mathbf{t}_1
+\end{bmatrix}
+\begin{bmatrix}
+\mathbf{m}_0 \\[2pt] \mathbf{m}_1 \\[2pt] \mathbf{m}_2
+\end{bmatrix}
+=
+\begin{bmatrix}
+\mathbf{t}_0 \cdot \mathbf{m}_0 & \mathbf{t}_0 \cdot \mathbf{m}_1 & \mathbf{t}_0 \cdot \mathbf{m}_2 \\[2pt]
+\mathbf{t}_1 \cdot \mathbf{m}_0 & \mathbf{t}_1 \cdot \mathbf{m}_1 & \mathbf{t}_1 \cdot \mathbf{m}_2
+\end{bmatrix}
+$$
+
+Expanding each element:
+
+$$
+\boldsymbol{\Sigma}_{2d} =
+\underbrace{
+\begin{bmatrix}
+t_{0x} & t_{0y} & t_{0z} \\[2pt]
+t_{1x} & t_{1y} & t_{1z}
+\end{bmatrix}
+\begin{bmatrix}
+m_{0x} & m_{0y} & m_{0z} \\[2pt]
+m_{1x} & m_{1y} & m_{1z} \\[2pt]
+m_{2x} & m_{2y} & m_{2z}
+\end{bmatrix}
+}_{\mathbf{J'}}
+\underbrace{
+\begin{bmatrix}
+m_{0x} & m_{1x} & m_{2x} \\[2pt]
+m_{0y} & m_{1y} & m_{2y} \\[2pt]
+m_{0z} & m_{1z} & m_{2z}
+\end{bmatrix}
+\begin{bmatrix}
+t_{0x} & t_{1x} \\[2pt]
+t_{0y} & t_{1y} \\[2pt]
+t_{0z} & t_{1z}
+\end{bmatrix}
+}_{\mathbf{J'}^T}
+$$
+
+$$
+\boldsymbol{\Sigma}_{2d} =
+\begin{bmatrix}
+\color{green}{\mathbf{j'}_0 \cdot \mathbf{j'}_0} & \color{green}{\mathbf{j'}_0 \cdot \mathbf{j'}_1} \\
+\mathbf{j'}_1 \cdot \mathbf{j'}_0 & \color{green}{\mathbf{j'}_1 \cdot \mathbf{j'}_1}
+\end{bmatrix}
+$$
+
+This eliminates $\boldsymbol{\Sigma}_{3D}$ entirely —
+$\mathbf{J'}$ is the same size (6 scalars) but cheaper to contract
+into the final $2\times2$ result:
+
+| Step | Naive ($\mathbf{T}\boldsymbol{\Sigma}_{3D}\mathbf{T}^T$) | **Implemented** ($\mathbf{J'}\mathbf{J'}^T$) |
+|---|---|---|
+| Form $\mathbf{M} = \mathbf{R}\,\text{diag}(\mathbf{s})$ | 9 mul | 9 mul |
+| Compute intermediate | 18 mul + 12 add ($\boldsymbol{\Sigma}_{3D} = \mathbf{M}\mathbf{M}^T$) | 18 mul + 12 add ($\mathbf{J'} = \mathbf{T}\mathbf{M}$) |
+| Compute $\boldsymbol{\Sigma}_{2d}$ | 27 mul + 18 add ($\mathbf{T}\boldsymbol{\Sigma}_{3D}\mathbf{T}^T$) | 9 mul + 6 add ($\mathbf{J'}\mathbf{J'}^T$) |
+| **Total** | **54 mul + 30 add** | **36 mul + 18 add** |
+
+The savings (18 mul, 12 add per Gaussian) come from the final step.
+Since $\mathbf{T}$ has rank 2, the product
+$\mathbf{T}\boldsymbol{\Sigma}_{3D}\mathbf{T}^T$ evaluates two rows
+through a full $3\times3$ matrix — but any component of
+$\boldsymbol{\Sigma}_{3D}$ in the null space of $\mathbf{T}$ is
+discarded. Computing $\mathbf{J'} = \mathbf{T}\mathbf{M}$ projects into
+the 2D tangent plane first, avoiding work on the unused third dimension.
+
 ---
 
 ## 3. Screen-Space Extent & Tile Intersection

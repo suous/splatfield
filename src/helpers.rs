@@ -29,16 +29,6 @@ pub(crate) struct Mat3 {
 }
 
 #[derive(CubeType, Clone, Copy)]
-pub(crate) struct Covariance3D {
-    pub xx: f32,
-    pub xy: f32,
-    pub xz: f32,
-    pub yy: f32,
-    pub yz: f32,
-    pub zz: f32,
-}
-
-#[derive(CubeType, Clone, Copy)]
 pub(crate) struct TileBBox {
     pub min_x: u32,
     pub min_y: u32,

@@ -3,7 +3,7 @@
 //! References:
 //! - <https://github.com/graphdeco-inria/diff-gaussian-rasterization/blob/main/cuda_rasterizer/forward.cu>
 //! - <https://github.com/graphdeco-inria/diff-gaussian-rasterization/blob/main/cuda_rasterizer/rasterizer_impl.cu>
-use crate::helpers::{self, Covariance3D, Mat3, Vec2F, Vec3F, Vec4F};
+use crate::helpers::{self, Mat3, Vec2F, Vec3F, Vec4F};
 use cubecl::prelude::*;
 
 const ALPHA_CUTOFF: f32 = 10.0 / 255.0;
@@ -20,15 +20,6 @@ fn normalize(v: Vec3F) -> Vec3F {
         x: v.x * inv,
         y: v.y * inv,
         z: v.z * inv,
-    }
-}
-
-#[cube]
-fn sym_mul_row(row: Vec3F, s: Covariance3D) -> Vec3F {
-    Vec3F {
-        x: row.x * s.xx + row.y * s.xy + row.z * s.xz,
-        y: row.x * s.xy + row.y * s.yy + row.z * s.yz,
-        z: row.x * s.xz + row.y * s.yz + row.z * s.zz,
     }
 }
 
@@ -102,23 +93,19 @@ fn scale_components(v: Vec3F, s: Vec3F) -> Vec3F {
 }
 
 #[cube]
-fn compute_cov3d(scale: Vec3F, quat: Vec4F) -> Covariance3D {
+fn compute_cov2d(
+    scale: Vec3F,
+    quat: Vec4F,
+    rot: &Mat3,
+    focal: Vec2F,
+    cam: Vec3F,
+    img: Vec2F,
+) -> Vec3F {
     let r = quat_to_rotation(quat);
     let m0 = scale_components(r.row0, scale);
     let m1 = scale_components(r.row1, scale);
     let m2 = scale_components(r.row2, scale);
-    Covariance3D {
-        xx: dot3(m0, m0),
-        xy: dot3(m0, m1),
-        xz: dot3(m0, m2),
-        yy: dot3(m1, m1),
-        yz: dot3(m1, m2),
-        zz: dot3(m2, m2),
-    }
-}
 
-#[cube]
-fn compute_cov2d(cov3d: Covariance3D, rot: &Mat3, focal: Vec2F, cam: Vec3F, img: Vec2F) -> Vec3F {
     let inv_cam_z = cam.z.recip();
     let lim_x = 1.3 * img.x / (2.0 * focal.x);
     let lim_y = 1.3 * img.y / (2.0 * focal.y);
@@ -127,7 +114,7 @@ fn compute_cov2d(cov3d: Covariance3D, rot: &Mat3, focal: Vec2F, cam: Vec3F, img:
 
     let fx_inv_z = focal.x * inv_cam_z;
     let fu_inv_z = fx_inv_z * u;
-    let t_r0 = Vec3F {
+    let t0 = Vec3F {
         x: fx_inv_z * rot.row0.x - fu_inv_z * rot.row2.x,
         y: fx_inv_z * rot.row0.y - fu_inv_z * rot.row2.y,
         z: fx_inv_z * rot.row0.z - fu_inv_z * rot.row2.z,
@@ -135,19 +122,27 @@ fn compute_cov2d(cov3d: Covariance3D, rot: &Mat3, focal: Vec2F, cam: Vec3F, img:
 
     let fy_inv_z = focal.y * inv_cam_z;
     let fv_inv_z = fy_inv_z * v;
-    let t_r1 = Vec3F {
+    let t1 = Vec3F {
         x: fy_inv_z * rot.row1.x - fv_inv_z * rot.row2.x,
         y: fy_inv_z * rot.row1.y - fv_inv_z * rot.row2.y,
         z: fy_inv_z * rot.row1.z - fv_inv_z * rot.row2.z,
     };
 
-    let jc_r0 = sym_mul_row(t_r0, cov3d);
-    let jc_r1 = sym_mul_row(t_r1, cov3d);
+    let j0 = Vec3F {
+        x: t0.x * m0.x + t0.y * m1.x + t0.z * m2.x,
+        y: t0.x * m0.y + t0.y * m1.y + t0.z * m2.y,
+        z: t0.x * m0.z + t0.y * m1.z + t0.z * m2.z,
+    };
+    let j1 = Vec3F {
+        x: t1.x * m0.x + t1.y * m1.x + t1.z * m2.x,
+        y: t1.x * m0.y + t1.y * m1.y + t1.z * m2.y,
+        z: t1.x * m0.z + t1.y * m1.z + t1.z * m2.z,
+    };
 
     Vec3F {
-        x: dot3(jc_r0, t_r0) + 0.3,
-        y: dot3(jc_r0, t_r1),
-        z: dot3(jc_r1, t_r1) + 0.3,
+        x: dot3(j0, j0) + 0.3,
+        y: dot3(j0, j1),
+        z: dot3(j1, j1) + 0.3,
     }
 }
 
@@ -207,8 +202,7 @@ pub(crate) fn project_splats(
         if cam.z <= 0.1f32 {
             terminate!();
         }
-        let cov3d = compute_cov3d(scale, quat);
-        let cov2d = compute_cov2d(cov3d, &rot, focal, cam, img_size);
+        let cov2d = compute_cov2d(scale, quat, &rot, focal, cam, img_size);
         let conic = compute_conic(cov2d.x, cov2d.y, cov2d.z);
 
         let vis_slot = counters[1].fetch_add(1u32);
