@@ -179,7 +179,7 @@ $$
 \mathbf{t}_1 = \frac{f_y}{z} \cdot \mathbf{W}_1 - \frac{f_y \cdot v}{z} \cdot \mathbf{W}_2
 $$
 
-where $\mathbf{W}_0, \mathbf{W}_1, \mathbf{W}_2$ are the rows of the view rotation.
+where $W_0$, $W_1$, and $W_2$ are the rows of the view rotation.
 Sandwiching $\boldsymbol{\Sigma_{3D}}$ directly with $\mathbf{T}$ yields the same
 results while completely bypassing the intermediate $3\times3$ camera covariance:
 
@@ -221,14 +221,16 @@ to evaluate Gaussian contributions without per-pixel matrix inversion
 ### Direct 2D Projection (Implemented)
 
 Rather than materializing the intermediate
-$\boldsymbol{\Sigma}_{3D}$, the implementation projects
-$\mathbf{M}$ directly through $\mathbf{T}$. Substituting
+$\Sigma_{3D}$, the implementation projects
+$\mathbf{M}$  directly through $\mathbf{T}$. Substituting
 $\boldsymbol{\Sigma}_{3D} = \mathbf{M}\mathbf{M}^T$ and applying
 associativity:
 
 $$
-\boldsymbol{\Sigma}_{2d} = \mathbf{T}(\mathbf{M}\mathbf{M}^T)\mathbf{T}^T
-= (\mathbf{T}\mathbf{M})(\mathbf{T}\mathbf{M})^T = \mathbf{J'}\mathbf{J'}^T
+\boldsymbol{\Sigma}_{2d} 
+= \mathbf{T}(\mathbf{M}\mathbf{M}^T)\mathbf{T}^T
+= (\mathbf{T}\mathbf{M})(\mathbf{T}\mathbf{M})^T 
+= \mathbf{J'}\mathbf{J'}^T
 $$
 
 where $\mathbf{J'} = \mathbf{T}\mathbf{M}$ is a $2\times3$ matrix — the
@@ -237,16 +239,18 @@ projection of the scaled rotation directly into the 2D tangent plane:
 $$
 \mathbf{J'} =
 \begin{bmatrix}
-\mathbf{t}_0 \\[2pt] \mathbf{t}_1
-\end{bmatrix}
+    \mathbf{t}_0 \\ 
+    \mathbf{t}_1
+\end{bmatrix}_{2\times3}
 \begin{bmatrix}
-\mathbf{m}_0 \\[2pt] \mathbf{m}_1 \\[2pt] \mathbf{m}_2
-\end{bmatrix}
-=
-\begin{bmatrix}
-\mathbf{t}_0 \cdot \mathbf{m}_0 & \mathbf{t}_0 \cdot \mathbf{m}_1 & \mathbf{t}_0 \cdot \mathbf{m}_2 \\[2pt]
-\mathbf{t}_1 \cdot \mathbf{m}_0 & \mathbf{t}_1 \cdot \mathbf{m}_1 & \mathbf{t}_1 \cdot \mathbf{m}_2
-\end{bmatrix}
+    \mathbf{m}_0 \\ 
+    \mathbf{m}_1 \\ 
+    \mathbf{m}_2
+\end{bmatrix}_{3\times3}
+=\begin{bmatrix}
+    \mathbf{t}_0 \cdot \mathbf{m}_0 & \mathbf{t}_0 \cdot \mathbf{m}_1 & \mathbf{t}_0 \cdot \mathbf{m}_2 \\
+    \mathbf{t}_1 \cdot \mathbf{m}_0 & \mathbf{t}_1 \cdot \mathbf{m}_1 & \mathbf{t}_1 \cdot \mathbf{m}_2
+\end{bmatrix}_{2\times3}
 $$
 
 Expanding each element:
@@ -255,24 +259,24 @@ $$
 \boldsymbol{\Sigma}_{2d} =
 \underbrace{
 \begin{bmatrix}
-t_{0x} & t_{0y} & t_{0z} \\[2pt]
+t_{0x} & t_{0y} & t_{0z} \\
 t_{1x} & t_{1y} & t_{1z}
 \end{bmatrix}
 \begin{bmatrix}
-m_{0x} & m_{0y} & m_{0z} \\[2pt]
-m_{1x} & m_{1y} & m_{1z} \\[2pt]
+m_{0x} & m_{0y} & m_{0z} \\
+m_{1x} & m_{1y} & m_{1z} \\
 m_{2x} & m_{2y} & m_{2z}
 \end{bmatrix}
 }_{\mathbf{J'}}
 \underbrace{
 \begin{bmatrix}
-m_{0x} & m_{1x} & m_{2x} \\[2pt]
-m_{0y} & m_{1y} & m_{2y} \\[2pt]
+m_{0x} & m_{1x} & m_{2x} \\
+m_{0y} & m_{1y} & m_{2y} \\
 m_{0z} & m_{1z} & m_{2z}
 \end{bmatrix}
 \begin{bmatrix}
-t_{0x} & t_{1x} \\[2pt]
-t_{0y} & t_{1y} \\[2pt]
+t_{0x} & t_{1x} \\
+t_{0y} & t_{1y} \\
 t_{0z} & t_{1z}
 \end{bmatrix}
 }_{\mathbf{J'}^T}
@@ -299,7 +303,7 @@ into the final $2\times2$ result:
 
 The savings (18 mul, 12 add per Gaussian) come from the final step.
 Since $\mathbf{T}$ has rank 2, the product
-$\mathbf{T}\boldsymbol{\Sigma}_{3D}\mathbf{T}^T$ evaluates two rows
+$\mathbf{T}\Sigma_{3D}\mathbf{T}^T$ evaluates two rows
 through a full $3\times3$ matrix — but any component of
 $\boldsymbol{\Sigma}_{3D}$ in the null space of $\mathbf{T}$ is
 discarded. Computing $\mathbf{J'} = \mathbf{T}\mathbf{M}$ projects into
