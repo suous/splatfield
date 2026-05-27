@@ -87,11 +87,7 @@ fn unpack_quat(px: u8, py: u8, pz: u8, tag: u8) -> [f32; 4] {
 
 pub fn load_sog(data: &[u8], client: &ComputeClient<WgpuRuntime>) -> Result<Splats> {
     let mut zip = ZipArchive::new(Cursor::new(data))?;
-    let meta: Meta = {
-        let mut buf = String::new();
-        zip.by_name("meta.json")?.read_to_string(&mut buf)?;
-        serde_json::from_str(&buf)?
-    };
+    let meta: Meta = serde_json::from_reader(zip.by_name("meta.json")?)?;
 
     let n = meta.count;
     let mut attributes = vec![0f32; n * 11];
@@ -103,19 +99,15 @@ pub fn load_sog(data: &[u8], client: &ComputeClient<WgpuRuntime>) -> Result<Spla
     let mins = glam::Vec3::from_array(meta.means.mins);
     let spans = glam::Vec3::from_array(meta.means.maxs) - mins;
 
-    for ((attr, lo_chunk), hi_chunk) in attributes
+    for ((attr, lc), hc) in attributes
         .chunks_exact_mut(11)
         .zip(lo.chunks_exact(4))
         .zip(hi.chunks_exact(4))
     {
-        let u16x = u16::from_le_bytes([lo_chunk[0], hi_chunk[0]]);
-        let u16y = u16::from_le_bytes([lo_chunk[1], hi_chunk[1]]);
-        let u16z = u16::from_le_bytes([lo_chunk[2], hi_chunk[2]]);
-
         let p = glam::Vec3::new(
-            inv_log(mins.x + spans.x * u16x as f32 / 65535.0),
-            inv_log(mins.y + spans.y * u16y as f32 / 65535.0),
-            inv_log(mins.z + spans.z * u16z as f32 / 65535.0),
+            inv_log(mins.x + spans.x * u16::from_le_bytes([lc[0], hc[0]]) as f32 / 65535.0),
+            inv_log(mins.y + spans.y * u16::from_le_bytes([lc[1], hc[1]]) as f32 / 65535.0),
+            inv_log(mins.z + spans.z * u16::from_le_bytes([lc[2], hc[2]]) as f32 / 65535.0),
         );
 
         attr[0..3].copy_from_slice(&p.to_array());
@@ -127,23 +119,22 @@ pub fn load_sog(data: &[u8], client: &ComputeClient<WgpuRuntime>) -> Result<Spla
     let scale_cb = &meta.scales.codebook;
     for (attr, chunk) in attributes.chunks_exact_mut(11).zip(sl.chunks_exact(4)) {
         for i in 0..3 {
-            attr[7 + i] = *scale_cb.get(chunk[i] as usize).context("scales codebook")?;
+            attr[7 + i] = scale_cb[chunk[i] as usize];
         }
     }
 
     let (qr, _) = decode_rgba(&mut zip, &meta.quats.files[0], n)?;
     for (attr, chunk) in attributes.chunks_exact_mut(11).zip(qr.chunks_exact(4)) {
         let tag = chunk[3];
-        let q = if !(252..=255).contains(&tag) {
-            [1.0, 0.0, 0.0, 0.0]
-        } else {
-            unpack_quat(chunk[0], chunk[1], chunk[2], tag)
+        let q = match tag {
+            252..=255 => unpack_quat(chunk[0], chunk[1], chunk[2], tag),
+            _ => [1.0, 0.0, 0.0, 0.0],
         };
         attr[3..7].copy_from_slice(&q);
     }
 
     let (c0, _) = decode_rgba(&mut zip, &meta.sh0.files[0], n)?;
-    let sh_per_ch = 1 + meta.sh_n.as_ref().map_or(0, |s| (s.bands + 1).pow(2) - 1);
+    let sh_per_ch = meta.sh_n.as_ref().map_or(1, |s| (s.bands + 1).pow(2));
     let mut sh_coeffs = vec![0f32; n * sh_per_ch * 3];
     let sh0_cb = &meta.sh0.codebook;
 
@@ -153,7 +144,7 @@ pub fn load_sog(data: &[u8], client: &ComputeClient<WgpuRuntime>) -> Result<Spla
         .zip(sh_coeffs.chunks_exact_mut(sh_per_ch * 3))
     {
         for i in 0..3 {
-            sh_chunk[i] = *sh0_cb.get(chunk[i] as usize).context("sh0 codebook")?;
+            sh_chunk[i] = sh0_cb[chunk[i] as usize];
         }
         attr[10] = logit(chunk[3] as f32 / 255.0);
     }
@@ -181,9 +172,7 @@ pub fn load_sog(data: &[u8], client: &ComputeClient<WgpuRuntime>) -> Result<Spla
                 let p = (base_y * cw + base_x + j) * 4;
                 let c_idx = (j + 1) * 3;
                 for k in 0..3 {
-                    sh_chunk[c_idx + k] = *codebook
-                        .get(centroids[p + k] as usize)
-                        .context("shN codebook")?;
+                    sh_chunk[c_idx + k] = codebook[centroids[p + k] as usize];
                 }
             }
         }
