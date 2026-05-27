@@ -11,6 +11,10 @@ egui = "0.34"
 wgpu = "29"
 anyhow = "1.0.102"
 log = "0.4"
+image = { version = "0.25", default-features = false, features = ["webp"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 eframe = { version = "0.34", default-features = false, features = ["wgpu", "x11", "wayland"] }
@@ -25,7 +29,6 @@ wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = ["HtmlCanvasElement", "Document", "Element", "Window"] }
 console_error_panic_hook = "0.1"
 getrandom = { version = "0.4", features = ["wasm_js"] }
-serde_json = { version = "1.0", features = ["alloc"] }
 
 [dev-dependencies]
 rand = "0.10"

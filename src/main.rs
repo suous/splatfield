@@ -2,7 +2,6 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
 
-#[cfg(not(target_arch = "wasm32"))]
 use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(target_arch = "wasm32")]
@@ -11,13 +10,16 @@ use std::cell::Cell;
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::JsCast;
 
+#[cfg(not(target_arch = "wasm32"))]
+use anyhow::Context;
+
 use cubecl::prelude::*;
 use cubecl::wgpu::{MemoryConfiguration, RuntimeOptions, WgpuRuntime, WgpuSetup, init_device};
 use eframe::egui;
 use egui::{Color32, Rect};
 use glam::{Quat, Vec3};
 use log::error;
-use splatfield::{camera, file, render, texture};
+use splatfield::{camera, file, render, sog, texture};
 
 const UV_RECT: Rect = Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
 
@@ -26,7 +28,6 @@ struct App {
     controller: camera::Controller,
     client: ComputeClient<WgpuRuntime>,
     splats: Arc<RwLock<Option<render::Splats>>>,
-    #[cfg(not(target_arch = "wasm32"))]
     reframe: Arc<AtomicBool>,
     #[cfg(target_arch = "wasm32")]
     rendering: Rc<Cell<bool>>,
@@ -84,26 +85,39 @@ impl App {
             controller: camera::Controller::new(-Vec3::Z * 2.5, Quat::IDENTITY),
             client: WgpuRuntime::client(&device),
             splats: Arc::new(RwLock::new(None)),
-            #[cfg(not(target_arch = "wasm32"))]
             reframe: Arc::new(AtomicBool::new(false)),
             #[cfg(target_arch = "wasm32")]
             rendering: Rc::new(Cell::new(false)),
         }
     }
 
-    #[cfg(not(target_arch = "wasm32"))]
-    fn load_first_ply(&self, file: egui::DroppedFile, ctx: egui::Context) {
-        if let Some(path) = file.path {
+    fn load_dropped(&self, file: egui::DroppedFile, ctx: egui::Context) {
+        let ext = file
+            .path
+            .as_ref()
+            .and_then(|p| p.extension())
+            .and_then(|e| e.to_str())
+            .or_else(|| file.name.rsplit('.').next())
+            .unwrap_or("")
+            .to_string();
+
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let Some(path) = file.path else { return };
             let client = self.client.clone();
             let splats = Arc::clone(&self.splats);
             let reframe = Arc::clone(&self.reframe);
 
             std::thread::spawn(move || {
-                let Ok(reader) = std::fs::File::open(&path) else {
-                    error!("Failed to open file: {path:?}");
-                    return;
+                let result = match ext.as_str() {
+                    "sog" => std::fs::read(&path)
+                        .context(format!("Failed to read {path:?}"))
+                        .and_then(|data| sog::load_sog(&data, &client)),
+                    _ => std::fs::File::open(&path)
+                        .context(format!("Failed to open {path:?}"))
+                        .and_then(|r| file::load_ply(r, &client)),
                 };
-                match file::load_ply(reader, &client) {
+                match result {
                     Ok(data) => {
                         *splats.write().unwrap() = Some(data);
                         reframe.store(true, Ordering::Release);
@@ -113,18 +127,28 @@ impl App {
                 }
             });
         }
-    }
 
-    #[cfg(target_arch = "wasm32")]
-    fn load_first_ply(&mut self, file: egui::DroppedFile, _ctx: egui::Context) {
-        if let Some(bytes) = file.bytes {
-            match file::load_ply(std::io::Cursor::new(bytes), &self.client) {
-                Ok(data) => {
-                    self.controller.frame_bounds(data.bounds);
-                    *self.splats.write().unwrap() = Some(data);
+        #[cfg(target_arch = "wasm32")]
+        {
+            let Some(bytes) = file.bytes else { return };
+            let client = self.client.clone();
+            let splats = Arc::clone(&self.splats);
+            let reframe = Arc::clone(&self.reframe);
+
+            wasm_bindgen_futures::spawn_local(async move {
+                let result = match ext.as_str() {
+                    "sog" => sog::load_sog(&bytes, &client),
+                    _ => file::load_ply(std::io::Cursor::new(bytes), &client),
+                };
+                match result {
+                    Ok(data) => {
+                        *splats.write().unwrap() = Some(data);
+                        reframe.store(true, Ordering::Release);
+                        ctx.request_repaint();
+                    }
+                    Err(e) => error!("Failed to load splat: {e:?}"),
                 }
-                Err(e) => error!("Failed to load splat: {e:?}"),
-            }
+            });
         }
     }
 }
@@ -136,21 +160,22 @@ impl eframe::App for App {
             .into_iter()
             .find(|f| {
                 f.name.ends_with(".ply")
-                    || f.path
-                        .as_ref()
-                        .is_some_and(|p| p.extension().is_some_and(|ext| ext == "ply"))
+                    || f.name.ends_with(".sog")
+                    || f.path.as_ref().is_some_and(|p| {
+                        p.extension()
+                            .is_some_and(|ext| ext == "ply" || ext == "sog")
+                    })
             })
         {
-            self.load_first_ply(file, ui.ctx().clone());
+            self.load_dropped(file, ui.ctx().clone());
         }
 
         let binding = self.splats.read().unwrap();
         let Some(splats) = binding.as_ref() else {
-            ui.centered_and_justified(|ui| ui.heading("Drag and drop a .ply file"));
+            ui.centered_and_justified(|ui| ui.heading("Drag and drop a .ply or .sog file"));
             return;
         };
 
-        #[cfg(not(target_arch = "wasm32"))]
         if self.reframe.swap(false, Ordering::AcqRel) {
             self.controller.frame_bounds(splats.bounds);
         }

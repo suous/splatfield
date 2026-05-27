@@ -3,6 +3,7 @@ pub mod file;
 pub mod helpers;
 pub mod project;
 pub mod render;
+pub mod sog;
 pub mod sort;
 pub mod tensor;
 pub mod texture;
