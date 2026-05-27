@@ -44,19 +44,17 @@ pub fn load_ply(reader: impl Read, client: &ComputeClient<WgpuRuntime>) -> Resul
     let idx_dc1 = get_idx("f_dc_1")?;
     let idx_dc2 = get_idx("f_dc_2")?;
 
-    let mut rest_keys: Vec<usize> = properties
+    let mut rest_keys: Vec<(usize, usize)> = properties
         .iter()
         .enumerate()
-        .filter(|(_, name)| name.starts_with("f_rest_"))
-        .map(|(idx, _)| idx)
+        .filter_map(|(idx, name)| {
+            name.strip_prefix("f_rest_")
+                .and_then(|s| s.parse::<usize>().ok())
+                .map(|n| (idx, n))
+        })
         .collect();
-
-    rest_keys.sort_by_key(|&idx| {
-        properties[idx]
-            .strip_prefix("f_rest_")
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(0)
-    });
+    rest_keys.sort_by_key(|&(_, n)| n);
+    let rest_keys: Vec<usize> = rest_keys.into_iter().map(|(idx, _)| idx).collect();
 
     let stride = properties.len();
     let mut buf = vec![0u8; vertex_count * stride * 4];

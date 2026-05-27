@@ -139,22 +139,22 @@ pub fn radix_argsort(
     n: u32,
     bits: u32,
 ) -> (GpuTensor, GpuTensor) {
-    let client = &keys.client.clone();
     let max_n = keys.shape[0] as u32;
+    let client = keys.client.clone();
     let max_wgs = max_n.div_ceil(SORT_BLOCK);
 
-    let num_wgs = cube_count_1d(client, n, SORT_BLOCK);
+    let num_wgs = cube_count_1d(&client, n, SORT_BLOCK);
     let cube_dim = CubeDim::new_1d(SORT_WG);
 
     let mut cur_keys = keys;
     let mut cur_vals = vals;
-    let count_buf = GpuTensor::empty(client, [(max_wgs as usize) * SORT_BINS as usize], U32);
-    let mut dst_keys = GpuTensor::empty(client, [max_n as usize], cur_keys.dtype);
-    let mut dst_vals = GpuTensor::empty(client, [max_n as usize], cur_vals.dtype);
+    let count_buf = GpuTensor::empty(&client, [(max_wgs as usize) * SORT_BINS as usize], U32);
+    let mut dst_keys = GpuTensor::empty(&client, [max_n as usize], cur_keys.dtype);
+    let mut dst_vals = GpuTensor::empty(&client, [max_n as usize], cur_vals.dtype);
 
     for shift in (0..bits).step_by(4) {
         count_kernel::launch::<WgpuRuntime>(
-            client,
+            &client,
             num_wgs.clone(),
             cube_dim,
             shift,
@@ -164,7 +164,7 @@ pub fn radix_argsort(
         );
 
         prefix_kernel::launch::<WgpuRuntime>(
-            client,
+            &client,
             CubeCount::new_single(),
             cube_dim,
             n,
@@ -172,7 +172,7 @@ pub fn radix_argsort(
         );
 
         scatter_kernel::launch::<WgpuRuntime>(
-            client,
+            &client,
             num_wgs.clone(),
             cube_dim,
             shift,
@@ -242,8 +242,8 @@ mod radix_sort_tests {
             let values = GpuTensor::from(&client, [values_inp.len()], U32, &values_inp);
             let (ret_keys, ret_values) = radix_argsort(keys, values, keys_inp.len() as u32, 32);
 
-            let ret_keys = tensor_to_vec::<u32>(ret_keys);
-            let ret_values = tensor_to_vec::<u32>(ret_values);
+            let ret_keys = tensor_to_vec(ret_keys);
+            let ret_values = tensor_to_vec(ret_values);
 
             let inds = argsort(&keys_inp);
             let ref_keys: Vec<u32> = inds.iter().map(|&i| keys_inp[i]).collect();
@@ -274,8 +274,8 @@ mod radix_sort_tests {
         let values = GpuTensor::from(&client, [values_inp.len()], U32, &values_inp);
         let (ret_keys, ret_values) = radix_argsort(keys, values, keys_inp.len() as u32, 32);
 
-        let ret_keys = tensor_to_vec::<u32>(ret_keys);
-        let ret_values = tensor_to_vec::<u32>(ret_values);
+        let ret_keys: Vec<u32> = tensor_to_vec(ret_keys);
+        let ret_values: Vec<u32> = tensor_to_vec(ret_values);
 
         let inds = argsort(&keys_inp);
         let ref_keys: Vec<u32> = inds.iter().map(|&i| keys_inp[i]).collect();
@@ -300,8 +300,8 @@ mod radix_sort_tests {
         let values = GpuTensor::from(&client, [NUM_ELEMENTS], U32, &values_inp);
         let (ret_keys, ret_values) = radix_argsort(keys, values, NUM_ELEMENTS as u32, 32);
 
-        let ret_keys = tensor_to_vec::<u32>(ret_keys);
-        let ret_values = tensor_to_vec::<u32>(ret_values);
+        let ret_keys: Vec<u32> = tensor_to_vec(ret_keys);
+        let ret_values: Vec<u32> = tensor_to_vec(ret_values);
 
         assert_eq!(ret_keys.len(), NUM_ELEMENTS);
         assert_eq!(ret_values.len(), NUM_ELEMENTS);
