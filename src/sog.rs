@@ -2,7 +2,7 @@ use crate::render::Splats;
 use anyhow::{Context, Result};
 use cubecl::{client::ComputeClient, wgpu::WgpuRuntime};
 use serde::Deserialize;
-use std::io::{Cursor, Read};
+use std::io::{Read, Seek};
 use zip::ZipArchive;
 
 #[derive(Deserialize)]
@@ -41,8 +41,8 @@ struct ShN {
     files: [String; 2],
 }
 
-fn decode_rgba(
-    zip: &mut ZipArchive<Cursor<&[u8]>>,
+fn decode_rgba<R: Read + Seek>(
+    zip: &mut ZipArchive<R>,
     name: &str,
     min_pixels: usize,
 ) -> Result<(Vec<u8>, usize)> {
@@ -85,8 +85,8 @@ fn unpack_quat(px: u8, py: u8, pz: u8, tag: u8) -> [f32; 4] {
     }
 }
 
-pub fn load_sog(data: &[u8], client: &ComputeClient<WgpuRuntime>) -> Result<Splats> {
-    let mut zip = ZipArchive::new(Cursor::new(data))?;
+pub fn load_sog(reader: impl Read + Seek, client: &ComputeClient<WgpuRuntime>) -> Result<Splats> {
+    let mut zip = ZipArchive::new(reader)?;
     let meta: Meta = serde_json::from_reader(zip.by_name("meta.json")?)?;
 
     let n = meta.count;

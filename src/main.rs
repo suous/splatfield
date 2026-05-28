@@ -1,8 +1,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::{Arc, RwLock};
-
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock};
 
 #[cfg(target_arch = "wasm32")]
 use std::cell::Cell;
@@ -18,8 +17,7 @@ use cubecl::wgpu::{MemoryConfiguration, RuntimeOptions, WgpuRuntime, WgpuSetup, 
 use eframe::egui;
 use egui::{Color32, Rect};
 use glam::{Quat, Vec3};
-use log::error;
-use splatfield::{camera, file, render, sog, texture};
+use splatfield::{camera, ply, render, sog, texture};
 
 const UV_RECT: Rect = Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
 
@@ -92,62 +90,50 @@ impl App {
     }
 
     fn load_dropped(&self, file: egui::DroppedFile, ctx: egui::Context) {
-        let ext = file
+        let is_sog = file
             .path
             .as_ref()
-            .and_then(|p| p.extension())
-            .and_then(|e| e.to_str())
-            .or_else(|| file.name.rsplit('.').next())
-            .unwrap_or("")
-            .to_string();
+            .is_some_and(|p| p.extension().is_some_and(|e| e == "sog"))
+            || file.name.ends_with(".sog");
+
+        let client = self.client.clone();
+        let splats = Arc::clone(&self.splats);
+        let reframe = Arc::clone(&self.reframe);
+
+        let load = move |reader| -> anyhow::Result<render::Splats> {
+            if is_sog {
+                sog::load_sog(reader, &client)
+            } else {
+                ply::load_ply(reader, &client)
+            }
+        };
+
+        let on_loaded = move |result: anyhow::Result<render::Splats>| match result {
+            Ok(data) => {
+                *splats.write().unwrap() = Some(data);
+                reframe.store(true, Ordering::Release);
+                ctx.request_repaint();
+            }
+            Err(e) => log::error!("Failed to load splat: {e:?}"),
+        };
 
         #[cfg(not(target_arch = "wasm32"))]
         {
             let Some(path) = file.path else { return };
-            let client = self.client.clone();
-            let splats = Arc::clone(&self.splats);
-            let reframe = Arc::clone(&self.reframe);
-
             std::thread::spawn(move || {
-                let result = match ext.as_str() {
-                    "sog" => std::fs::read(&path)
-                        .context(format!("Failed to read {path:?}"))
-                        .and_then(|data| sog::load_sog(&data, &client)),
-                    _ => std::fs::File::open(&path)
-                        .context(format!("Failed to open {path:?}"))
-                        .and_then(|r| file::load_ply(r, &client)),
-                };
-                match result {
-                    Ok(data) => {
-                        *splats.write().unwrap() = Some(data);
-                        reframe.store(true, Ordering::Release);
-                        ctx.request_repaint();
-                    }
-                    Err(e) => error!("Failed to load splat: {e:?}"),
-                }
+                on_loaded(
+                    std::fs::File::open(&path)
+                        .with_context(|| format!("Failed to open {path:?}"))
+                        .and_then(|f| load(std::io::BufReader::new(f))),
+                );
             });
         }
 
         #[cfg(target_arch = "wasm32")]
         {
             let Some(bytes) = file.bytes else { return };
-            let client = self.client.clone();
-            let splats = Arc::clone(&self.splats);
-            let reframe = Arc::clone(&self.reframe);
-
             wasm_bindgen_futures::spawn_local(async move {
-                let result = match ext.as_str() {
-                    "sog" => sog::load_sog(&bytes, &client),
-                    _ => file::load_ply(std::io::Cursor::new(bytes), &client),
-                };
-                match result {
-                    Ok(data) => {
-                        *splats.write().unwrap() = Some(data);
-                        reframe.store(true, Ordering::Release);
-                        ctx.request_repaint();
-                    }
-                    Err(e) => error!("Failed to load splat: {e:?}"),
-                }
+                on_loaded(load(std::io::Cursor::new(bytes)));
             });
         }
     }

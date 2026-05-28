@@ -1,6 +1,6 @@
 pub mod camera;
-pub mod file;
 pub mod helpers;
+pub mod ply;
 pub mod project;
 pub mod render;
 pub mod sog;
