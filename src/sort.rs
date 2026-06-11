@@ -2,7 +2,7 @@
 //!
 //! References:
 //! - <https://github.com/ArthurBrussee/brush/blob/main/crates/brush-sort/src/lib.rs>
-use crate::tensor::{GpuTensor, U32, cube_count_1d};
+use crate::tensor::{GpuTensor, cube_count_1d};
 use cubecl::prelude::*;
 use cubecl::wgpu::WgpuRuntime;
 
@@ -52,22 +52,19 @@ fn plane_exclusive_sum(value: u32) -> u32 {
 
 #[cube(launch)]
 fn count_kernel(shift: u32, num_keys: u32, src: &Array<u32>, counts: &mut Array<u32>) {
-    let num_wgs = num_keys.div_ceil(SORT_BLOCK);
     let base = SORT_BLOCK * CUBE_POS_X + UNIT_POS;
 
-    if CUBE_POS_X < num_wgs {
-        for bin in 0..SORT_BINS {
-            let mut local_count = 0u32;
-            for e in 0..ELEMS_PER_THREAD {
-                let idx = base + e * SORT_WG;
-                if idx < num_keys && (src[idx as usize] >> shift) & 0xf == bin {
-                    local_count += 1;
-                }
+    for bin in 0..SORT_BINS {
+        let mut local_count = 0u32;
+        for e in 0..ELEMS_PER_THREAD {
+            let idx = base + e * SORT_WG;
+            if idx < num_keys && (src[idx as usize] >> shift) & 0xf == bin {
+                local_count += 1;
             }
-            let total = plane_sum(local_count);
-            if UNIT_POS == 0 {
-                counts[(bin * num_wgs + CUBE_POS_X) as usize] = total;
-            }
+        }
+        let total = plane_sum(local_count);
+        if UNIT_POS == 0 {
+            counts[(bin * CUBE_COUNT_X + CUBE_POS_X) as usize] = total;
         }
     }
 }
@@ -107,28 +104,25 @@ fn scatter_kernel(
     out: &mut Array<u32>,
     out_values: &mut Array<u32>,
 ) {
-    let num_wgs = num_keys.div_ceil(SORT_BLOCK);
-    if CUBE_POS_X < num_wgs {
-        let mut bin_offsets = SharedMemory::<u32>::new(SORT_BINS as usize);
-        let histogram = SharedMemory::<Atomic<u32>>::new(SORT_BINS as usize);
-        if UNIT_POS < SORT_BINS {
-            bin_offsets[UNIT_POS as usize] = counts[(UNIT_POS * num_wgs + CUBE_POS_X) as usize];
-            histogram[UNIT_POS as usize].store(0u32);
-        }
-        sync_cube();
+    let mut bin_offsets = SharedMemory::<u32>::new(SORT_BINS as usize);
+    let histogram = SharedMemory::<Atomic<u32>>::new(SORT_BINS as usize);
+    if UNIT_POS < SORT_BINS {
+        bin_offsets[UNIT_POS as usize] = counts[(UNIT_POS * CUBE_COUNT_X + CUBE_POS_X) as usize];
+        histogram[UNIT_POS as usize].store(0u32);
+    }
+    sync_cube();
 
-        let base = SORT_BLOCK * CUBE_POS_X + UNIT_POS;
-        for e in 0..ELEMS_PER_THREAD {
-            let idx = base + e * SORT_WG;
-            if idx < num_keys {
-                let key = src[idx as usize];
-                let val = values[idx as usize];
-                let bin = (key >> shift) & 0xf;
-                let rank = histogram[bin as usize].fetch_add(1u32);
-                let pos = bin_offsets[bin as usize] + rank;
-                out[pos as usize] = key;
-                out_values[pos as usize] = val;
-            }
+    let base = SORT_BLOCK * CUBE_POS_X + UNIT_POS;
+    for e in 0..ELEMS_PER_THREAD {
+        let idx = base + e * SORT_WG;
+        if idx < num_keys {
+            let key = src[idx as usize];
+            let val = values[idx as usize];
+            let bin = (key >> shift) & 0xf;
+            let rank = histogram[bin as usize].fetch_add(1u32);
+            let pos = bin_offsets[bin as usize] + rank;
+            out[pos as usize] = key;
+            out_values[pos as usize] = val;
         }
     }
 }
@@ -148,9 +142,9 @@ pub fn radix_argsort(
 
     let mut cur_keys = keys;
     let mut cur_vals = vals;
-    let count_buf = GpuTensor::empty(&client, [(max_wgs as usize) * SORT_BINS as usize], U32);
-    let mut dst_keys = GpuTensor::empty(&client, [max_n as usize], cur_keys.dtype);
-    let mut dst_vals = GpuTensor::empty(&client, [max_n as usize], cur_vals.dtype);
+    let count_buf = GpuTensor::empty(&client, [(max_wgs as usize) * SORT_BINS as usize]);
+    let mut dst_keys = GpuTensor::empty(&client, [max_n as usize]);
+    let mut dst_vals = GpuTensor::empty(&client, [max_n as usize]);
 
     for shift in (0..bits).step_by(4) {
         count_kernel::launch::<WgpuRuntime>(
@@ -238,8 +232,8 @@ mod radix_sort_tests {
 
             let values_inp: Vec<_> = keys_inp.iter().copied().map(|x| x * 2 + 5).collect();
 
-            let keys = GpuTensor::from(&client, [keys_inp.len()], U32, &keys_inp);
-            let values = GpuTensor::from(&client, [values_inp.len()], U32, &values_inp);
+            let keys = GpuTensor::from(&client, [keys_inp.len()], &keys_inp);
+            let values = GpuTensor::from(&client, [values_inp.len()], &values_inp);
             let (ret_keys, ret_values) = radix_argsort(keys, values, keys_inp.len() as u32, 32);
 
             let ret_keys = tensor_to_vec(ret_keys);
@@ -270,8 +264,8 @@ mod radix_sort_tests {
         }
 
         let values_inp: Vec<_> = keys_inp.iter().map(|&x| x * 2 + 5).collect();
-        let keys = GpuTensor::from(&client, [keys_inp.len()], U32, &keys_inp);
-        let values = GpuTensor::from(&client, [values_inp.len()], U32, &values_inp);
+        let keys = GpuTensor::from(&client, [keys_inp.len()], &keys_inp);
+        let values = GpuTensor::from(&client, [values_inp.len()], &values_inp);
         let (ret_keys, ret_values) = radix_argsort(keys, values, keys_inp.len() as u32, 32);
 
         let ret_keys: Vec<u32> = tensor_to_vec(ret_keys);
@@ -296,8 +290,8 @@ mod radix_sort_tests {
             .collect();
         let values_inp: Vec<u32> = (0..NUM_ELEMENTS).map(|i| i as u32).collect();
 
-        let keys = GpuTensor::from(&client, [NUM_ELEMENTS], U32, &keys_inp);
-        let values = GpuTensor::from(&client, [NUM_ELEMENTS], U32, &values_inp);
+        let keys = GpuTensor::from(&client, [NUM_ELEMENTS], &keys_inp);
+        let values = GpuTensor::from(&client, [NUM_ELEMENTS], &values_inp);
         let (ret_keys, ret_values) = radix_argsort(keys, values, NUM_ELEMENTS as u32, 32);
 
         let ret_keys: Vec<u32> = tensor_to_vec(ret_keys);

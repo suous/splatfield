@@ -6,7 +6,7 @@
 use crate::helpers::{self, Mat3, Vec2F, Vec3F, Vec4F};
 use cubecl::prelude::*;
 
-const ALPHA_CUTOFF: f32 = 10.0 / 255.0;
+const ALPHA_CUTOFF: f32 = 10.0 / u8::MAX as f32;
 
 #[cube]
 fn dot3(a: Vec3F, b: Vec3F) -> f32 {

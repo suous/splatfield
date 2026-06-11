@@ -7,9 +7,9 @@ pub fn load_ply(reader: impl Read, client: &ComputeClient<WgpuRuntime>) -> Resul
     let mut reader = BufReader::new(reader);
     let mut vertex_count = 0;
     let mut properties = Vec::new();
-    let mut line = String::new();
 
-    while reader.read_line(&mut line)? > 0 {
+    for line in reader.by_ref().lines() {
+        let line = line?;
         let tokens: Vec<&str> = line.split_whitespace().collect();
         match tokens.as_slice() {
             ["end_header", ..] => break,
@@ -19,7 +19,6 @@ pub fn load_ply(reader: impl Read, client: &ComputeClient<WgpuRuntime>) -> Resul
             ["property", "float", name] => properties.push(name.to_string()),
             _ => {}
         }
-        line.clear();
     }
 
     let get_idx = |name: &str| {

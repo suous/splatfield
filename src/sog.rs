@@ -73,9 +73,9 @@ fn logit(y: f32) -> f32 {
 
 fn unpack_quat(px: u8, py: u8, pz: u8, tag: u8) -> [f32; 4] {
     let sqrt2 = std::f32::consts::SQRT_2;
-    let a = (px as f32 / 255.0 * 2.0 - 1.0) / sqrt2;
-    let b = (py as f32 / 255.0 * 2.0 - 1.0) / sqrt2;
-    let c = (pz as f32 / 255.0 * 2.0 - 1.0) / sqrt2;
+    let a = (px as f32 / u8::MAX as f32 * 2.0 - 1.0) / sqrt2;
+    let b = (py as f32 / u8::MAX as f32 * 2.0 - 1.0) / sqrt2;
+    let c = (pz as f32 / u8::MAX as f32 * 2.0 - 1.0) / sqrt2;
     let d = (1.0 - a * a - b * b - c * c).max(0.0).sqrt();
     match tag.wrapping_sub(252) {
         0 => [d, a, b, c],
@@ -105,9 +105,9 @@ pub fn load_sog(reader: impl Read + Seek, client: &ComputeClient<WgpuRuntime>) -
         .zip(hi.chunks_exact(4))
     {
         let p = glam::Vec3::new(
-            inv_log(mins.x + spans.x * u16::from_le_bytes([lc[0], hc[0]]) as f32 / 65535.0),
-            inv_log(mins.y + spans.y * u16::from_le_bytes([lc[1], hc[1]]) as f32 / 65535.0),
-            inv_log(mins.z + spans.z * u16::from_le_bytes([lc[2], hc[2]]) as f32 / 65535.0),
+            inv_log(mins.x + spans.x * u16::from_le_bytes([lc[0], hc[0]]) as f32 / u16::MAX as f32),
+            inv_log(mins.y + spans.y * u16::from_le_bytes([lc[1], hc[1]]) as f32 / u16::MAX as f32),
+            inv_log(mins.z + spans.z * u16::from_le_bytes([lc[2], hc[2]]) as f32 / u16::MAX as f32),
         );
 
         attr[0..3].copy_from_slice(&p.to_array());
@@ -146,7 +146,7 @@ pub fn load_sog(reader: impl Read + Seek, client: &ComputeClient<WgpuRuntime>) -
         for i in 0..3 {
             sh_chunk[i] = sh0_cb[chunk[i] as usize];
         }
-        attr[10] = logit(chunk[3] as f32 / 255.0);
+        attr[10] = logit(chunk[3] as f32 / u8::MAX as f32);
     }
 
     if let Some(ref sh_n) = meta.sh_n {
