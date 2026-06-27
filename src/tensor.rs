@@ -25,11 +25,7 @@ impl core::fmt::Debug for GpuTensor {
 }
 
 impl GpuTensor {
-    pub fn new(
-        client: ComputeClient<WgpuRuntime>,
-        shape: impl Into<Shape>,
-        handle: Handle,
-    ) -> Self {
+    fn new(client: ComputeClient<WgpuRuntime>, shape: impl Into<Shape>, handle: Handle) -> Self {
         Self {
             client,
             handle,

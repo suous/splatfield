@@ -187,6 +187,7 @@ pub fn radix_argsort(
 #[cfg(test)]
 mod radix_sort_tests {
     use super::*;
+    use cubecl::client::ComputeClient;
     use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
     use rand::RngExt;
 
@@ -201,11 +202,20 @@ mod radix_sort_tests {
         indices
     }
 
-    fn assert_sorted(keys: &[u32], values: &[u32], ref_keys: &[u32], ref_values: &[u32]) {
-        for (((k, v), rk), rv) in keys.iter().zip(values).zip(ref_keys).zip(ref_values) {
-            assert_eq!(k, rk);
-            assert_eq!(v, rv);
-        }
+    fn assert_argsort(client: &ComputeClient<WgpuRuntime>, keys_inp: &[u32], values_inp: &[u32]) {
+        let keys = GpuTensor::from(client, [keys_inp.len()], keys_inp);
+        let values = GpuTensor::from(client, [values_inp.len()], values_inp);
+        let (ret_keys, ret_values) = radix_argsort(keys, values, keys_inp.len() as u32, 32);
+
+        let ret_keys: Vec<u32> = tensor_to_vec(ret_keys);
+        let ret_values: Vec<u32> = tensor_to_vec(ret_values);
+
+        let inds = argsort(keys_inp);
+        let ref_keys: Vec<u32> = inds.iter().map(|&i| keys_inp[i]).collect();
+        let ref_values: Vec<u32> = inds.iter().map(|&i| values_inp[i]).collect();
+
+        assert_eq!(ret_keys, ref_keys);
+        assert_eq!(ret_values, ref_values);
     }
 
     #[test]
@@ -232,18 +242,7 @@ mod radix_sort_tests {
 
             let values_inp: Vec<_> = keys_inp.iter().copied().map(|x| x * 2 + 5).collect();
 
-            let keys = GpuTensor::from(&client, [keys_inp.len()], &keys_inp);
-            let values = GpuTensor::from(&client, [values_inp.len()], &values_inp);
-            let (ret_keys, ret_values) = radix_argsort(keys, values, keys_inp.len() as u32, 32);
-
-            let ret_keys = tensor_to_vec(ret_keys);
-            let ret_values = tensor_to_vec(ret_values);
-
-            let inds = argsort(&keys_inp);
-            let ref_keys: Vec<u32> = inds.iter().map(|&i| keys_inp[i]).collect();
-            let ref_values: Vec<u32> = inds.iter().map(|&i| values_inp[i]).collect();
-
-            assert_sorted(&ret_keys, &ret_values, &ref_keys, &ref_values);
+            assert_argsort(&client, &keys_inp, &values_inp);
         }
     }
 
@@ -264,18 +263,7 @@ mod radix_sort_tests {
         }
 
         let values_inp: Vec<_> = keys_inp.iter().map(|&x| x * 2 + 5).collect();
-        let keys = GpuTensor::from(&client, [keys_inp.len()], &keys_inp);
-        let values = GpuTensor::from(&client, [values_inp.len()], &values_inp);
-        let (ret_keys, ret_values) = radix_argsort(keys, values, keys_inp.len() as u32, 32);
-
-        let ret_keys: Vec<u32> = tensor_to_vec(ret_keys);
-        let ret_values: Vec<u32> = tensor_to_vec(ret_values);
-
-        let inds = argsort(&keys_inp);
-        let ref_keys: Vec<u32> = inds.iter().map(|&i| keys_inp[i]).collect();
-        let ref_values: Vec<u32> = inds.iter().map(|&i| values_inp[i]).collect();
-
-        assert_sorted(&ret_keys, &ret_values, &ref_keys, &ref_values);
+        assert_argsort(&client, &keys_inp, &values_inp);
     }
 
     #[test]

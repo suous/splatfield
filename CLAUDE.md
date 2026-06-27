@@ -1,5 +1,9 @@
 # CLAUDE.md
 
+## CRITICAL — use relative paths for file tools
+
+Pass **relative paths** (e.g. `src/tensor.rs`, `CLAUDE.md`) to `Read`, `Edit`, `Write`, and any file tool. **Never hand-type the absolute repo path.** The absolute path is often mistyped, causing resolution failures. Relative paths resolve against the session CWD and always work; `Bash` search uses `rg`/`fd` with relative paths too.
+
 ## Commands
 
 ```bash
