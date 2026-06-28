@@ -11,27 +11,8 @@ const SORT_BINS: u32 = 16;
 const ELEMS_PER_THREAD: u32 = 32;
 const SORT_BLOCK: u32 = SORT_WG * ELEMS_PER_THREAD;
 
-// Shared memory fallbacks for WASM — cubecl's built-in plane ops generate
-// subgroup ops which aren't available on WebGPU. Native uses the built-ins.
-#[cfg(target_arch = "wasm32")]
-#[cube]
-fn plane_sum(value: u32) -> u32 {
-    let mut lds = SharedMemory::<u32>::new(SORT_WG as usize);
-    lds[UNIT_POS as usize] = value;
-    sync_cube();
-
-    let mut stride = 16u32;
-    while stride > 0 {
-        if UNIT_POS < stride {
-            lds[UNIT_POS as usize] += lds[(UNIT_POS + stride) as usize];
-        }
-        stride >>= 1;
-        sync_cube();
-    }
-
-    lds[0]
-}
-
+// Shared memory fallback for WASM — cubecl's built-in plane ops generate
+// subgroup ops which aren't available on WebGPU. Native uses the built-in.
 #[cfg(target_arch = "wasm32")]
 #[cube]
 fn plane_exclusive_sum(value: u32) -> u32 {
@@ -52,20 +33,28 @@ fn plane_exclusive_sum(value: u32) -> u32 {
 
 #[cube(launch)]
 fn count_kernel(shift: u32, num_keys: u32, src: &Array<u32>, counts: &mut Array<u32>) {
-    let base = SORT_BLOCK * CUBE_POS_X + UNIT_POS;
+    // Workgroup-shared histogram: each key is read exactly once, then atomically
+    // bucketed into one of SORT_BINS counters — replacing a per-bin loop that
+    // re-read every key SORT_BINS times.
+    let histogram = SharedMemory::<Atomic<u32>>::new(SORT_BINS as usize);
+    if UNIT_POS < SORT_BINS {
+        histogram[UNIT_POS as usize].store(0u32);
+    }
+    sync_cube();
 
-    for bin in 0..SORT_BINS {
-        let mut local_count = 0u32;
-        for e in 0..ELEMS_PER_THREAD {
-            let idx = base + e * SORT_WG;
-            if idx < num_keys && (src[idx as usize] >> shift) & 0xf == bin {
-                local_count += 1;
-            }
+    let base = SORT_BLOCK * CUBE_POS_X + UNIT_POS;
+    for e in 0..ELEMS_PER_THREAD {
+        let idx = base + e * SORT_WG;
+        if idx < num_keys {
+            let bin = (src[idx as usize] >> shift) & 0xf;
+            histogram[bin as usize].fetch_add(1u32);
         }
-        let total = plane_sum(local_count);
-        if UNIT_POS == 0 {
-            counts[(bin * CUBE_COUNT_X + CUBE_POS_X) as usize] = total;
-        }
+    }
+    sync_cube();
+
+    if UNIT_POS < SORT_BINS {
+        counts[(UNIT_POS * CUBE_COUNT_X + CUBE_POS_X) as usize] =
+            histogram[UNIT_POS as usize].load();
     }
 }
 
