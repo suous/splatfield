@@ -152,7 +152,8 @@ pub fn load_sog(reader: impl Read + Seek, client: &ComputeClient<WgpuRuntime>) -
     if let Some(ref sh_n) = meta.sh_n {
         let bands = sh_n.bands;
         let sh_coeffs_per_ch = (bands + 1).pow(2) - 1;
-        let (centroids, cw) = decode_rgba(&mut zip, &sh_n.files[0], n)?;
+        // centroids is the SH palette, not per-splat data — don't gate it on n
+        let (centroids, cw) = decode_rgba(&mut zip, &sh_n.files[0], 0)?;
         let (labels, _) = decode_rgba(&mut zip, &sh_n.files[1], n)?;
         let codebook = &sh_n.codebook;
         let palette_count = (cw / sh_coeffs_per_ch) * (centroids.len() / 4 / cw);
