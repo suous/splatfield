@@ -91,8 +91,6 @@ pub fn load_sog(reader: impl Read + Seek, client: &ComputeClient<WgpuRuntime>) -
 
     let n = meta.count;
     let mut attributes = vec![0f32; n * 11];
-    let mut min = glam::Vec3::splat(f32::MAX);
-    let mut max = glam::Vec3::splat(f32::MIN);
 
     let (lo, _) = decode_rgba(&mut zip, &meta.means.files[0], n)?;
     let (hi, _) = decode_rgba(&mut zip, &meta.means.files[1], n)?;
@@ -111,8 +109,6 @@ pub fn load_sog(reader: impl Read + Seek, client: &ComputeClient<WgpuRuntime>) -
         );
 
         attr[0..3].copy_from_slice(&p.to_array());
-        min = min.min(p);
-        max = max.max(p);
     }
 
     let (sl, _) = decode_rgba(&mut zip, &meta.scales.files[0], n)?;
@@ -179,5 +175,5 @@ pub fn load_sog(reader: impl Read + Seek, client: &ComputeClient<WgpuRuntime>) -
         }
     }
 
-    Ok(Splats::new(&attributes, &sh_coeffs, client, (min, max)))
+    Ok(Splats::new(&attributes, &sh_coeffs, client))
 }

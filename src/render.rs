@@ -16,18 +16,22 @@ pub struct Splats {
 }
 
 impl Splats {
-    pub fn new(
-        attributes: &[f32],
-        sh_coeffs: &[f32],
-        client: &ComputeClient<WgpuRuntime>,
-        bounds: (glam::Vec3, glam::Vec3),
-    ) -> Self {
+    pub fn new(attributes: &[f32], sh_coeffs: &[f32], client: &ComputeClient<WgpuRuntime>) -> Self {
         let n = attributes.len() / 11;
         let n_coeffs = sh_coeffs.len() / n;
+
+        let mut min = glam::Vec3::splat(f32::MAX);
+        let mut max = glam::Vec3::splat(f32::MIN);
+        for attr in attributes.chunks_exact(11) {
+            let p = glam::Vec3::from_slice(&attr[..3]);
+            min = min.min(p);
+            max = max.max(p);
+        }
+
         Self {
             attributes: GpuTensor::from(client, [n, 11], attributes),
             sh_coeffs: GpuTensor::from(client, [n, n_coeffs / 3, 3], sh_coeffs),
-            bounds,
+            bounds: (min, max),
         }
     }
 

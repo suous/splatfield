@@ -35,10 +35,10 @@ fn device_descriptor(adapter: &eframe::wgpu::Adapter) -> eframe::wgpu::DeviceDes
     eframe::wgpu::DeviceDescriptor {
         required_features: adapter
             .features()
-            .difference(eframe::wgpu::Features::MAPPABLE_PRIMARY_BUFFERS),
+            .difference(eframe::wgpu::Features::MAPPABLE_PRIMARY_BUFFERS)
+            .difference(eframe::wgpu::Features::all_experimental_mask()),
         required_limits: adapter.limits(),
         memory_hints: eframe::wgpu::MemoryHints::MemoryUsage,
-        experimental_features: unsafe { eframe::wgpu::ExperimentalFeatures::enabled() },
         ..Default::default()
     }
 }
