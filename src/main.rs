@@ -55,6 +55,26 @@ fn wgpu_config() -> eframe::egui_wgpu::WgpuConfiguration {
     }
 }
 
+#[derive(Clone, Copy)]
+enum SplatFormat {
+    Ply,
+    Sog,
+}
+
+fn splat_format(file: &egui::DroppedFile) -> Option<SplatFormat> {
+    let ext = file
+        .path
+        .as_ref()
+        .and_then(|p| p.extension()?.to_str())
+        .or_else(|| file.name.rsplit_once('.').map(|(_, ext)| ext))
+        .map(str::to_ascii_lowercase);
+    match ext.as_deref() {
+        Some("ply") => Some(SplatFormat::Ply),
+        Some("sog") => Some(SplatFormat::Sog),
+        _ => None,
+    }
+}
+
 impl App {
     fn new(cc: &eframe::CreationContext) -> Self {
         let render_state = cc.wgpu_render_state.as_ref().expect("Must use wgpu");
@@ -90,21 +110,18 @@ impl App {
     }
 
     fn load_dropped(&self, file: egui::DroppedFile, ctx: egui::Context) {
-        let is_sog = file
-            .path
-            .as_ref()
-            .is_some_and(|p| p.extension().is_some_and(|e| e == "sog"))
-            || file.name.ends_with(".sog");
+        let Some(format) = splat_format(&file) else {
+            return;
+        };
 
         let client = self.client.clone();
         let splats = Arc::clone(&self.splats);
         let reframe = Arc::clone(&self.reframe);
 
         let load = move |reader| -> anyhow::Result<render::Splats> {
-            if is_sog {
-                sog::load_sog(reader, &client)
-            } else {
-                ply::load_ply(reader, &client)
+            match format {
+                SplatFormat::Sog => sog::load_sog(reader, &client),
+                SplatFormat::Ply => ply::load_ply(reader, &client),
             }
         };
 
@@ -144,14 +161,7 @@ impl eframe::App for App {
         if let Some(file) = ui
             .input(|i| i.raw.dropped_files.clone())
             .into_iter()
-            .find(|f| {
-                f.name.ends_with(".ply")
-                    || f.name.ends_with(".sog")
-                    || f.path.as_ref().is_some_and(|p| {
-                        p.extension()
-                            .is_some_and(|ext| ext == "ply" || ext == "sog")
-                    })
-            })
+            .find(|f| splat_format(f).is_some())
         {
             self.load_dropped(file, ui.ctx().clone());
         }
@@ -168,7 +178,7 @@ impl eframe::App for App {
 
         let size = ui.available_size();
         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::drag());
-        let pixel = (glam::vec2(size.x, size.y) * ui.ctx().pixels_per_point()).as_uvec2();
+        let pixel = (glam::vec2(size.x, size.y) * ui.pixels_per_point()).as_uvec2();
         self.controller.tick(&response, ui);
         self.controller.camera.fit_fov(pixel);
 

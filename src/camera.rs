@@ -63,7 +63,7 @@ impl Controller {
         let is_orbit = !t && response.dragged_by(PointerButton::Primary) && !is_pan;
 
         if response.hovered() {
-            ui.ctx().set_cursor_icon(if mods.ctrl || is_pan {
+            ui.set_cursor_icon(if mods.ctrl || is_pan {
                 CursorIcon::Move
             } else {
                 CursorIcon::PointingHand
