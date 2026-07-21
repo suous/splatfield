@@ -48,6 +48,12 @@ impl GpuTensor {
         Self::new(client.clone(), shape, buffer)
     }
 
+    /// Blocking GPU→CPU readback. Generic over `T: Pod` for symmetry with `from`.
+    pub fn read_vec<T: bytemuck::Pod>(&self) -> Vec<T> {
+        let bytes = self.client.read_one_unchecked(self.handle.clone());
+        bytemuck::cast_slice(&bytes).to_vec()
+    }
+
     pub async fn read_pair(&self) -> [u32; 2] {
         let bytes = self.client.read_async(vec![self.handle.clone()]).await;
         bytemuck::cast_slice(&bytes.unwrap()[0]).try_into().unwrap()

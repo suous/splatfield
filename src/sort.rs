@@ -180,11 +180,6 @@ mod radix_sort_tests {
     use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
     use rand::RngExt;
 
-    fn tensor_to_vec<T: bytemuck::Pod>(tensor: GpuTensor) -> Vec<T> {
-        let bytes = tensor.client.read_one_unchecked(tensor.handle);
-        bytemuck::cast_slice::<u8, T>(&bytes).to_vec()
-    }
-
     fn argsort<T: Ord>(data: &[T]) -> Vec<usize> {
         let mut indices: Vec<usize> = (0..data.len()).collect();
         indices.sort_unstable_by_key(|&i| &data[i]);
@@ -196,8 +191,8 @@ mod radix_sort_tests {
         let values = GpuTensor::from(client, [values_inp.len()], values_inp);
         let (ret_keys, ret_values) = radix_argsort(keys, values, keys_inp.len() as u32, 32);
 
-        let ret_keys: Vec<u32> = tensor_to_vec(ret_keys);
-        let ret_values: Vec<u32> = tensor_to_vec(ret_values);
+        let ret_keys: Vec<u32> = ret_keys.read_vec();
+        let ret_values: Vec<u32> = ret_values.read_vec();
 
         let inds = argsort(keys_inp);
         let ref_keys: Vec<u32> = inds.iter().map(|&i| keys_inp[i]).collect();
@@ -271,8 +266,8 @@ mod radix_sort_tests {
         let values = GpuTensor::from(&client, [NUM_ELEMENTS], &values_inp);
         let (ret_keys, ret_values) = radix_argsort(keys, values, NUM_ELEMENTS as u32, 32);
 
-        let ret_keys: Vec<u32> = tensor_to_vec(ret_keys);
-        let ret_values: Vec<u32> = tensor_to_vec(ret_values);
+        let ret_keys: Vec<u32> = ret_keys.read_vec();
+        let ret_values: Vec<u32> = ret_values.read_vec();
 
         assert_eq!(ret_keys.len(), NUM_ELEMENTS);
         assert_eq!(ret_values.len(), NUM_ELEMENTS);

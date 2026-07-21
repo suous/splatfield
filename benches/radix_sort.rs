@@ -5,11 +5,6 @@ use splatfield::sort::radix_argsort;
 use splatfield::tensor::GpuTensor;
 use std::time::Duration;
 
-fn readback_u32(tensor: GpuTensor) -> Vec<u32> {
-    let bytes = tensor.client.read_one_unchecked(tensor.handle);
-    bytemuck::cast_slice::<u8, u32>(&bytes).to_vec()
-}
-
 fn make_data(n: usize, dist: &str) -> Vec<u32> {
     let mut rng = rand::rng();
     match dist {
@@ -44,8 +39,8 @@ fn bench_size_sweep(c: &mut Criterion) {
                 let k = GpuTensor::from(&client, [n], &keys_data);
                 let v = GpuTensor::from(&client, [n], &vals_data);
                 let (sorted_k, sorted_v) = radix_argsort(black_box(k), black_box(v), n as u32, 32);
-                readback_u32(sorted_k);
-                readback_u32(sorted_v);
+                sorted_k.read_vec::<u32>();
+                sorted_v.read_vec::<u32>();
             });
         });
     }
@@ -73,8 +68,8 @@ fn bench_bits_sweep(c: &mut Criterion) {
                 let v = GpuTensor::from(&client, [n], &vals_data);
                 let (sorted_k, sorted_v) =
                     radix_argsort(black_box(k), black_box(v), n as u32, bits);
-                readback_u32(sorted_k);
-                readback_u32(sorted_v);
+                sorted_k.read_vec::<u32>();
+                sorted_v.read_vec::<u32>();
             });
         });
     }
@@ -106,8 +101,8 @@ fn bench_distribution(c: &mut Criterion) {
                     let v = GpuTensor::from(&client, [n], &vals_data);
                     let (sorted_k, sorted_v) =
                         radix_argsort(black_box(k), black_box(v), n as u32, 32);
-                    readback_u32(sorted_k);
-                    readback_u32(sorted_v);
+                    sorted_k.read_vec::<u32>();
+                    sorted_v.read_vec::<u32>();
                 });
             },
         );
