@@ -22,6 +22,8 @@ pollster = "0.4"
 env_logger = "0.11.9"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+# Enables cubecl-common's `bytes` module (needed by cubecl-runtime) on wasm —
+# cubecl-runtime only enables it itself on desktop targets.
 cubecl-common = { version = "0.10.0", features = ["serde"] }
 eframe = { version = "0.35", features = ["wgpu"] }
 wasm-bindgen = "0.2"

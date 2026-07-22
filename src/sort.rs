@@ -262,8 +262,8 @@ mod radix_sort_tests {
             .collect();
         let values_inp: Vec<u32> = (0..NUM_ELEMENTS).map(|i| i as u32).collect();
 
-        let keys = GpuTensor::from(&client, [NUM_ELEMENTS], &keys_inp);
-        let values = GpuTensor::from(&client, [NUM_ELEMENTS], &values_inp);
+        let keys = GpuTensor::from(&client, [NUM_ELEMENTS], &keys_inp[..]);
+        let values = GpuTensor::from(&client, [NUM_ELEMENTS], &values_inp[..]);
         let (ret_keys, ret_values) = radix_argsort(keys, values, NUM_ELEMENTS as u32, 32);
 
         let ret_keys: Vec<u32> = ret_keys.read_vec();

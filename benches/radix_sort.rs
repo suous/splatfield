@@ -36,8 +36,8 @@ fn bench_size_sweep(c: &mut Criterion) {
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| {
-                let k = GpuTensor::from(&client, [n], &keys_data);
-                let v = GpuTensor::from(&client, [n], &vals_data);
+                let k = GpuTensor::from(&client, [n], &keys_data[..]);
+                let v = GpuTensor::from(&client, [n], &vals_data[..]);
                 let (sorted_k, sorted_v) = radix_argsort(black_box(k), black_box(v), n as u32, 32);
                 sorted_k.read_vec::<u32>();
                 sorted_v.read_vec::<u32>();
@@ -64,8 +64,8 @@ fn bench_bits_sweep(c: &mut Criterion) {
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(bits), &bits, |b, &bits| {
             b.iter(|| {
-                let k = GpuTensor::from(&client, [n], &keys_data);
-                let v = GpuTensor::from(&client, [n], &vals_data);
+                let k = GpuTensor::from(&client, [n], &keys_data[..]);
+                let v = GpuTensor::from(&client, [n], &vals_data[..]);
                 let (sorted_k, sorted_v) =
                     radix_argsort(black_box(k), black_box(v), n as u32, bits);
                 sorted_k.read_vec::<u32>();
@@ -97,8 +97,8 @@ fn bench_distribution(c: &mut Criterion) {
             &keys_data,
             |b, keys_data| {
                 b.iter(|| {
-                    let k = GpuTensor::from(&client, [n], keys_data);
-                    let v = GpuTensor::from(&client, [n], &vals_data);
+                    let k = GpuTensor::from(&client, [n], &keys_data[..]);
+                    let v = GpuTensor::from(&client, [n], &vals_data[..]);
                     let (sorted_k, sorted_v) =
                         radix_argsort(black_box(k), black_box(v), n as u32, 32);
                     sorted_k.read_vec::<u32>();

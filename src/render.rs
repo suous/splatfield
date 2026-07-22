@@ -16,7 +16,11 @@ pub struct Splats {
 }
 
 impl Splats {
-    pub fn new(attributes: &[f32], sh_coeffs: &[f32], client: &ComputeClient<WgpuRuntime>) -> Self {
+    pub fn new(
+        attributes: Vec<f32>,
+        sh_coeffs: Vec<f32>,
+        client: &ComputeClient<WgpuRuntime>,
+    ) -> Self {
         let n = attributes.len() / 11;
         let n_coeffs = sh_coeffs.len() / n;
 
@@ -60,10 +64,10 @@ impl Splats {
         let depth_order = GpuTensor::empty(client, [total]);
         let depth_keys = GpuTensor::empty(client, [total]);
         let projected = GpuTensor::empty(client, [total, 9]);
-        let counters = GpuTensor::from(client, [2], &[0u32, 0u32]);
+        let counters = GpuTensor::from(client, [2], [0u32, 0u32]);
         let tile_ids = GpuTensor::empty(client, [max_isects]);
         let gaussian_ids = GpuTensor::empty(client, [max_isects]);
-        let viewmat = GpuTensor::from(client, [16], &viewmat);
+        let viewmat = GpuTensor::from(client, [16], viewmat);
 
         crate::project::project_splats::launch::<WgpuRuntime>(
             client,

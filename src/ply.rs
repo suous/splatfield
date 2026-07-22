@@ -56,8 +56,12 @@ pub fn load_ply(reader: impl Read, client: &ComputeClient<WgpuRuntime>) -> Resul
     let rest_keys: Vec<usize> = rest_keys.into_iter().map(|(idx, _)| idx).collect();
 
     let stride = properties.len();
+
     let mut buf = vec![0u8; vertex_count * stride * 4];
     reader.read_exact(&mut buf).context("Failed read vertex")?;
+    // Free the file bytes before the big allocations: wasm32 linear memory is
+    // capped at 4 GiB, so every large buffer is released as early as possible.
+    drop(reader);
 
     let float_data: &[f32] = bytemuck::cast_slice(&buf);
     let mut attributes = Vec::with_capacity(vertex_count * 11);
@@ -79,5 +83,6 @@ pub fn load_ply(reader: impl Read, client: &ComputeClient<WgpuRuntime>) -> Resul
         }
     }
 
-    Ok(Splats::new(&attributes, &shs, client))
+    drop(buf);
+    Ok(Splats::new(attributes, shs, client))
 }

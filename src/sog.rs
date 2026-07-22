@@ -175,5 +175,7 @@ pub fn load_sog(reader: impl Read + Seek, client: &ComputeClient<WgpuRuntime>) -
         }
     }
 
-    Ok(Splats::new(&attributes, &sh_coeffs, client))
+    // Release the archive (holds the full dropped-file bytes on wasm) before upload.
+    drop(zip);
+    Ok(Splats::new(attributes, sh_coeffs, client))
 }

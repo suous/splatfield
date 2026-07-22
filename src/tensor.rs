@@ -39,16 +39,17 @@ impl GpuTensor {
         Self::new(client.clone(), shape, buffer)
     }
 
-    pub fn from<T: bytemuck::Pod>(
+    /// Upload to the GPU. An owned `Vec` is moved without copying; a slice is
+    /// copied once — on wasm32 each large copy risks the 4 GiB linear-memory ceiling.
+    pub fn from<T: bytemuck::NoUninit + Send + Sync>(
         client: &ComputeClient<WgpuRuntime>,
         shape: impl Into<Shape>,
-        data: &[T],
+        data: impl Into<Vec<T>>,
     ) -> Self {
-        let buffer = client.create_from_slice(bytemuck::cast_slice(data));
+        let buffer = client.create(cubecl::bytes::Bytes::from_elems(data.into()));
         Self::new(client.clone(), shape, buffer)
     }
 
-    /// Blocking GPU→CPU readback. Generic over `T: Pod` for symmetry with `from`.
     pub fn read_vec<T: bytemuck::Pod>(&self) -> Vec<T> {
         let bytes = self.client.read_one_unchecked(self.handle.clone());
         bytemuck::cast_slice(&bytes).to_vec()
