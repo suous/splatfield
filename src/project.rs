@@ -255,7 +255,8 @@ pub(crate) fn project_splats(
 mod tests {
     use super::*;
     use crate::helpers::{Vec2FLaunch, Vec3FLaunch};
-    use crate::tensor::{GpuTensor, cube_count_1d};
+    use crate::tensor::GpuTensor;
+    use cubecl::calculate_cube_count_elemwise;
     use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
 
     const SENTINEL: u32 = 0xDEAD_BEEF;
@@ -280,7 +281,7 @@ mod tests {
 
         project_splats::launch::<WgpuRuntime>(
             &client,
-            cube_count_1d(&client, 1, 256),
+            calculate_cube_count_elemwise(&client, 1, CubeDim::new_1d(256)),
             CubeDim::new_1d(256),
             viewmat_t.as_buffer_arg(),
             Vec2FLaunch::new(32.0, 32.0),

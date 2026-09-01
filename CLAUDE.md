@@ -19,7 +19,7 @@ Format and lint via the auto_check hook — no manual
 
 GPU-accelerated Gaussian Splatting renderer. egui GUI loads PLY files via drag-and-drop.
 
-### Rendering Pipeline (`render::Splats::render()`)
+### Rendering Pipeline (`render::Splats::render_with()`)
 
 6 GPU kernel passes per frame:
 
@@ -43,4 +43,4 @@ GPU-accelerated Gaussian Splatting renderer. egui GUI loads PLY files via drag-a
 
 Kernels use `cubecl` with `#[cube(launch)]` targeting `WgpuRuntime`.
 Custom types via `#[cube]`/`CubeLaunch` in `helpers`.
-Dispatch: `CubeDim::new_1d(TILE_SIZE)` + `cube_count_1d()`.
+Dispatch: `calculate_cube_count_elemwise` + `CubeDim::new_1d(TILE_SIZE)`.

@@ -1,7 +1,8 @@
 use crate::camera::Camera;
 use crate::helpers;
 use crate::sort::{bits_for, radix_argsort};
-use crate::tensor::{GpuTensor, cube_count_1d};
+use crate::tensor::GpuTensor;
+use cubecl::calculate_cube_count_elemwise;
 use cubecl::prelude::*;
 use cubecl::wgpu::WgpuRuntime;
 
@@ -40,10 +41,7 @@ impl RenderScratch {
     pub fn new(client: &ComputeClient<WgpuRuntime>, total: usize, img_size: glam::UVec2) -> Self {
         let tile_bounds = img_size.map(|c| c.div_ceil(helpers::TILE_WIDTH));
         let num_tiles = (tile_bounds.x * tile_bounds.y) as usize;
-        let isect_capacity = num_tiles
-            .saturating_mul(total)
-            .min(1 << 22)
-            .min(INTERSECTS_UPPER_BOUND);
+        let isect_capacity = num_tiles.saturating_mul(total).min(1 << 22);
         let row_stride = (img_size.x * 4).next_multiple_of(256) / 4;
         Self {
             depth_order: GpuTensor::empty(client, [total]),
@@ -98,26 +96,6 @@ impl Splats {
         }
     }
 
-    /// Render pipeline (3D Gaussian Splatting):
-    ///
-    /// 1. **Project** 3D Gaussians into image space — compute 2D mean, conic, color (SH),
-    ///    opacity, and emit (`tile_id`, `gaussian_id`) pairs for every tile each Gaussian covers.
-    /// 2. **Tile & replicate** — divide image into 16×16 tiles; replicate Gaussians that
-    ///    span multiple tiles, assigning each copy a tile ID.
-    /// 3. **Sort** — depth-sort Gaussians, then stable-sort intersection pairs by tile ID
-    ///    (equivalent to the paper's single composite-key sort).
-    /// 4. **Rasterize** — render sorted Gaussians per tile in parallel; each pixel
-    ///    alpha-blends front-to-back through its tile's Gaussian list.
-    ///
-    /// One-shot render builds a fresh scratch at the initial isect capacity; views
-    /// exceeding it render truncated (warned) for that call — use `render_with`
-    /// for the self-healing path.
-    pub async fn render(&self, camera: &Camera, img_size: glam::UVec2) -> GpuTensor {
-        let mut scratch =
-            RenderScratch::new(&self.attributes.client, self.attributes.shape[0], img_size);
-        self.render_with(&mut scratch, camera, img_size).await
-    }
-
     /// Render one frame into `scratch`'s buffers; the returned bitmap aliases
     /// `scratch.bitmap` and is valid until the next `render_with` on it.
     ///
@@ -153,7 +131,11 @@ impl Splats {
 
         zero_buffers::launch::<WgpuRuntime>(
             client,
-            cube_count_1d(client, (2 + 2 * num_tiles) as u32, helpers::TILE_SIZE),
+            calculate_cube_count_elemwise(
+                client,
+                2 + 2 * num_tiles,
+                CubeDim::new_1d(helpers::TILE_SIZE),
+            ),
             CubeDim::new_1d(helpers::TILE_SIZE),
             scratch.counters.as_buffer_arg(),
             scratch.tile_ranges.as_buffer_arg(),
@@ -161,7 +143,7 @@ impl Splats {
 
         crate::project::project_splats::launch::<WgpuRuntime>(
             client,
-            cube_count_1d(client, total as u32, helpers::TILE_SIZE),
+            calculate_cube_count_elemwise(client, total, CubeDim::new_1d(helpers::TILE_SIZE)),
             CubeDim::new_1d(helpers::TILE_SIZE),
             viewmat.as_buffer_arg(),
             helpers::Vec2FLaunch::new(focal.x, focal.y),
@@ -210,7 +192,11 @@ impl Splats {
 
         invert_permutation::launch::<WgpuRuntime>(
             client,
-            cube_count_1d(client, num_visible, helpers::TILE_SIZE),
+            calculate_cube_count_elemwise(
+                client,
+                num_visible as usize,
+                CubeDim::new_1d(helpers::TILE_SIZE),
+            ),
             CubeDim::new_1d(helpers::TILE_SIZE),
             depth_order.as_buffer_arg(),
             inv_perm.as_buffer_arg(),
@@ -219,7 +205,11 @@ impl Splats {
 
         remap_global_ids::launch::<WgpuRuntime>(
             client,
-            cube_count_1d(client, num_isects, helpers::TILE_SIZE),
+            calculate_cube_count_elemwise(
+                client,
+                num_isects as usize,
+                CubeDim::new_1d(helpers::TILE_SIZE),
+            ),
             CubeDim::new_1d(helpers::TILE_SIZE),
             gaussian_ids.as_buffer_arg(),
             inv_perm.as_buffer_arg(),
@@ -234,7 +224,11 @@ impl Splats {
 
         build_tile_ranges::launch::<WgpuRuntime>(
             client,
-            cube_count_1d(client, num_isects, helpers::TILE_SIZE),
+            calculate_cube_count_elemwise(
+                client,
+                num_isects as usize,
+                CubeDim::new_1d(helpers::TILE_SIZE),
+            ),
             CubeDim::new_1d(helpers::TILE_SIZE),
             tile_ids.as_buffer_arg(),
             scratch.tile_ranges.as_buffer_arg(),
@@ -394,7 +388,9 @@ mod tests {
             position: glam::Vec3::ZERO,
             rotation: glam::Quat::IDENTITY,
         };
-        let bitmap = pollster::block_on(splats.render(&camera, glam::uvec2(32, 32)));
+        let mut scratch = RenderScratch::new(&client, 5, glam::uvec2(32, 32));
+        let bitmap =
+            pollster::block_on(splats.render_with(&mut scratch, &camera, glam::uvec2(32, 32)));
         let px: Vec<u32> = bitmap.read_vec();
         let stride = bitmap.shape[1] as usize;
         let center = px[16 * stride + 16];
@@ -404,9 +400,7 @@ mod tests {
             ((center >> 16) & 0xFF) as i32,
             ((center >> 24) & 0xFF) as i32,
         ];
-        eprintln!("center pixel: r={r} g={g} b={b} a={a}");
         let corner = px[0];
-        eprintln!("corner pixel: {corner:#010x}");
         // quantize_u8 truncates; f32 residual transmittance leaves 255-1 LSB.
         assert!(
             a >= 254,
@@ -423,7 +417,7 @@ mod tests {
     }
 
     #[test]
-    fn test_render_with_matches_render() {
+    fn test_render_reuses_scratch() {
         let client = WgpuRuntime::client(&WgpuDevice::default());
         let attributes: Vec<f32> = (0..50 * 11)
             .map(|i| (i as f32 * 0.13).sin() * 0.5)
@@ -435,14 +429,11 @@ mod tests {
             position: glam::Vec3::new(0.0, -1.0, 0.0),
             rotation: glam::Quat::IDENTITY,
         };
-        let a = pollster::block_on(splats.render(&camera, glam::uvec2(64, 64))).read_vec::<u32>();
         let mut scratch = RenderScratch::new(&client, 50, glam::uvec2(64, 64));
         let b = pollster::block_on(splats.render_with(&mut scratch, &camera, glam::uvec2(64, 64)))
             .read_vec::<u32>();
-        // second frame through the same scratch — the steady-state path
         let c = pollster::block_on(splats.render_with(&mut scratch, &camera, glam::uvec2(64, 64)))
             .read_vec::<u32>();
-        assert_eq!(a, b);
         assert_eq!(b, c);
     }
 
@@ -482,14 +473,18 @@ mod tests {
 
         zero_buffers::launch::<WgpuRuntime>(
             &client,
-            cube_count_1d(&client, (2 + 2 * num_tiles) as u32, helpers::TILE_SIZE),
+            calculate_cube_count_elemwise(
+                &client,
+                2 + 2 * num_tiles,
+                CubeDim::new_1d(helpers::TILE_SIZE),
+            ),
             CubeDim::new_1d(helpers::TILE_SIZE),
             counters.as_buffer_arg(),
             ranges.as_buffer_arg(),
         );
         build_tile_ranges::launch::<WgpuRuntime>(
             &client,
-            cube_count_1d(&client, ids.len() as u32, helpers::TILE_SIZE),
+            calculate_cube_count_elemwise(&client, ids.len(), CubeDim::new_1d(helpers::TILE_SIZE)),
             CubeDim::new_1d(helpers::TILE_SIZE),
             ids_t.as_buffer_arg(),
             ranges.as_buffer_arg(),

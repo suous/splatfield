@@ -1,7 +1,7 @@
 pub mod camera;
-pub mod helpers;
+mod helpers;
 pub mod ply;
-pub mod project;
+mod project;
 pub mod render;
 pub mod sog;
 pub mod sort;

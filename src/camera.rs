@@ -31,21 +31,29 @@ impl Camera {
 
 pub struct Controller {
     pub camera: Camera,
-    pub focus_distance: f32,
+    focus_distance: f32,
 }
 
 impl Controller {
-    pub fn new(position: Vec3, rotation: Quat) -> Self {
+    pub fn new() -> Self {
         Self {
             camera: Camera {
-                position,
-                rotation,
+                position: Vec3::ZERO,
+                rotation: Quat::IDENTITY,
                 fov: Vec2::splat(0.8),
             },
             focus_distance: 2.5,
         }
     }
+}
 
+impl Default for Controller {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Controller {
     pub fn frame_bounds(&mut self, (min, max): (Vec3, Vec3)) {
         let d = (max - min).max_element() * 2.0;
         self.camera.position = (min + max) * 0.5 - Vec3::Y * d;

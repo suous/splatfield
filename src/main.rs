@@ -16,7 +16,6 @@ use cubecl::prelude::*;
 use cubecl::wgpu::{MemoryConfiguration, RuntimeOptions, WgpuRuntime, WgpuSetup, init_device};
 use eframe::egui;
 use egui::{Color32, Rect};
-use glam::{Quat, Vec3};
 use splatfield::{camera, ply, render, sog, texture};
 
 const UV_RECT: Rect = Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
@@ -56,7 +55,6 @@ fn wgpu_config() -> eframe::egui_wgpu::WgpuConfiguration {
     }
 }
 
-#[derive(Clone, Copy)]
 enum SplatFormat {
     Ply,
     Sog,
@@ -73,10 +71,6 @@ fn splat_format(file: &(impl egui::DroppedFile + ?Sized)) -> Option<SplatFormat>
         Some("sog") => Some(SplatFormat::Sog),
         _ => None,
     }
-}
-
-fn splat_format_ok(file: &(impl egui::DroppedFile + ?Sized)) -> bool {
-    splat_format(file).is_some()
 }
 
 impl App {
@@ -104,7 +98,7 @@ impl App {
                 render_state.device.clone(),
                 render_state.queue.clone(),
             ))),
-            controller: camera::Controller::new(-Vec3::Z * 2.5, Quat::IDENTITY),
+            controller: camera::Controller::new(),
             client: WgpuRuntime::client(&device),
             scratch: Rc::new(RefCell::new(None)),
             splats: Arc::new(RwLock::new(None)),
@@ -165,16 +159,13 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
-        // Index into the dropped files and clone only the first splat's handle —
-        // no full-vec clone, single format-detection pass.
-        let dropped = ui
-            .input(|i| {
-                i.raw
-                    .dropped_files
-                    .iter()
-                    .position(|f| splat_format_ok(f.as_ref()))
-            })
-            .map(|idx| ui.input(|i| i.raw.dropped_files[idx].clone()));
+        let dropped = ui.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .find(|f| splat_format(f.as_ref()).is_some())
+                .cloned()
+        });
         if let Some(file) = dropped {
             self.load_dropped(file, ui.ctx().clone());
         }
@@ -261,8 +252,6 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(target_arch = "wasm32")]
 fn main() {
-    console_error_panic_hook::set_once();
-
     wasm_bindgen_futures::spawn_local(async {
         let canvas = web_sys::window()
             .unwrap()

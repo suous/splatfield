@@ -31,13 +31,11 @@ eframe = { version = "0.36", features = ["wgpu"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = ["HtmlCanvasElement", "Document", "Element", "Window"] }
-console_error_panic_hook = "0.1"
 getrandom = { version = "0.4", features = ["wasm_js"] }
 
 [dev-dependencies]
 rand = "0.10"
 criterion = "0.5"
-pollster = "0.4"
 
 [[bench]]
 name = "radix_sort"

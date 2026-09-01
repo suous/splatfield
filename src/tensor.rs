@@ -1,13 +1,7 @@
 use cubecl::prelude::*;
-use cubecl::server::{CubeCountSelection, Handle};
+use cubecl::server::Handle;
 use cubecl::wgpu::WgpuRuntime;
 use cubecl::zspace::Shape;
-
-const STRIDE: usize = 4;
-
-pub fn cube_count_1d(client: &ComputeClient<WgpuRuntime>, length: u32, groups: u32) -> CubeCount {
-    CubeCountSelection::new(client, length.div_ceil(groups)).cube_count()
-}
 
 #[derive(Clone)]
 pub struct GpuTensor {
@@ -35,7 +29,7 @@ impl GpuTensor {
 
     pub fn empty(client: &ComputeClient<WgpuRuntime>, shape: impl Into<Shape>) -> GpuTensor {
         let shape = shape.into();
-        let buffer = client.empty(shape.iter().product::<usize>() * STRIDE);
+        let buffer = client.empty(shape.iter().product::<usize>() * size_of::<f32>());
         Self::new(client.clone(), shape, buffer)
     }
 

@@ -2,7 +2,8 @@
 //!
 //! References:
 //! - <https://github.com/ArthurBrussee/brush/blob/main/crates/brush-sort/src/lib.rs>
-use crate::tensor::{GpuTensor, cube_count_1d};
+use crate::tensor::GpuTensor;
+use cubecl::calculate_cube_count_elemwise;
 use cubecl::prelude::*;
 use cubecl::wgpu::WgpuRuntime;
 
@@ -32,13 +33,7 @@ fn plane_exclusive_sum(value: u32) -> u32 {
 }
 
 #[cube(launch)]
-fn count_kernel(
-    num_wgs: u32,
-    shift: u32,
-    num_keys: u32,
-    src: &[u32],
-    counts: &mut [u32],
-) {
+fn count_kernel(num_wgs: u32, shift: u32, num_keys: u32, src: &[u32], counts: &mut [u32]) {
     // Workgroup-shared histogram: each key is read exactly once, then atomically
     // bucketed into one of SORT_BINS counters — replacing a per-bin loop that
     // re-read every key SORT_BINS times.
@@ -153,7 +148,8 @@ pub fn radix_argsort(
     // The launched grid may exceed the hardware X limit and get spread over
     // Y/Z (CubeCountSelection), so kernels linearize the workgroup id.
     let num_wgs = n.div_ceil(SORT_BLOCK);
-    let cube_count = cube_count_1d(&client, n, SORT_BLOCK);
+    let cube_count =
+        calculate_cube_count_elemwise(&client, n as usize, CubeDim::new_1d(SORT_BLOCK));
     let cube_dim = CubeDim::new_1d(SORT_WG);
 
     let count_buf = GpuTensor::empty(&client, [(num_wgs * SORT_BINS) as usize]);
@@ -209,28 +205,6 @@ mod radix_sort_tests {
     use cubecl::client::ComputeClient;
     use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
     use rand::RngExt;
-
-    fn argsort<T: Ord>(data: &[T]) -> Vec<usize> {
-        let mut indices: Vec<usize> = (0..data.len()).collect();
-        indices.sort_by_key(|&i| &data[i]);
-        indices
-    }
-
-    fn assert_argsort(client: &ComputeClient<WgpuRuntime>, keys_inp: &[u32], values_inp: &[u32]) {
-        let keys = GpuTensor::from(client, [keys_inp.len()], keys_inp);
-        let values = GpuTensor::from(client, [values_inp.len()], values_inp);
-        let (ret_keys, ret_values) = radix_argsort(keys, values, keys_inp.len() as u32, 32);
-
-        let ret_keys: Vec<u32> = ret_keys.read_vec();
-        let ret_values: Vec<u32> = ret_values.read_vec();
-
-        let inds = argsort(keys_inp);
-        let ref_keys: Vec<u32> = inds.iter().map(|&i| keys_inp[i]).collect();
-        let ref_values: Vec<u32> = inds.iter().map(|&i| values_inp[i]).collect();
-
-        assert_eq!(ret_keys, ref_keys);
-        assert_eq!(ret_values, ref_values);
-    }
 
     fn assert_argsort_bits(
         client: &ComputeClient<WgpuRuntime>,
@@ -294,34 +268,6 @@ mod radix_sort_tests {
     }
 
     #[test]
-    fn test_sorting() {
-        let client = WgpuRuntime::client(&WgpuDevice::default());
-        for i in 0..128u32 {
-            let keys_inp = [
-                5 + i * 4,
-                i,
-                6,
-                123,
-                74657,
-                123,
-                999,
-                2u32.pow(24) + 123,
-                6,
-                7,
-                8,
-                0,
-                i * 2,
-                16 + i,
-                128 * i,
-            ];
-
-            let values_inp: Vec<_> = keys_inp.iter().copied().map(|x| x * 2 + 5).collect();
-
-            assert_argsort(&client, &keys_inp, &values_inp);
-        }
-    }
-
-    #[test]
     fn test_sorting_big() {
         let client = WgpuRuntime::client(&WgpuDevice::default());
         let mut rng = rand::rng();
@@ -337,8 +283,8 @@ mod radix_sort_tests {
             }
         }
 
-        let values_inp: Vec<_> = keys_inp.iter().map(|&x| x * 2 + 5).collect();
-        assert_argsort(&client, &keys_inp, &values_inp);
+        let values_inp: Vec<u32> = (0..keys_inp.len()).map(|i| i as u32).collect();
+        assert_argsort_bits(&client, &keys_inp, &values_inp, 32);
     }
 
     #[test]

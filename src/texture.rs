@@ -37,9 +37,10 @@ impl GpuTexture {
             self.texture = Some(self.ensure_texture(size));
         }
 
-        if let Some((texture, _)) = &self.texture {
-            self.copy_to_texture(img, texture);
-        }
+        let Some((texture, _)) = &self.texture else {
+            unreachable!("texture is always set by the resize branch");
+        };
+        self.copy_to_texture(img, texture);
     }
 
     fn ensure_texture(&mut self, size: glam::UVec2) -> (wgpu::Texture, TextureId) {
@@ -55,7 +56,7 @@ impl GpuTexture {
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::Rgba8Unorm,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[wgpu::TextureFormat::Rgba8Unorm],
+            view_formats: &[],
         });
 
         let view = texture.create_view(&Default::default());
