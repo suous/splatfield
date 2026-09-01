@@ -18,6 +18,54 @@ pub struct CpuSplats {
     pub sh_coeffs: Vec<f32>,
 }
 
+/// Per-frame GPU buffers, reused across frames so steady-state rendering
+/// allocates nothing new. Rebuild when `matches` returns false.
+#[derive(Debug)]
+pub struct RenderScratch {
+    depth_order: GpuTensor,
+    depth_keys: GpuTensor,
+    projected: GpuTensor,
+    counters: GpuTensor,
+    tile_ids: GpuTensor,
+    gaussian_ids: GpuTensor,
+    tile_ranges: GpuTensor,
+    bitmap: GpuTensor,
+    total: usize,
+    img_size: glam::UVec2,
+    num_tiles: usize,
+    isect_capacity: usize,
+}
+
+impl RenderScratch {
+    pub fn new(client: &ComputeClient<WgpuRuntime>, total: usize, img_size: glam::UVec2) -> Self {
+        let tile_bounds = img_size.map(|c| c.div_ceil(helpers::TILE_WIDTH));
+        let num_tiles = (tile_bounds.x * tile_bounds.y) as usize;
+        let isect_capacity = num_tiles
+            .saturating_mul(total)
+            .min(1 << 22)
+            .min(INTERSECTS_UPPER_BOUND);
+        let row_stride = (img_size.x * 4).next_multiple_of(256) / 4;
+        Self {
+            depth_order: GpuTensor::empty(client, [total]),
+            depth_keys: GpuTensor::empty(client, [total]),
+            projected: GpuTensor::empty(client, [total, 9]),
+            counters: GpuTensor::empty(client, [2]),
+            tile_ids: GpuTensor::empty(client, [isect_capacity]),
+            gaussian_ids: GpuTensor::empty(client, [isect_capacity]),
+            tile_ranges: GpuTensor::empty(client, [num_tiles * 2]),
+            bitmap: GpuTensor::empty(client, [img_size.y as usize, row_stride as usize]),
+            total,
+            img_size,
+            num_tiles,
+            isect_capacity,
+        }
+    }
+
+    pub fn matches(&self, total: usize, img_size: glam::UVec2) -> bool {
+        self.total == total && self.img_size == img_size
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Splats {
     pub attributes: GpuTensor,
@@ -61,32 +109,46 @@ impl Splats {
     /// 4. **Rasterize** — render sorted Gaussians per tile in parallel; each pixel
     ///    alpha-blends front-to-back through its tile's Gaussian list.
     pub async fn render(&self, camera: &Camera, img_size: glam::UVec2) -> GpuTensor {
+        let mut scratch =
+            RenderScratch::new(&self.attributes.client, self.attributes.shape[0], img_size);
+        self.render_with(&mut scratch, camera, img_size).await
+    }
+
+    /// Render one frame into `scratch`'s buffers; the returned bitmap aliases
+    /// `scratch.bitmap` and is valid until the next `render_with` on it.
+    pub async fn render_with(
+        &self,
+        scratch: &mut RenderScratch,
+        camera: &Camera,
+        img_size: glam::UVec2,
+    ) -> GpuTensor {
         let client = &self.attributes.client;
         let total = self.attributes.shape[0];
+        debug_assert!(scratch.matches(total, img_size));
         let tile_bounds = img_size.map(|c| c.div_ceil(helpers::TILE_WIDTH));
-        let num_tiles = (tile_bounds.x * tile_bounds.y) as usize;
-        let max_isects = num_tiles.saturating_mul(total).min(INTERSECTS_UPPER_BOUND);
+        let num_tiles = scratch.num_tiles;
+        let max_isects = scratch.isect_capacity;
 
         let focal = camera.focal(img_size);
         let camera_pos = camera.position;
         let viewmat = glam::Mat4::from(camera.w2c()).transpose().to_cols_array();
         let sh_per_ch = self.sh_coeffs.shape[1] as u32;
 
-        let depth_order = GpuTensor::empty(client, [total]);
-        let depth_keys = GpuTensor::empty(client, [total]);
-        let projected = GpuTensor::empty(client, [total, 9]);
-        let counters = GpuTensor::empty(client, [2]);
-        let tile_ranges = GpuTensor::empty(client, [num_tiles * 2]);
-        let tile_ids = GpuTensor::empty(client, [max_isects]);
-        let gaussian_ids = GpuTensor::empty(client, [max_isects]);
+        // Frame-local clones of the growable buffers: if they are reallocated
+        // after the counters readback below, this frame still finishes on the
+        // old buffers and the larger ones take effect next frame.
+        let tile_ids = scratch.tile_ids.clone();
+        let gaussian_ids = scratch.gaussian_ids.clone();
+        // viewmat stays a per-frame 64-byte upload — measured negligible,
+        // not worth scalar-arg plumbing.
         let viewmat = GpuTensor::from(client, [16], viewmat);
 
         zero_buffers::launch::<WgpuRuntime>(
             client,
             cube_count_1d(client, (2 + 2 * num_tiles) as u32, helpers::TILE_SIZE),
             CubeDim::new_1d(helpers::TILE_SIZE),
-            counters.as_array_arg(),
-            tile_ranges.as_array_arg(),
+            scratch.counters.as_array_arg(),
+            scratch.tile_ranges.as_array_arg(),
         );
 
         crate::project::project_splats::launch::<WgpuRuntime>(
@@ -101,25 +163,37 @@ impl Splats {
             sh_per_ch,
             helpers::Vec2FLaunch::new(tile_bounds.x as f32, tile_bounds.y as f32),
             helpers::Vec2FLaunch::new(img_size.x as f32, img_size.y as f32),
-            depth_order.as_array_arg(),
-            depth_keys.as_array_arg(),
-            projected.as_array_arg(),
-            counters.as_array_arg(),
+            scratch.depth_order.as_array_arg(),
+            scratch.depth_keys.as_array_arg(),
+            scratch.projected.as_array_arg(),
+            scratch.counters.as_array_arg(),
             max_isects as u32,
             tile_ids.as_array_arg(),
             gaussian_ids.as_array_arg(),
         );
 
-        let [num_isects_raw, num_visible] = counters.read_pair().await;
+        let [num_isects_raw, num_visible] = scratch.counters.read_pair().await;
         let num_isects = num_isects_raw.min(max_isects as u32);
-        if num_isects_raw > max_isects as u32 {
+        if num_isects_raw as usize >= max_isects {
+            // Saturated: this frame is truncated to the clamped count; grow so
+            // the next frame fits. Reallocating now is safe — everything below
+            // runs on the frame-local clones of the old buffers.
+            scratch.isect_capacity = (num_isects_raw as usize)
+                .next_power_of_two()
+                .min(INTERSECTS_UPPER_BOUND);
             log::warn!(
-                "intersection overflow: {} emitted, cap {max_isects}",
-                num_isects_raw
+                "intersection capacity {max_isects} reached ({num_isects_raw} emitted); growing to {}",
+                scratch.isect_capacity
             );
+            scratch.tile_ids = GpuTensor::empty(client, [scratch.isect_capacity]);
+            scratch.gaussian_ids = GpuTensor::empty(client, [scratch.isect_capacity]);
         }
-        let (inv_perm, depth_order) =
-            radix_argsort(depth_keys, depth_order, num_visible, DEPTH_KEY_BITS);
+        let (inv_perm, depth_order) = radix_argsort(
+            scratch.depth_keys.clone(),
+            scratch.depth_order.clone(),
+            num_visible,
+            DEPTH_KEY_BITS,
+        );
 
         invert_permutation::launch::<WgpuRuntime>(
             client,
@@ -150,12 +224,11 @@ impl Splats {
             cube_count_1d(client, num_isects, helpers::TILE_SIZE),
             CubeDim::new_1d(helpers::TILE_SIZE),
             tile_ids.as_array_arg(),
-            tile_ranges.as_array_arg(),
+            scratch.tile_ranges.as_array_arg(),
             num_isects,
         );
 
-        let row_stride = (img_size.x * 4).next_multiple_of(256) / 4;
-        let bitmap = GpuTensor::empty(client, [img_size.y as usize, row_stride as usize]);
+        let row_stride = scratch.bitmap.shape[1] as u32;
         rasterize_kernel::launch::<WgpuRuntime>(
             client,
             CubeCount::new_2d(tile_bounds.x, tile_bounds.y),
@@ -164,12 +237,12 @@ impl Splats {
             img_size.y,
             row_stride,
             gaussian_ids.as_array_arg(),
-            tile_ranges.as_array_arg(),
-            projected.as_array_arg(),
+            scratch.tile_ranges.as_array_arg(),
+            scratch.projected.as_array_arg(),
             depth_order.as_array_arg(),
-            bitmap.as_array_arg(),
+            scratch.bitmap.as_array_arg(),
         );
-        bitmap
+        scratch.bitmap.clone()
     }
 }
 
@@ -334,6 +407,54 @@ mod tests {
         assert!((r - GOLDEN_CENTER[0]).abs() <= 1);
         assert!((g - GOLDEN_CENTER[1]).abs() <= 1);
         assert!((b - GOLDEN_CENTER[2]).abs() <= 1);
+    }
+
+    #[test]
+    fn test_render_with_matches_render() {
+        let client = WgpuRuntime::client(&WgpuDevice::default());
+        let attributes: Vec<f32> = (0..50 * 11)
+            .map(|i| (i as f32 * 0.13).sin() * 0.5)
+            .collect();
+        let sh = vec![0.1f32; 50 * 3];
+        let splats = Splats::new(attributes, sh, &client);
+        let camera = crate::camera::Camera {
+            fov: glam::Vec2::splat(0.8),
+            position: glam::Vec3::new(0.0, -1.0, 0.0),
+            rotation: glam::Quat::IDENTITY,
+        };
+        let a = pollster::block_on(splats.render(&camera, glam::uvec2(64, 64))).read_vec::<u32>();
+        let mut scratch = RenderScratch::new(&client, 50, glam::uvec2(64, 64));
+        let b = pollster::block_on(splats.render_with(&mut scratch, &camera, glam::uvec2(64, 64)))
+            .read_vec::<u32>();
+        // second frame through the same scratch — the steady-state path
+        let c = pollster::block_on(splats.render_with(&mut scratch, &camera, glam::uvec2(64, 64)))
+            .read_vec::<u32>();
+        assert_eq!(a, b);
+        assert_eq!(b, c);
+    }
+
+    #[test]
+    fn test_scratch_stops_allocating_after_first_frame() {
+        let client = WgpuRuntime::client(&WgpuDevice::default());
+        let attributes: Vec<f32> = (0..100 * 11)
+            .map(|i| (i as f32 * 0.07).sin() * 0.4)
+            .collect();
+        let splats = Splats::new(attributes, vec![0.0; 100 * 3], &client);
+        let camera = crate::camera::Camera {
+            fov: glam::Vec2::splat(0.8),
+            position: glam::Vec3::new(0.0, -1.2, 0.0),
+            rotation: glam::Quat::IDENTITY,
+        };
+        let mut scratch = RenderScratch::new(&client, 100, glam::uvec2(64, 64));
+        pollster::block_on(splats.render_with(&mut scratch, &camera, glam::uvec2(64, 64)));
+        let m1 = client.memory_usage().unwrap().bytes_in_use;
+        pollster::block_on(splats.render_with(&mut scratch, &camera, glam::uvec2(64, 64)));
+        let m2 = client.memory_usage().unwrap().bytes_in_use;
+        assert!(
+            m2 <= m1 + 65_536,
+            "steady-state frame allocated {} bytes",
+            m2.saturating_sub(m1)
+        );
     }
 
     #[test]

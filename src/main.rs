@@ -23,6 +23,7 @@ const UV_RECT: Rect = Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0))
 
 struct App {
     backbuffer: Rc<RefCell<texture::GpuTexture>>,
+    scratch: Rc<RefCell<Option<render::RenderScratch>>>,
     controller: camera::Controller,
     client: ComputeClient<WgpuRuntime>,
     splats: Arc<RwLock<Option<render::Splats>>>,
@@ -75,6 +76,10 @@ fn splat_format(file: &egui::DroppedFile) -> Option<SplatFormat> {
     }
 }
 
+fn splat_format_ok(file: &egui::DroppedFile) -> bool {
+    splat_format(file).is_some()
+}
+
 impl App {
     fn new(cc: &eframe::CreationContext) -> Self {
         let render_state = cc.wgpu_render_state.as_ref().expect("Must use wgpu");
@@ -102,6 +107,7 @@ impl App {
             ))),
             controller: camera::Controller::new(-Vec3::Z * 2.5, Quat::IDENTITY),
             client: WgpuRuntime::client(&device),
+            scratch: Rc::new(RefCell::new(None)),
             splats: Arc::new(RwLock::new(None)),
             reframe: Arc::new(AtomicBool::new(false)),
             #[cfg(target_arch = "wasm32")]
@@ -158,11 +164,12 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
-        if let Some(file) = ui
-            .input(|i| i.raw.dropped_files.clone())
-            .into_iter()
-            .find(|f| splat_format(f).is_some())
-        {
+        // Index into the dropped files and clone only the first splat — no
+        // full-vec clone, single format-detection pass.
+        let dropped = ui
+            .input(|i| i.raw.dropped_files.iter().position(splat_format_ok))
+            .map(|idx| ui.input(|i| i.raw.dropped_files[idx].clone()));
+        if let Some(file) = dropped {
             self.load_dropped(file, ui.ctx().clone());
         }
 
@@ -175,6 +182,8 @@ impl eframe::App for App {
         if self.reframe.swap(false, Ordering::AcqRel) {
             self.controller.frame_bounds(splats.bounds);
         }
+        let splats = splats.clone(); // cheap: GpuTensor clones are handle refcounts
+        drop(binding); // release the read lock before rendering the frame
 
         let size = ui.available_size();
         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::drag());
@@ -184,21 +193,39 @@ impl eframe::App for App {
 
         #[cfg(not(target_arch = "wasm32"))]
         if pixel.x > 8 && pixel.y > 8 {
-            let img = pollster::block_on(splats.render(&self.controller.camera, pixel));
+            let total = splats.attributes.shape[0];
+            let mut slot = self.scratch.borrow_mut();
+            if !slot.as_ref().is_some_and(|s| s.matches(total, pixel)) {
+                *slot = Some(render::RenderScratch::new(&self.client, total, pixel));
+            }
+            let img = pollster::block_on(splats.render_with(
+                slot.as_mut().unwrap(),
+                &self.controller.camera,
+                pixel,
+            ));
             self.backbuffer.borrow_mut().update_texture(&img, pixel);
         }
 
         #[cfg(target_arch = "wasm32")]
         if pixel.x > 8 && pixel.y > 8 && !self.rendering.get() {
             self.rendering.set(true);
-            let splats = splats.clone();
+            let total = splats.attributes.shape[0];
+            {
+                let mut slot = self.scratch.borrow_mut();
+                if !slot.as_ref().is_some_and(|s| s.matches(total, pixel)) {
+                    *slot = Some(render::RenderScratch::new(&self.client, total, pixel));
+                }
+            }
             let camera = self.controller.camera.clone();
+            let scratch = self.scratch.clone();
             let backbuffer = self.backbuffer.clone();
             let rendering = self.rendering.clone();
             let ctx = ui.ctx().clone();
 
             wasm_bindgen_futures::spawn_local(async move {
-                let img = splats.render(&camera, pixel).await;
+                let img = splats
+                    .render_with(scratch.borrow_mut().as_mut().unwrap(), &camera, pixel)
+                    .await;
                 backbuffer.borrow_mut().update_texture(&img, pixel);
                 rendering.set(false);
                 ctx.request_repaint();

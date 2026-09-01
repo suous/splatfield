@@ -41,6 +41,10 @@ pollster = "0.4"
 name = "radix_sort"
 harness = false
 
+[[bench]]
+name = "render_frame"
+harness = false
+
 [profile.release]
 lto = true
 opt-level = 's'
