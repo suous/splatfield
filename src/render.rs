@@ -262,6 +262,10 @@ fn rasterize_kernel(
                 pix_g += color_g * vis;
                 pix_b += color_b * vis;
                 transmittance *= 1.0 - alpha;
+                // Remaining weight < 1 LSB of the final 8-bit channels.
+                if transmittance < 1.0 / 255.0 {
+                    break;
+                }
             }
         }
 
@@ -280,6 +284,53 @@ mod tests {
     use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
 
     const SENTINEL: u32 = 0xDEAD_BEEF;
+
+    // Golden from current rasterizer; regenerate only with documented behavior change.
+    const GOLDEN_CENTER: [i32; 3] = [127, 127, 127];
+
+    #[test]
+    fn test_render_stacked_opaque_splats() {
+        let client = WgpuRuntime::client(&WgpuDevice::default());
+        // Five opaque splats stacked in depth at the same XY, nearest at z = 1.0.
+        let mut attributes = Vec::new();
+        for i in 0..5u32 {
+            let z = 1.0 + i as f32 * 0.5;
+            attributes.extend_from_slice(&[0.0, 0.0, z, 1.0, 0.0, 0.0, 0.0, -2.0, -2.0, -2.0, 8.0]);
+        }
+        let sh = vec![0.0; 5 * 3];
+        let splats = Splats::new(attributes, sh, &client);
+        let camera = crate::camera::Camera {
+            fov: glam::Vec2::splat(0.8),
+            position: glam::Vec3::ZERO,
+            rotation: glam::Quat::IDENTITY,
+        };
+        let bitmap = pollster::block_on(splats.render(&camera, glam::uvec2(32, 32)));
+        let px: Vec<u32> = bitmap.read_vec();
+        let stride = bitmap.shape[1] as usize;
+        let center = px[16 * stride + 16];
+        let [r, g, b, a] = [
+            (center & 0xFF) as i32,
+            ((center >> 8) & 0xFF) as i32,
+            ((center >> 16) & 0xFF) as i32,
+            ((center >> 24) & 0xFF) as i32,
+        ];
+        eprintln!("center pixel: r={r} g={g} b={b} a={a}");
+        let corner = px[0];
+        eprintln!("corner pixel: {corner:#010x}");
+        // quantize_u8 truncates; f32 residual transmittance leaves 255-1 LSB.
+        assert!(
+            a >= 254,
+            "opaque stack must saturate alpha (truncating quantizer: {a})"
+        );
+        assert_eq!(
+            corner & 0xFF00_0000,
+            0,
+            "uncovered pixel must be transparent"
+        );
+        assert!((r - GOLDEN_CENTER[0]).abs() <= 1);
+        assert!((g - GOLDEN_CENTER[1]).abs() <= 1);
+        assert!((b - GOLDEN_CENTER[2]).abs() <= 1);
+    }
 
     #[test]
     fn test_tile_ranges_zeroed_for_empty_tiles() {
