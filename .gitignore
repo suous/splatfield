@@ -2,3 +2,7 @@
 .rumdl_cache
 .DS_Store
 dist
+data
+.worktrees
+.superpowers
+docs/superpowers/
