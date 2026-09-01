@@ -8,6 +8,13 @@ use cubecl::wgpu::WgpuRuntime;
 // Safety cap: 2 * max_tiles_per_dim * max_splats
 const INTERSECTS_UPPER_BOUND: usize = 2 * 512 * 65535;
 
+/// Host-side splat payload produced by the PLY/SOG parsers, uploaded once by `Splats::new`.
+#[derive(Debug, Clone, Default)]
+pub struct CpuSplats {
+    pub attributes: Vec<f32>,
+    pub sh_coeffs: Vec<f32>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Splats {
     pub attributes: GpuTensor,
@@ -22,6 +29,7 @@ impl Splats {
         client: &ComputeClient<WgpuRuntime>,
     ) -> Self {
         let n = attributes.len() / 11;
+        assert!(n > 0, "Splats::new: zero splats");
         let n_coeffs = sh_coeffs.len() / n;
 
         let mut min = glam::Vec3::splat(f32::MAX);

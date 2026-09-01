@@ -1,9 +1,14 @@
-use crate::render::Splats;
+use crate::render::{CpuSplats, Splats};
 use anyhow::{Context, Result, anyhow};
 use cubecl::{client::ComputeClient, wgpu::WgpuRuntime};
 use std::io::{BufRead, BufReader, Read};
 
 pub fn load_ply(reader: impl Read, client: &ComputeClient<WgpuRuntime>) -> Result<Splats> {
+    let cpu = parse_ply(reader)?;
+    Ok(Splats::new(cpu.attributes, cpu.sh_coeffs, client))
+}
+
+pub fn parse_ply(reader: impl Read) -> Result<CpuSplats> {
     let mut reader = BufReader::new(reader);
     let mut vertex_count = 0;
     let mut properties = Vec::new();
@@ -19,6 +24,10 @@ pub fn load_ply(reader: impl Read, client: &ComputeClient<WgpuRuntime>) -> Resul
             ["property", "float", name] => properties.push(name.to_string()),
             _ => {}
         }
+    }
+
+    if vertex_count == 0 {
+        return Err(anyhow!("PLY contains no vertices"));
     }
 
     let get_idx = |name: &str| {
@@ -84,5 +93,92 @@ pub fn load_ply(reader: impl Read, client: &ComputeClient<WgpuRuntime>) -> Resul
     }
 
     drop(buf);
-    Ok(Splats::new(attributes, shs, client))
+    Ok(CpuSplats {
+        attributes,
+        sh_coeffs: shs,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BASE_PROPS: [&str; 14] = [
+        "x", "y", "z", "rot_0", "rot_1", "rot_2", "rot_3", "scale_0", "scale_1", "scale_2",
+        "opacity", "f_dc_0", "f_dc_1", "f_dc_2",
+    ];
+
+    fn synthetic_ply(n: usize, extra_props: &[&str]) -> Vec<u8> {
+        let props = BASE_PROPS
+            .iter()
+            .chain(extra_props)
+            .map(|p| format!("property float {p}\n"))
+            .collect::<String>();
+        let mut bytes = format!(
+            "ply\nformat binary_little_endian 1.0\nelement vertex {n}\n{props}end_header\n"
+        )
+        .into_bytes();
+        let stride = BASE_PROPS.len() + extra_props.len();
+        for i in 0..n {
+            for j in 0..stride {
+                let v = (i * 31 + j) as f32 * 0.25 - 8.0;
+                bytes.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        bytes
+    }
+
+    #[test]
+    fn test_parse_ply_layout() {
+        let bytes = synthetic_ply(3, &["f_rest_0", "f_rest_2", "f_rest_1"]);
+        let cpu = parse_ply(&bytes[..]).unwrap();
+        assert_eq!(cpu.attributes.len(), 3 * 11);
+        // 3 DC + 1 rest per channel (the fixture declares one rest prop per channel).
+        assert_eq!(cpu.sh_coeffs.len(), 3 * 6);
+
+        // `end_header` is followed by a newline before the binary data.
+        let data_off = bytes.windows(10).position(|w| w == b"end_header").unwrap() + 11;
+        let stride = 17;
+        let file = |i: usize, j: usize| {
+            let start = data_off + (i * stride + j) * 4;
+            f32::from_le_bytes(bytes[start..start + 4].try_into().unwrap())
+        };
+
+        // Attribute layout: x, y, z, q(wxyz), scale, opacity.
+        assert_eq!(cpu.attributes[0], file(0, 0));
+        assert_eq!(cpu.attributes[1], file(0, 1));
+        assert_eq!(cpu.attributes[2], file(0, 2));
+        assert_eq!(cpu.attributes[7], file(0, 7));
+        assert_eq!(cpu.attributes[8], file(0, 8));
+        assert_eq!(cpu.attributes[9], file(0, 9));
+        assert_eq!(cpu.attributes[10], file(0, 10));
+
+        // SH is channel-interleaved: [dc_r, dc_g, dc_b, rest_r, rest_g, rest_b].
+        // File property order rest_0, rest_2, rest_1 is sorted to rest_0, rest_1, rest_2,
+        // i.e. file indices 14, 16, 15 feed rest slots R, G, B in that order.
+        let sorted_rest = [14usize, 16, 15];
+        for i in 0..3usize {
+            for (c, &rest) in sorted_rest.iter().enumerate() {
+                assert_eq!(cpu.sh_coeffs[i * 6 + c], file(i, 11 + c));
+                assert_eq!(cpu.sh_coeffs[i * 6 + 3 + c], file(i, rest));
+            }
+        }
+    }
+
+    #[test]
+    fn test_parse_ply_missing_property() {
+        let bytes = "ply\nformat binary_little_endian 1.0\nelement vertex 1\nproperty float x\nend_header\n"
+            .to_string()
+            .into_bytes();
+        let err = parse_ply(&bytes[..]).unwrap_err().to_string();
+        assert!(err.contains("Missing property"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_ply_empty_rejected() {
+        let bytes = "ply\nformat binary_little_endian 1.0\nelement vertex 0\nproperty float x\nend_header\n"
+            .to_string()
+            .into_bytes();
+        assert!(parse_ply(&bytes[..]).is_err());
+    }
 }

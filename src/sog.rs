@@ -1,4 +1,4 @@
-use crate::render::Splats;
+use crate::render::{CpuSplats, Splats};
 use anyhow::{Context, Result};
 use cubecl::{client::ComputeClient, wgpu::WgpuRuntime};
 use serde::Deserialize;
@@ -86,6 +86,11 @@ fn unpack_quat(px: u8, py: u8, pz: u8, tag: u8) -> [f32; 4] {
 }
 
 pub fn load_sog(reader: impl Read + Seek, client: &ComputeClient<WgpuRuntime>) -> Result<Splats> {
+    let cpu = parse_sog(reader)?;
+    Ok(Splats::new(cpu.attributes, cpu.sh_coeffs, client))
+}
+
+pub fn parse_sog(reader: impl Read + Seek) -> Result<CpuSplats> {
     let mut zip = ZipArchive::new(reader)?;
     let meta: Meta = serde_json::from_reader(zip.by_name("meta.json")?)?;
 
@@ -162,8 +167,7 @@ pub fn load_sog(reader: impl Read + Seek, client: &ComputeClient<WgpuRuntime>) -
             if label >= palette_count {
                 continue;
             }
-            let base_x = (label % 64) * sh_coeffs_per_ch;
-            let base_y = label / 64;
+            let (base_x, base_y) = palette_offset(label, cw, sh_coeffs_per_ch);
 
             for j in 0..sh_coeffs_per_ch {
                 let p = (base_y * cw + base_x + j) * 4;
@@ -177,5 +181,77 @@ pub fn load_sog(reader: impl Read + Seek, client: &ComputeClient<WgpuRuntime>) -
 
     // Release the archive (holds the full dropped-file bytes on wasm) before upload.
     drop(zip);
-    Ok(Splats::new(attributes, sh_coeffs, client))
+    Ok(CpuSplats {
+        attributes,
+        sh_coeffs,
+    })
+}
+
+/// Column (in pixels) and row of a label's palette entry in the centroid sheet.
+fn palette_offset(label: usize, cw: usize, sh_coeffs_per_ch: usize) -> (usize, usize) {
+    let per_row = cw / sh_coeffs_per_ch;
+    (label % per_row * sh_coeffs_per_ch, label / per_row)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_palette_offset_derives_row_width() {
+        // 128px-wide centroid sheet, 8 coeffs per channel → 16 palettes per row.
+        let (col, row) = palette_offset(20, 128, 8);
+        assert_eq!((col, row), (4 * 8, 1)); // col in pixels, not palette index
+    }
+
+    #[test]
+    fn test_unpack_quat_unit_all_tags() {
+        for tag in 252u8..=255 {
+            let q = unpack_quat(200, 10, 77, tag);
+            let norm: f32 = q.iter().map(|x| x * x).sum();
+            assert!((norm - 1.0).abs() < 1e-5, "tag {tag}: {norm}");
+        }
+    }
+
+    #[test]
+    fn test_inv_log_logit_roundtrip() {
+        for &v in &[-3.0f32, -0.5, 0.0, 0.5, 3.0] {
+            let y = 1.0 / (1.0 + (-v).exp());
+            assert!((logit(y) - v).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn test_parse_sog_fixtures() {
+        let files = [
+            "data/bear.3d71a266.sog",
+            "data/bear.3d71a266_sh1.sog",
+            "data/bear.3d71a266_sh2.sog",
+        ];
+        if !std::path::Path::new(files[0]).exists() {
+            eprintln!("skipping: no sog fixtures");
+            return;
+        }
+        let parsed: Vec<CpuSplats> = files
+            .iter()
+            .map(|f| parse_sog(std::fs::File::open(f).unwrap()).unwrap())
+            .collect();
+        // Measured fixtures: the base bear.sog is a bands=3 model (970_948 splats);
+        // _sh1/_sh2 are bands=1/2 models sharing 944_830 splats — not bands 0/1/2
+        // of one model, so geometry equality only holds within the _shN pair.
+        let ns: Vec<usize> = parsed.iter().map(|p| p.attributes.len() / 11).collect();
+        assert!(ns.iter().all(|&n| n > 100_000));
+        assert_eq!(ns[1], ns[2], "sh1/sh2 share geometry");
+        let chs: Vec<usize> = parsed
+            .iter()
+            .zip(&ns)
+            .map(|(p, &n)| p.sh_coeffs.len() / n / 3)
+            .collect();
+        assert_eq!(chs, vec![16, 4, 9], "bands 3/1/2 → channels 16/4/9");
+        assert!(parsed.iter().all(|p| {
+            p.sh_coeffs
+                .chunks(3)
+                .all(|c| c.iter().all(|x| x.is_finite()))
+        }));
+    }
 }
