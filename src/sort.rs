@@ -32,7 +32,13 @@ fn plane_exclusive_sum(value: u32) -> u32 {
 }
 
 #[cube(launch)]
-fn count_kernel(shift: u32, num_keys: u32, src: &Array<u32>, counts: &mut Array<u32>) {
+fn count_kernel(
+    num_wgs: u32,
+    shift: u32,
+    num_keys: u32,
+    src: &Array<u32>,
+    counts: &mut Array<u32>,
+) {
     // Workgroup-shared histogram: each key is read exactly once, then atomically
     // bucketed into one of SORT_BINS counters — replacing a per-bin loop that
     // re-read every key SORT_BINS times.
@@ -42,19 +48,24 @@ fn count_kernel(shift: u32, num_keys: u32, src: &Array<u32>, counts: &mut Array<
     }
     sync_cube();
 
-    let base = SORT_BLOCK * CUBE_POS_X + UNIT_POS;
-    for e in 0..ELEMS_PER_THREAD {
-        let idx = base + e * SORT_WG;
-        if idx < num_keys {
-            let bin = (src[idx as usize] >> shift) & 0xf;
-            histogram[bin as usize].fetch_add(1u32);
+    // The grid may be spread over Y/Z when the X count exceeds the hardware
+    // limit (cubecl's CubeCountSelection), so flatten the cube position
+    // instead of addressing work by CUBE_POS_X alone.
+    let wg = CUBE_POS_X + CUBE_COUNT_X * (CUBE_POS_Y + CUBE_COUNT_Y * CUBE_POS_Z);
+    if wg < num_wgs {
+        let base = SORT_BLOCK * wg + UNIT_POS;
+        for e in 0..ELEMS_PER_THREAD {
+            let idx = base + e * SORT_WG;
+            if idx < num_keys {
+                let bin = (src[idx as usize] >> shift) & 0xf;
+                histogram[bin as usize].fetch_add(1u32);
+            }
         }
     }
     sync_cube();
 
-    if UNIT_POS < SORT_BINS {
-        counts[(UNIT_POS * CUBE_COUNT_X + CUBE_POS_X) as usize] =
-            histogram[UNIT_POS as usize].load();
+    if UNIT_POS < SORT_BINS && wg < num_wgs {
+        counts[(UNIT_POS * num_wgs + wg) as usize] = histogram[UNIT_POS as usize].load();
     }
 }
 
@@ -85,6 +96,7 @@ fn prefix_kernel(num_keys: u32, counts: &mut Array<u32>) {
 
 #[cube(launch)]
 fn scatter_kernel(
+    num_wgs: u32,
     shift: u32,
     num_keys: u32,
     src: &Array<u32>,
@@ -93,15 +105,22 @@ fn scatter_kernel(
     out: &mut Array<u32>,
     out_values: &mut Array<u32>,
 ) {
+    // See count_kernel: the cube position must be linearized to survive
+    // CubeCountSelection spreading the grid over Y/Z.
+    let wg = CUBE_POS_X + CUBE_COUNT_X * (CUBE_POS_Y + CUBE_COUNT_Y * CUBE_POS_Z);
+    if wg >= num_wgs {
+        terminate!();
+    }
+
     let mut bin_offsets = SharedMemory::<u32>::new(SORT_BINS as usize);
     let histogram = SharedMemory::<Atomic<u32>>::new(SORT_BINS as usize);
     if UNIT_POS < SORT_BINS {
-        bin_offsets[UNIT_POS as usize] = counts[(UNIT_POS * CUBE_COUNT_X + CUBE_POS_X) as usize];
+        bin_offsets[UNIT_POS as usize] = counts[(UNIT_POS * num_wgs + wg) as usize];
         histogram[UNIT_POS as usize].store(0u32);
     }
     sync_cube();
 
-    let base = SORT_BLOCK * CUBE_POS_X + UNIT_POS;
+    let base = SORT_BLOCK * wg + UNIT_POS;
     for e in 0..ELEMS_PER_THREAD {
         let idx = base + e * SORT_WG;
         if idx < num_keys {
@@ -116,30 +135,40 @@ fn scatter_kernel(
     }
 }
 
+/// Bits needed to represent any value in `0..max_exclusive`.
+pub(crate) fn bits_for(max_exclusive: u32) -> u32 {
+    u32::BITS - max_exclusive.saturating_sub(1).leading_zeros()
+}
+
 pub fn radix_argsort(
     keys: GpuTensor,
     vals: GpuTensor,
     n: u32,
     bits: u32,
 ) -> (GpuTensor, GpuTensor) {
-    let max_n = keys.shape[0] as u32;
+    if n <= 1 || bits == 0 {
+        return (keys, vals);
+    }
     let client = keys.client.clone();
-    let max_wgs = max_n.div_ceil(SORT_BLOCK);
-
-    let num_wgs = cube_count_1d(&client, n, SORT_BLOCK);
+    // The launched grid may exceed the hardware X limit and get spread over
+    // Y/Z (CubeCountSelection), so kernels linearize the workgroup id.
+    let num_wgs = n.div_ceil(SORT_BLOCK);
+    let cube_count = cube_count_1d(&client, n, SORT_BLOCK);
     let cube_dim = CubeDim::new_1d(SORT_WG);
+
+    let count_buf = GpuTensor::empty(&client, [(num_wgs * SORT_BINS) as usize]);
+    let mut dst_keys = GpuTensor::empty(&client, [n as usize]);
+    let mut dst_vals = GpuTensor::empty(&client, [n as usize]);
 
     let mut cur_keys = keys;
     let mut cur_vals = vals;
-    let count_buf = GpuTensor::empty(&client, [(max_wgs as usize) * SORT_BINS as usize]);
-    let mut dst_keys = GpuTensor::empty(&client, [max_n as usize]);
-    let mut dst_vals = GpuTensor::empty(&client, [max_n as usize]);
 
     for shift in (0..bits).step_by(4) {
         count_kernel::launch::<WgpuRuntime>(
             &client,
-            num_wgs.clone(),
+            cube_count.clone(),
             cube_dim,
+            num_wgs,
             shift,
             n,
             cur_keys.as_array_arg(),
@@ -156,8 +185,9 @@ pub fn radix_argsort(
 
         scatter_kernel::launch::<WgpuRuntime>(
             &client,
-            num_wgs.clone(),
+            cube_count.clone(),
             cube_dim,
+            num_wgs,
             shift,
             n,
             cur_keys.as_array_arg(),
@@ -182,7 +212,7 @@ mod radix_sort_tests {
 
     fn argsort<T: Ord>(data: &[T]) -> Vec<usize> {
         let mut indices: Vec<usize> = (0..data.len()).collect();
-        indices.sort_unstable_by_key(|&i| &data[i]);
+        indices.sort_by_key(|&i| &data[i]);
         indices
     }
 
@@ -200,6 +230,67 @@ mod radix_sort_tests {
 
         assert_eq!(ret_keys, ref_keys);
         assert_eq!(ret_values, ref_values);
+    }
+
+    fn assert_argsort_bits(
+        client: &ComputeClient<WgpuRuntime>,
+        keys_inp: &[u32],
+        values_inp: &[u32],
+        bits: u32,
+    ) {
+        let keys = GpuTensor::from(client, [keys_inp.len()], keys_inp);
+        let values = GpuTensor::from(client, [values_inp.len()], values_inp);
+        let (ret_keys, ret_values) = radix_argsort(keys, values, keys_inp.len() as u32, bits);
+        let ret_keys: Vec<u32> = ret_keys.read_vec();
+        let ret_values: Vec<u32> = ret_values.read_vec();
+
+        assert_eq!(ret_keys.len(), keys_inp.len());
+        assert_eq!(ret_values.len(), keys_inp.len());
+
+        // The GPU radix sort is not stable within equal keys, so assert sorted
+        // order and key/value pairing instead of an exact stable reference.
+        for i in 1..keys_inp.len() {
+            assert!(
+                ret_keys[i - 1] <= ret_keys[i],
+                "Keys not sorted at index {i}: {} > {}",
+                ret_keys[i - 1],
+                ret_keys[i]
+            );
+        }
+
+        for i in 0..keys_inp.len() {
+            let sorted_key = ret_keys[i];
+            let original_idx = ret_values[i] as usize;
+            assert_eq!(
+                keys_inp[original_idx], sorted_key,
+                "Value at index {i} points to wrong original index"
+            );
+        }
+    }
+
+    #[test]
+    fn test_bits_for() {
+        assert_eq!(bits_for(0), 0);
+        assert_eq!(bits_for(1), 0);
+        assert_eq!(bits_for(2), 1);
+        assert_eq!(bits_for(3), 2);
+        assert_eq!(bits_for(255), 8);
+        assert_eq!(bits_for(256), 8);
+        assert_eq!(bits_for(257), 9);
+        assert_eq!(bits_for(65536), 16);
+        assert_eq!(bits_for(u32::MAX), 32);
+    }
+
+    #[test]
+    fn test_sorting_partial_bits() {
+        let client = WgpuRuntime::client(&WgpuDevice::default());
+        for max in [2u32, 64, 1000, 65536] {
+            let bits = bits_for(max);
+            let mut rng = rand::rng();
+            let keys_inp: Vec<u32> = (0..5000).map(|_| rng.random_range(0..max)).collect();
+            let values_inp: Vec<u32> = (0..5000).map(|i| i as u32).collect();
+            assert_argsort_bits(&client, &keys_inp, &values_inp, bits);
+        }
     }
 
     #[test]
@@ -288,6 +379,42 @@ mod radix_sort_tests {
             assert_eq!(
                 keys_inp[original_idx], sorted_key,
                 "Value at index {idx} points to wrong original index"
+            );
+        }
+    }
+
+    #[test]
+    fn test_scratch_sized_by_sorted_length() {
+        let client = WgpuRuntime::client(&WgpuDevice::default());
+        let cap = 1_000_000usize;
+        let n = 1_000usize;
+        let keys_inp: Vec<u32> = (0..cap)
+            .map(|i| (i as u32).wrapping_mul(2_654_435_761))
+            .collect();
+        let vals_inp: Vec<u32> = (0..cap).map(|i| i as u32).collect();
+        let keys = GpuTensor::from(&client, [cap], &keys_inp[..]);
+        let vals = GpuTensor::from(&client, [cap], &vals_inp[..]);
+
+        let before = client.memory_usage().unwrap().bytes_in_use;
+        let (sorted_keys, sorted_vals) = radix_argsort(keys, vals, n as u32, 32);
+        let out: Vec<u32> = sorted_keys.read_vec(); // forces completion before measuring
+        let after = client.memory_usage().unwrap().bytes_in_use;
+        assert_eq!(out.len(), cap); // tensor shape unchanged; only first n are sorted
+
+        // Scratch (dst pair + counts) must track n, not the tensor capacity.
+        assert!(
+            after - before < 256 * 1024,
+            "scratch allocation {} bytes exceeds n-sized budget",
+            after - before
+        );
+        let sv: Vec<u32> = sorted_vals.read_vec();
+        let mut sorted = keys_inp[..n].to_vec();
+        sorted.sort_unstable();
+        assert_eq!(&out[..n], &sorted[..]);
+        for (i, &idx) in sv[..n].iter().enumerate() {
+            assert_eq!(
+                keys_inp[idx as usize], out[i],
+                "Value at index {i} points at the wrong key"
             );
         }
     }

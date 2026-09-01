@@ -1,6 +1,6 @@
 use crate::camera::Camera;
 use crate::helpers;
-use crate::sort::radix_argsort;
+use crate::sort::{bits_for, radix_argsort};
 use crate::tensor::{GpuTensor, cube_count_1d};
 use cubecl::prelude::*;
 use cubecl::wgpu::WgpuRuntime;
@@ -127,11 +127,10 @@ impl Splats {
             num_isects,
         );
 
-        // Two stable radix sorts equivalent to the paper's single composite key
-        // (tile_id << depth_bits) | depth_id: first sort by depth, then by tile.
-        let gid_bits = u32::BITS - num_visible.leading_zeros().max(1);
+        // Two radix sorts equivalent to the paper's single composite key sort — the sort itself is not stable within equal keys, which is harmless for alpha blending.
+        let gid_bits = bits_for(num_visible);
         let (gaussian_ids, tile_ids) = radix_argsort(gaussian_ids, tile_ids, num_isects, gid_bits);
-        let tile_bits = u32::BITS - (num_tiles as u32).leading_zeros();
+        let tile_bits = bits_for(num_tiles as u32);
         let (tile_ids, gaussian_ids) = radix_argsort(tile_ids, gaussian_ids, num_isects, tile_bits);
 
         build_tile_ranges::launch::<WgpuRuntime>(
