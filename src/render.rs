@@ -8,6 +8,9 @@ use cubecl::wgpu::WgpuRuntime;
 // Safety cap: 2 * max_tiles_per_dim * max_splats
 const INTERSECTS_UPPER_BOUND: usize = 2 * 512 * 65535;
 
+// z ∈ (0.1, 1e4) keeps the top 4 mantissa-bits constant; dropping them saves a radix pass.
+const DEPTH_KEY_BITS: u32 = 28;
+
 /// Host-side splat payload produced by the PLY/SOG parsers, uploaded once by `Splats::new`.
 #[derive(Debug, Clone, Default)]
 pub struct CpuSplats {
@@ -115,7 +118,8 @@ impl Splats {
                 num_isects_raw
             );
         }
-        let (inv_perm, depth_order) = radix_argsort(depth_keys, depth_order, num_visible, 32);
+        let (inv_perm, depth_order) =
+            radix_argsort(depth_keys, depth_order, num_visible, DEPTH_KEY_BITS);
 
         invert_permutation::launch::<WgpuRuntime>(
             client,

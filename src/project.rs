@@ -208,7 +208,7 @@ pub(crate) fn project_splats(
 
         let vis_slot = counters[1].fetch_add(1u32);
         depth_order[vis_slot as usize] = vis_slot;
-        depth_keys[vis_slot as usize] = cam.z.to_bits();
+        depth_keys[vis_slot as usize] = cam.z.to_bits() >> 4;
 
         let dir = Vec3F {
             x: mean.x - camera_pos.x,
