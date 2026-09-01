@@ -108,6 +108,10 @@ impl Splats {
     ///    (equivalent to the paper's single composite-key sort).
     /// 4. **Rasterize** — render sorted Gaussians per tile in parallel; each pixel
     ///    alpha-blends front-to-back through its tile's Gaussian list.
+    ///
+    /// One-shot render builds a fresh scratch at the initial isect capacity; views
+    /// exceeding it render truncated (warned) for that call — use `render_with`
+    /// for the self-healing path.
     pub async fn render(&self, camera: &Camera, img_size: glam::UVec2) -> GpuTensor {
         let mut scratch =
             RenderScratch::new(&self.attributes.client, self.attributes.shape[0], img_size);
@@ -116,6 +120,10 @@ impl Splats {
 
     /// Render one frame into `scratch`'s buffers; the returned bitmap aliases
     /// `scratch.bitmap` and is valid until the next `render_with` on it.
+    ///
+    /// `scratch` must satisfy `matches(self.attributes.shape[0], img_size)`
+    /// (debug_asserted); a mismatched scratch in release yields garbage-clamped
+    /// output, not UB.
     pub async fn render_with(
         &self,
         scratch: &mut RenderScratch,
@@ -177,16 +185,21 @@ impl Splats {
         if num_isects_raw as usize >= max_isects {
             // Saturated: this frame is truncated to the clamped count; grow so
             // the next frame fits. Reallocating now is safe — everything below
-            // runs on the frame-local clones of the old buffers.
-            scratch.isect_capacity = (num_isects_raw as usize)
+            // runs on the frame-local clones of the old buffers. Once the
+            // ceiling is reached the computed capacity equals the current one
+            // and no realloc (or warn) happens.
+            let new_cap = (num_isects_raw as usize)
                 .next_power_of_two()
                 .min(INTERSECTS_UPPER_BOUND);
-            log::warn!(
-                "intersection capacity {max_isects} reached ({num_isects_raw} emitted); growing to {}",
-                scratch.isect_capacity
-            );
-            scratch.tile_ids = GpuTensor::empty(client, [scratch.isect_capacity]);
-            scratch.gaussian_ids = GpuTensor::empty(client, [scratch.isect_capacity]);
+            if new_cap > scratch.isect_capacity {
+                log::warn!(
+                    "intersection capacity {max_isects} reached ({num_isects_raw} emitted); growing to {}",
+                    new_cap
+                );
+                scratch.isect_capacity = new_cap;
+                scratch.tile_ids = GpuTensor::empty(client, [new_cap]);
+                scratch.gaussian_ids = GpuTensor::empty(client, [new_cap]);
+            }
         }
         let (inv_perm, depth_order) = radix_argsort(
             scratch.depth_keys.clone(),
