@@ -64,10 +64,19 @@ impl Splats {
         let depth_order = GpuTensor::empty(client, [total]);
         let depth_keys = GpuTensor::empty(client, [total]);
         let projected = GpuTensor::empty(client, [total, 9]);
-        let counters = GpuTensor::from(client, [2], [0u32, 0u32]);
+        let counters = GpuTensor::empty(client, [2]);
+        let tile_ranges = GpuTensor::empty(client, [num_tiles * 2]);
         let tile_ids = GpuTensor::empty(client, [max_isects]);
         let gaussian_ids = GpuTensor::empty(client, [max_isects]);
         let viewmat = GpuTensor::from(client, [16], viewmat);
+
+        zero_buffers::launch::<WgpuRuntime>(
+            client,
+            cube_count_1d(client, (2 + 2 * num_tiles) as u32, helpers::TILE_SIZE),
+            CubeDim::new_1d(helpers::TILE_SIZE),
+            counters.as_array_arg(),
+            tile_ranges.as_array_arg(),
+        );
 
         crate::project::project_splats::launch::<WgpuRuntime>(
             client,
@@ -85,12 +94,19 @@ impl Splats {
             depth_keys.as_array_arg(),
             projected.as_array_arg(),
             counters.as_array_arg(),
+            max_isects as u32,
             tile_ids.as_array_arg(),
             gaussian_ids.as_array_arg(),
         );
 
-        let [num_isects, num_visible] = counters.read_pair().await;
-        let num_isects = num_isects.min(max_isects as u32);
+        let [num_isects_raw, num_visible] = counters.read_pair().await;
+        let num_isects = num_isects_raw.min(max_isects as u32);
+        if num_isects_raw > max_isects as u32 {
+            log::warn!(
+                "intersection overflow: {} emitted, cap {max_isects}",
+                num_isects_raw
+            );
+        }
         let (inv_perm, depth_order) = radix_argsort(depth_keys, depth_order, num_visible, 32);
 
         invert_permutation::launch::<WgpuRuntime>(
@@ -118,7 +134,6 @@ impl Splats {
         let tile_bits = u32::BITS - (num_tiles as u32).leading_zeros();
         let (tile_ids, gaussian_ids) = radix_argsort(tile_ids, gaussian_ids, num_isects, tile_bits);
 
-        let tile_ranges = GpuTensor::empty(client, [num_tiles * 2]);
         build_tile_ranges::launch::<WgpuRuntime>(
             client,
             cube_count_1d(client, num_isects, helpers::TILE_SIZE),
@@ -158,6 +173,16 @@ fn invert_permutation(perm: &mut Array<u32>, inv: &mut Array<u32>, n: u32) {
 fn remap_global_ids(gids: &mut Array<u32>, inv_perm: &Array<u32>, n: u32) {
     if ABSOLUTE_POS_X < n {
         gids[ABSOLUTE_POS_X as usize] = inv_perm[gids[ABSOLUTE_POS_X as usize] as usize];
+    }
+}
+
+#[cube(launch)]
+fn zero_buffers(counters: &mut Array<u32>, tile_ranges: &mut Array<u32>) {
+    let idx = ABSOLUTE_POS_X as usize;
+    if idx < 2 {
+        counters[idx] = 0;
+    } else if idx < 2 + tile_ranges.len() {
+        tile_ranges[idx - 2] = 0;
     }
 }
 
@@ -238,5 +263,52 @@ fn rasterize_kernel(
         let b = helpers::quantize_u8(pix_b);
         let a = helpers::quantize_u8(1.0f32 - transmittance);
         bitmap[(px + py * row_stride) as usize] = r | (g << 8u32) | (b << 16u32) | (a << 24u32);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tensor::GpuTensor;
+    use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+
+    const SENTINEL: u32 = 0xDEAD_BEEF;
+
+    #[test]
+    fn test_tile_ranges_zeroed_for_empty_tiles() {
+        let client = WgpuRuntime::client(&WgpuDevice::default());
+        let num_tiles = 8usize;
+        // Sorted tile ids: tiles 0, 1, 2, 5 have intersections; 3, 4, 6, 7 are empty.
+        let ids: Vec<u32> = vec![0, 0, 1, 2, 2, 2, 5, 5];
+        let ids_t = GpuTensor::from(&client, [ids.len()], &ids[..]);
+        let ranges = GpuTensor::from(&client, [num_tiles * 2], &vec![SENTINEL; num_tiles * 2][..]);
+        let counters = GpuTensor::from(&client, [2], &[SENTINEL, SENTINEL][..]);
+
+        zero_buffers::launch::<WgpuRuntime>(
+            &client,
+            cube_count_1d(&client, (2 + 2 * num_tiles) as u32, helpers::TILE_SIZE),
+            CubeDim::new_1d(helpers::TILE_SIZE),
+            counters.as_array_arg(),
+            ranges.as_array_arg(),
+        );
+        build_tile_ranges::launch::<WgpuRuntime>(
+            &client,
+            cube_count_1d(&client, ids.len() as u32, helpers::TILE_SIZE),
+            CubeDim::new_1d(helpers::TILE_SIZE),
+            ids_t.as_array_arg(),
+            ranges.as_array_arg(),
+            ids.len() as u32,
+        );
+
+        let r: Vec<u32> = ranges.read_vec();
+        assert_eq!(&r[0..2], &[0, 2], "tile 0 range");
+        assert_eq!(&r[2..4], &[2, 3], "tile 1 range");
+        assert_eq!(&r[4..6], &[3, 6], "tile 2 range");
+        assert_eq!(&r[10..12], &[6, 8], "tile 5 range");
+        for t in [3usize, 4, 6, 7] {
+            assert_eq!(&r[t * 2..t * 2 + 2], &[0, 0], "tile {t} must be zeroed");
+        }
+        let c: Vec<u32> = counters.read_vec();
+        assert_eq!(c, vec![0, 0]);
     }
 }

@@ -69,8 +69,8 @@ const SH_C2_3: f32 = 0.546_274_24_f32;
 
 #[rustfmt::skip]
 #[cube]
-pub(crate) fn sh_to_rgb(chs: u32, dir: Vec3F, shs: &Array<f32>) -> (f32, f32, f32) {
-    let bi = (ABSOLUTE_POS_X as usize) * chs as usize * 3;
+pub(crate) fn sh_to_rgb(chs: u32, dir: Vec3F, splat: u32, shs: &Array<f32>) -> (f32, f32, f32) {
+    let bi = (splat as usize) * chs as usize * 3;
     let mut r = SH_C0 * shs[bi];
     let mut g = SH_C0 * shs[bi + 1];
     let mut b = SH_C0 * shs[bi + 2];

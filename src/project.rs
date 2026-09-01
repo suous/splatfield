@@ -171,6 +171,7 @@ pub(crate) fn project_splats(
     depth_keys: &mut Array<u32>,
     projected_splats: &mut Array<f32>,
     counters: &Array<Atomic<u32>>,
+    max_isects: u32,
     tile_ids: &mut Array<u32>,
     gaussian_ids: &mut Array<u32>,
 ) {
@@ -214,7 +215,7 @@ pub(crate) fn project_splats(
             y: mean.y - camera_pos.y,
             z: mean.z - camera_pos.z,
         };
-        let (r, g, b) = helpers::sh_to_rgb(sh_per_ch, normalize(dir), sh_coeffs);
+        let (r, g, b) = helpers::sh_to_rgb(sh_per_ch, normalize(dir), ABSOLUTE_POS_X, sh_coeffs);
 
         let inv_cam_z = cam.z.recip();
         let mean2d = Vec2F {
@@ -241,9 +242,77 @@ pub(crate) fn project_splats(
         for ty in tile_bbox.min_y..tile_bbox.max_y {
             for tx in tile_bbox.min_x..tile_bbox.max_x {
                 let slot = counters[0].fetch_add(1u32);
-                tile_ids[slot as usize] = tx + ty * tile_bounds.x as u32;
-                gaussian_ids[slot as usize] = vis_slot;
+                if slot < max_isects {
+                    tile_ids[slot as usize] = tx + ty * tile_bounds.x as u32;
+                    gaussian_ids[slot as usize] = vis_slot;
+                }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::helpers::{Vec2FLaunch, Vec3FLaunch};
+    use crate::tensor::{GpuTensor, cube_count_1d};
+    use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+
+    const SENTINEL: u32 = 0xDEAD_BEEF;
+
+    #[test]
+    fn test_project_respects_isect_cap() {
+        let client = WgpuRuntime::client(&WgpuDevice::default());
+        // One splat at the image center, scale ~1, near-full opacity: with a
+        // 64x64 image and 16x16 tiles it intersects all 16 tiles.
+        let attributes: Vec<f32> = vec![0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 5.0];
+        let sh: Vec<f32> = vec![0.0; 3];
+        let attrs_t = GpuTensor::from(&client, [1, 11], &attributes[..]);
+        let sh_t = GpuTensor::from(&client, [1, 1, 3], &sh[..]);
+        let depth_order = GpuTensor::empty(&client, [1]);
+        let depth_keys = GpuTensor::empty(&client, [1]);
+        let projected = GpuTensor::empty(&client, [1, 9]);
+        let counters = GpuTensor::from(&client, [2], &[0u32, 0][..]);
+        let tile_ids = GpuTensor::from(&client, [32], &vec![SENTINEL; 32][..]);
+        let gaussian_ids = GpuTensor::from(&client, [32], &vec![SENTINEL; 32][..]);
+        let viewmat: Vec<f32> = glam::Mat4::IDENTITY.to_cols_array().to_vec();
+        let viewmat_t = GpuTensor::from(&client, [16], &viewmat[..]);
+
+        project_splats::launch::<WgpuRuntime>(
+            &client,
+            cube_count_1d(&client, 1, 256),
+            CubeDim::new_1d(256),
+            viewmat_t.as_array_arg(),
+            Vec2FLaunch::new(32.0, 32.0),
+            Vec3FLaunch::new(0.0, 0.0, 0.0),
+            attrs_t.as_array_arg(),
+            sh_t.as_array_arg(),
+            1,
+            Vec2FLaunch::new(4.0, 4.0),
+            Vec2FLaunch::new(64.0, 64.0),
+            depth_order.as_array_arg(),
+            depth_keys.as_array_arg(),
+            projected.as_array_arg(),
+            counters.as_array_arg(),
+            2, // max_isects
+            tile_ids.as_array_arg(),
+            gaussian_ids.as_array_arg(),
+        );
+
+        let c: Vec<u32> = counters.read_vec();
+        assert_eq!(c[1], 1, "one visible splat");
+        assert_eq!(c[0], 16, "all 16 tile emissions counted");
+        let tids: Vec<u32> = tile_ids.read_vec();
+        let gids: Vec<u32> = gaussian_ids.read_vec();
+        assert!(
+            tids[..2].iter().all(|&t| t != SENTINEL),
+            "capped slots written"
+        );
+        assert!(
+            tids[2..].iter().all(|&t| t == SENTINEL),
+            "slots beyond max_isects must be untouched, got {:?}",
+            &tids[2..6]
+        );
+        assert!(gids[2..].iter().all(|&g| g == SENTINEL));
     }
 }
