@@ -147,29 +147,29 @@ impl Splats {
             client,
             cube_count_1d(client, (2 + 2 * num_tiles) as u32, helpers::TILE_SIZE),
             CubeDim::new_1d(helpers::TILE_SIZE),
-            scratch.counters.as_array_arg(),
-            scratch.tile_ranges.as_array_arg(),
+            scratch.counters.as_buffer_arg(),
+            scratch.tile_ranges.as_buffer_arg(),
         );
 
         crate::project::project_splats::launch::<WgpuRuntime>(
             client,
             cube_count_1d(client, total as u32, helpers::TILE_SIZE),
             CubeDim::new_1d(helpers::TILE_SIZE),
-            viewmat.as_array_arg(),
+            viewmat.as_buffer_arg(),
             helpers::Vec2FLaunch::new(focal.x, focal.y),
             helpers::Vec3FLaunch::new(camera_pos.x, camera_pos.y, camera_pos.z),
-            self.attributes.as_array_arg(),
-            self.sh_coeffs.as_array_arg(),
+            self.attributes.as_buffer_arg(),
+            self.sh_coeffs.as_buffer_arg(),
             sh_per_ch,
             helpers::Vec2FLaunch::new(tile_bounds.x as f32, tile_bounds.y as f32),
             helpers::Vec2FLaunch::new(img_size.x as f32, img_size.y as f32),
-            scratch.depth_order.as_array_arg(),
-            scratch.depth_keys.as_array_arg(),
-            scratch.projected.as_array_arg(),
-            scratch.counters.as_array_arg(),
+            scratch.depth_order.as_buffer_arg(),
+            scratch.depth_keys.as_buffer_arg(),
+            scratch.projected.as_buffer_arg(),
+            scratch.counters.as_buffer_arg(),
             max_isects as u32,
-            tile_ids.as_array_arg(),
-            gaussian_ids.as_array_arg(),
+            tile_ids.as_buffer_arg(),
+            gaussian_ids.as_buffer_arg(),
         );
 
         let [num_isects_raw, num_visible] = scratch.counters.read_pair().await;
@@ -199,8 +199,8 @@ impl Splats {
             client,
             cube_count_1d(client, num_visible, helpers::TILE_SIZE),
             CubeDim::new_1d(helpers::TILE_SIZE),
-            depth_order.as_array_arg(),
-            inv_perm.as_array_arg(),
+            depth_order.as_buffer_arg(),
+            inv_perm.as_buffer_arg(),
             num_visible,
         );
 
@@ -208,8 +208,8 @@ impl Splats {
             client,
             cube_count_1d(client, num_isects, helpers::TILE_SIZE),
             CubeDim::new_1d(helpers::TILE_SIZE),
-            gaussian_ids.as_array_arg(),
-            inv_perm.as_array_arg(),
+            gaussian_ids.as_buffer_arg(),
+            inv_perm.as_buffer_arg(),
             num_isects,
         );
 
@@ -223,8 +223,8 @@ impl Splats {
             client,
             cube_count_1d(client, num_isects, helpers::TILE_SIZE),
             CubeDim::new_1d(helpers::TILE_SIZE),
-            tile_ids.as_array_arg(),
-            scratch.tile_ranges.as_array_arg(),
+            tile_ids.as_buffer_arg(),
+            scratch.tile_ranges.as_buffer_arg(),
             num_isects,
         );
 
@@ -236,32 +236,32 @@ impl Splats {
             img_size.x,
             img_size.y,
             row_stride,
-            gaussian_ids.as_array_arg(),
-            scratch.tile_ranges.as_array_arg(),
-            scratch.projected.as_array_arg(),
-            depth_order.as_array_arg(),
-            scratch.bitmap.as_array_arg(),
+            gaussian_ids.as_buffer_arg(),
+            scratch.tile_ranges.as_buffer_arg(),
+            scratch.projected.as_buffer_arg(),
+            depth_order.as_buffer_arg(),
+            scratch.bitmap.as_buffer_arg(),
         );
         scratch.bitmap.clone()
     }
 }
 
 #[cube(launch)]
-fn invert_permutation(perm: &mut Array<u32>, inv: &mut Array<u32>, n: u32) {
+fn invert_permutation(perm: &mut [u32], inv: &mut [u32], n: u32) {
     if ABSOLUTE_POS_X < n {
         inv[perm[ABSOLUTE_POS_X as usize] as usize] = ABSOLUTE_POS_X;
     }
 }
 
 #[cube(launch)]
-fn remap_global_ids(gids: &mut Array<u32>, inv_perm: &Array<u32>, n: u32) {
+fn remap_global_ids(gids: &mut [u32], inv_perm: &[u32], n: u32) {
     if ABSOLUTE_POS_X < n {
         gids[ABSOLUTE_POS_X as usize] = inv_perm[gids[ABSOLUTE_POS_X as usize] as usize];
     }
 }
 
 #[cube(launch)]
-fn zero_buffers(counters: &mut Array<u32>, tile_ranges: &mut Array<u32>) {
+fn zero_buffers(counters: &mut [u32], tile_ranges: &mut [u32]) {
     let idx = ABSOLUTE_POS_X as usize;
     if idx < 2 {
         counters[idx] = 0;
@@ -271,7 +271,7 @@ fn zero_buffers(counters: &mut Array<u32>, tile_ranges: &mut Array<u32>) {
 }
 
 #[cube(launch)]
-fn build_tile_ranges(ids: &Array<u32>, ranges: &mut Array<u32>, num_isects: u32) {
+fn build_tile_ranges(ids: &[u32], ranges: &mut [u32], num_isects: u32) {
     if ABSOLUTE_POS_X < num_isects {
         let cur = ids[ABSOLUTE_POS_X as usize];
         if ABSOLUTE_POS_X == 0 || ids[(ABSOLUTE_POS_X - 1) as usize] != cur {
@@ -285,7 +285,7 @@ fn build_tile_ranges(ids: &Array<u32>, ranges: &mut Array<u32>, num_isects: u32)
 
 #[cube]
 fn gaussian_power(conic: helpers::Vec3F, dx: f32, dy: f32) -> f32 {
-    0.5 * (conic.x * dx * dx + conic.z * dy * dy) + conic.y * dx * dy
+    0.5f32 * (conic.x * dx * dx + conic.z * dy * dy) + conic.y * dx * dy
 }
 
 #[cube(launch)]
@@ -293,11 +293,11 @@ fn rasterize_kernel(
     img_size_x: u32,
     img_size_y: u32,
     row_stride: u32,
-    gaussian_ids_by_tile: &Array<u32>,
-    tile_ranges: &Array<u32>,
-    projected: &Array<f32>,
-    depth_order: &Array<u32>,
-    bitmap: &mut Array<u32>,
+    gaussian_ids_by_tile: &[u32],
+    tile_ranges: &[u32],
+    projected: &[f32],
+    depth_order: &[u32],
+    bitmap: &mut [u32],
 ) {
     let px = ABSOLUTE_POS_X;
     let py = ABSOLUTE_POS_Y;
@@ -308,7 +308,7 @@ fn rasterize_kernel(
         let range_start = tile_ranges[tile_id as usize * 2];
         let range_end = tile_ranges[tile_id as usize * 2 + 1];
 
-        let mut transmittance = 1.0;
+        let mut transmittance = 1.0f32;
         let mut pix_r = 0.0;
         let mut pix_g = 0.0;
         let mut pix_b = 0.0;
@@ -333,14 +333,14 @@ fn rasterize_kernel(
             let power = gaussian_power(conic, mean_x - pixel_x, mean_y - pixel_y);
             let alpha = (color_a * (-power).exp()).min(0.999);
 
-            if alpha >= 1.0 / u8::MAX as f32 {
+            if alpha >= 1.0f32 / u8::MAX as f32 {
                 let vis = alpha * transmittance;
                 pix_r += color_r * vis;
                 pix_g += color_g * vis;
                 pix_b += color_b * vis;
-                transmittance *= 1.0 - alpha;
+                transmittance *= 1.0f32 - alpha;
                 // Remaining weight < 1 LSB of the final 8-bit channels.
-                if transmittance < 1.0 / 255.0 {
+                if transmittance < 1.0f32 / 255.0f32 {
                     break;
                 }
             }
@@ -471,15 +471,15 @@ mod tests {
             &client,
             cube_count_1d(&client, (2 + 2 * num_tiles) as u32, helpers::TILE_SIZE),
             CubeDim::new_1d(helpers::TILE_SIZE),
-            counters.as_array_arg(),
-            ranges.as_array_arg(),
+            counters.as_buffer_arg(),
+            ranges.as_buffer_arg(),
         );
         build_tile_ranges::launch::<WgpuRuntime>(
             &client,
             cube_count_1d(&client, ids.len() as u32, helpers::TILE_SIZE),
             CubeDim::new_1d(helpers::TILE_SIZE),
-            ids_t.as_array_arg(),
-            ranges.as_array_arg(),
+            ids_t.as_buffer_arg(),
+            ranges.as_buffer_arg(),
             ids.len() as u32,
         );
 

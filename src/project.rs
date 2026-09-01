@@ -24,7 +24,7 @@ fn normalize(v: Vec3F) -> Vec3F {
 }
 
 #[cube]
-fn to_camera_space(viewmat: &Array<f32>, pos: Vec3F) -> (Vec3F, Mat3) {
+fn to_camera_space(viewmat: &[f32], pos: Vec3F) -> (Vec3F, Mat3) {
     let rot = Mat3 {
         row0: Vec3F {
             x: viewmat[0],
@@ -66,19 +66,19 @@ fn quat_to_rotation(q: Vec4F) -> Mat3 {
 
     Mat3 {
         row0: Vec3F {
-            x: 1.0 - 2.0 * (y2 + z2),
-            y: 2.0 * (xy - wz),
-            z: 2.0 * (xz + wy),
+            x: 1.0f32 - 2.0f32 * (y2 + z2),
+            y: 2.0f32 * (xy - wz),
+            z: 2.0f32 * (xz + wy),
         },
         row1: Vec3F {
-            x: 2.0 * (xy + wz),
-            y: 1.0 - 2.0 * (x2 + z2),
-            z: 2.0 * (yz - wx),
+            x: 2.0f32 * (xy + wz),
+            y: 1.0f32 - 2.0f32 * (x2 + z2),
+            z: 2.0f32 * (yz - wx),
         },
         row2: Vec3F {
-            x: 2.0 * (xz - wy),
-            y: 2.0 * (yz + wx),
-            z: 1.0 - 2.0 * (x2 + y2),
+            x: 2.0f32 * (xz - wy),
+            y: 2.0f32 * (yz + wx),
+            z: 1.0f32 - 2.0f32 * (x2 + y2),
         },
     }
 }
@@ -107,8 +107,8 @@ fn compute_cov2d(
     let m2 = scale_components(r.row2, scale);
 
     let inv_cam_z = cam.z.recip();
-    let lim_x = 1.3 * img.x / (2.0 * focal.x);
-    let lim_y = 1.3 * img.y / (2.0 * focal.y);
+    let lim_x = 1.3f32 * img.x / (2.0f32 * focal.x);
+    let lim_y = 1.3f32 * img.y / (2.0f32 * focal.y);
     let u = (cam.x * inv_cam_z).clamp(-lim_x, lim_x);
     let v = (cam.y * inv_cam_z).clamp(-lim_y, lim_y);
 
@@ -159,21 +159,21 @@ fn compute_conic(a: f32, b: f32, c: f32) -> Vec3F {
 
 #[cube(launch)]
 pub(crate) fn project_splats(
-    viewmat: &Array<f32>,
+    viewmat: &[f32],
     focal: Vec2F,
     camera_pos: Vec3F,
-    attributes: &Array<f32>,
-    sh_coeffs: &Array<f32>,
+    attributes: &[f32],
+    sh_coeffs: &[f32],
     sh_per_ch: u32,
     tile_bounds: Vec2F,
     img_size: Vec2F,
-    depth_order: &mut Array<u32>,
-    depth_keys: &mut Array<u32>,
-    projected_splats: &mut Array<f32>,
-    counters: &Array<Atomic<u32>>,
+    depth_order: &mut [u32],
+    depth_keys: &mut [u32],
+    projected_splats: &mut [f32],
+    counters: &[Atomic<u32>],
     max_isects: u32,
-    tile_ids: &mut Array<u32>,
-    gaussian_ids: &mut Array<u32>,
+    tile_ids: &mut [u32],
+    gaussian_ids: &mut [u32],
 ) {
     if ABSOLUTE_POS_X < depth_order.len() as u32 {
         // Splat attributes layout: [x, y, z, qw, qx, qy, qz, sx, sy, sz, opacity]
@@ -282,21 +282,21 @@ mod tests {
             &client,
             cube_count_1d(&client, 1, 256),
             CubeDim::new_1d(256),
-            viewmat_t.as_array_arg(),
+            viewmat_t.as_buffer_arg(),
             Vec2FLaunch::new(32.0, 32.0),
             Vec3FLaunch::new(0.0, 0.0, 0.0),
-            attrs_t.as_array_arg(),
-            sh_t.as_array_arg(),
+            attrs_t.as_buffer_arg(),
+            sh_t.as_buffer_arg(),
             1,
             Vec2FLaunch::new(4.0, 4.0),
             Vec2FLaunch::new(64.0, 64.0),
-            depth_order.as_array_arg(),
-            depth_keys.as_array_arg(),
-            projected.as_array_arg(),
-            counters.as_array_arg(),
+            depth_order.as_buffer_arg(),
+            depth_keys.as_buffer_arg(),
+            projected.as_buffer_arg(),
+            counters.as_buffer_arg(),
             2, // max_isects
-            tile_ids.as_array_arg(),
-            gaussian_ids.as_array_arg(),
+            tile_ids.as_buffer_arg(),
+            gaussian_ids.as_buffer_arg(),
         );
 
         let c: Vec<u32> = counters.read_vec();

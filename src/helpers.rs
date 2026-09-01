@@ -1,12 +1,14 @@
 use cubecl::prelude::*;
 
 #[derive(CubeType, CubeLaunch, Clone, Copy)]
+#[expand(derive(Clone, Copy))]
 pub(crate) struct Vec2F {
     pub x: f32,
     pub y: f32,
 }
 
 #[derive(CubeType, CubeLaunch, Clone, Copy)]
+#[expand(derive(Clone, Copy))]
 pub(crate) struct Vec3F {
     pub x: f32,
     pub y: f32,
@@ -14,6 +16,7 @@ pub(crate) struct Vec3F {
 }
 
 #[derive(CubeType, CubeLaunch, Clone, Copy)]
+#[expand(derive(Clone, Copy))]
 pub(crate) struct Vec4F {
     pub w: f32,
     pub x: f32,
@@ -22,6 +25,7 @@ pub(crate) struct Vec4F {
 }
 
 #[derive(CubeType, Clone, Copy)]
+#[expand(derive(Clone, Copy))]
 pub(crate) struct Mat3 {
     pub row0: Vec3F,
     pub row1: Vec3F,
@@ -41,7 +45,7 @@ pub(crate) const TILE_SIZE: u32 = TILE_WIDTH * TILE_WIDTH;
 
 #[cube]
 pub(crate) fn sigmoid(x: f32) -> f32 {
-    1.0 / (1.0 + (-x).exp())
+    1.0f32 / (1.0f32 + (-x).exp())
 }
 
 #[cube]
@@ -51,7 +55,7 @@ pub(crate) fn quantize_u8(v: f32) -> u32 {
 
 #[cube]
 pub(crate) fn tile_bbox(mean: Vec2F, ext: Vec2F, bounds: Vec2F) -> TileBBox {
-    let inv_tile = 1.0 / TILE_WIDTH as f32;
+    let inv_tile = 1.0f32 / TILE_WIDTH as f32;
     TileBBox {
         min_x: ((mean.x - ext.x) * inv_tile).clamp(0.0, bounds.x) as u32,
         min_y: ((mean.y - ext.y) * inv_tile).clamp(0.0, bounds.y) as u32,
@@ -69,7 +73,7 @@ const SH_C2_3: f32 = 0.546_274_24_f32;
 
 #[rustfmt::skip]
 #[cube]
-pub(crate) fn sh_to_rgb(chs: u32, dir: Vec3F, splat: u32, shs: &Array<f32>) -> (f32, f32, f32) {
+pub(crate) fn sh_to_rgb(chs: u32, dir: Vec3F, splat: u32, shs: &[f32]) -> (f32, f32, f32) {
     let bi = (splat as usize) * chs as usize * 3;
     let mut r = SH_C0 * shs[bi];
     let mut g = SH_C0 * shs[bi + 1];
@@ -95,14 +99,14 @@ pub(crate) fn sh_to_rgb(chs: u32, dir: Vec3F, splat: u32, shs: &Array<f32>) -> (
 
     if chs >= 16 {
         let sh_c1x = dir.x * dir.x - dir.y * dir.y;
-        let sh_c1y = 2.0 * dir.x * dir.y;
-        let tmp0c = -2.285_229 * dir.z * dir.z + 0.457_045_8;
-        let tmp1b = 1.445_305_7 * dir.z;
-        let b9 = -0.590_043_6 * dir.x * sh_c1y + dir.y * sh_c1x;
-        let b10 = -0.590_043_6 * dir.x * sh_c1x - dir.y * sh_c1y;
+        let sh_c1y = 2.0f32 * dir.x * dir.y;
+        let tmp0c = -2.285_229f32 * dir.z * dir.z + 0.457_045_8;
+        let tmp1b = 1.445_305_7f32 * dir.z;
+        let b9 = -0.590_043_6f32 * dir.x * sh_c1y + dir.y * sh_c1x;
+        let b10 = -0.590_043_6f32 * dir.x * sh_c1x - dir.y * sh_c1y;
         let b11 = tmp0c * dir.y;
         let b12 = tmp0c * dir.x;
-        let b13 = dir.z * (1.865_881_7 * dir.z * dir.z - 1.119_529);
+        let b13 = dir.z * (1.865_881_7f32 * dir.z * dir.z - 1.119_529);
         let b14 = tmp1b * sh_c1y;
         let b15 = tmp1b * sh_c1x;
 

@@ -62,12 +62,11 @@ enum SplatFormat {
     Sog,
 }
 
-fn splat_format(file: &egui::DroppedFile) -> Option<SplatFormat> {
+fn splat_format(file: &(impl egui::DroppedFile + ?Sized)) -> Option<SplatFormat> {
     let ext = file
-        .path
-        .as_ref()
-        .and_then(|p| p.extension()?.to_str())
-        .or_else(|| file.name.rsplit_once('.').map(|(_, ext)| ext))
+        .path()
+        .extension()
+        .and_then(|ext| ext.to_str())
         .map(str::to_ascii_lowercase);
     match ext.as_deref() {
         Some("ply") => Some(SplatFormat::Ply),
@@ -76,7 +75,7 @@ fn splat_format(file: &egui::DroppedFile) -> Option<SplatFormat> {
     }
 }
 
-fn splat_format_ok(file: &egui::DroppedFile) -> bool {
+fn splat_format_ok(file: &(impl egui::DroppedFile + ?Sized)) -> bool {
     splat_format(file).is_some()
 }
 
@@ -115,8 +114,8 @@ impl App {
         }
     }
 
-    fn load_dropped(&self, file: egui::DroppedFile, ctx: egui::Context) {
-        let Some(format) = splat_format(&file) else {
+    fn load_dropped(&self, file: egui::DroppedFileHandle, ctx: egui::Context) {
+        let Some(format) = splat_format(file.as_ref()) else {
             return;
         };
 
@@ -142,7 +141,7 @@ impl App {
 
         #[cfg(not(target_arch = "wasm32"))]
         {
-            let Some(path) = file.path else { return };
+            let path = file.path().to_owned();
             std::thread::spawn(move || {
                 on_loaded(
                     std::fs::File::open(&path)
@@ -154,9 +153,11 @@ impl App {
 
         #[cfg(target_arch = "wasm32")]
         {
-            let Some(bytes) = file.bytes else { return };
             wasm_bindgen_futures::spawn_local(async move {
-                on_loaded(load(std::io::Cursor::new(bytes)));
+                match file.bytes_async().await {
+                    Ok(bytes) => on_loaded(load(std::io::Cursor::new(bytes))),
+                    Err(e) => on_loaded(Err(anyhow::anyhow!("Failed to read dropped file: {e}"))),
+                }
             });
         }
     }
@@ -164,10 +165,15 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
-        // Index into the dropped files and clone only the first splat — no
-        // full-vec clone, single format-detection pass.
+        // Index into the dropped files and clone only the first splat's handle —
+        // no full-vec clone, single format-detection pass.
         let dropped = ui
-            .input(|i| i.raw.dropped_files.iter().position(splat_format_ok))
+            .input(|i| {
+                i.raw
+                    .dropped_files
+                    .iter()
+                    .position(|f| splat_format_ok(f.as_ref()))
+            })
             .map(|idx| ui.input(|i| i.raw.dropped_files[idx].clone()));
         if let Some(file) = dropped {
             self.load_dropped(file, ui.ctx().clone());

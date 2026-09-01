@@ -60,8 +60,8 @@ impl GpuTensor {
         bytemuck::cast_slice(&bytes.unwrap()[0]).try_into().unwrap()
     }
 
-    pub fn as_array_arg(&self) -> ArrayArg<WgpuRuntime> {
+    pub fn as_buffer_arg(&self) -> BufferArg<WgpuRuntime> {
         // SAFETY: handle originates from a valid GPU allocation with matching dtype and shape.
-        unsafe { ArrayArg::from_raw_parts(self.handle.clone(), self.shape.iter().product()) }
+        unsafe { BufferArg::from_raw_parts(self.handle.clone(), self.shape.iter().product()) }
     }
 }

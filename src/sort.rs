@@ -16,7 +16,7 @@ const SORT_BLOCK: u32 = SORT_WG * ELEMS_PER_THREAD;
 #[cfg(target_arch = "wasm32")]
 #[cube]
 fn plane_exclusive_sum(value: u32) -> u32 {
-    let mut lds = SharedMemory::<u32>::new(SORT_WG as usize);
+    let mut lds = Shared::<[u32]>::new_slice(SORT_WG as usize);
     lds[UNIT_POS as usize] = value;
     sync_cube();
 
@@ -36,13 +36,13 @@ fn count_kernel(
     num_wgs: u32,
     shift: u32,
     num_keys: u32,
-    src: &Array<u32>,
-    counts: &mut Array<u32>,
+    src: &[u32],
+    counts: &mut [u32],
 ) {
     // Workgroup-shared histogram: each key is read exactly once, then atomically
     // bucketed into one of SORT_BINS counters — replacing a per-bin loop that
     // re-read every key SORT_BINS times.
-    let histogram = SharedMemory::<Atomic<u32>>::new(SORT_BINS as usize);
+    let histogram = Shared::<[Atomic<u32>]>::new_slice(SORT_BINS as usize);
     if UNIT_POS < SORT_BINS {
         histogram[UNIT_POS as usize].store(0u32);
     }
@@ -70,7 +70,7 @@ fn count_kernel(
 }
 
 #[cube(launch)]
-fn prefix_kernel(num_keys: u32, counts: &mut Array<u32>) {
+fn prefix_kernel(num_keys: u32, counts: &mut [u32]) {
     let num_wgs = num_keys.div_ceil(SORT_BLOCK);
 
     let mut bin_total = 0u32;
@@ -99,11 +99,11 @@ fn scatter_kernel(
     num_wgs: u32,
     shift: u32,
     num_keys: u32,
-    src: &Array<u32>,
-    values: &Array<u32>,
-    counts: &Array<u32>,
-    out: &mut Array<u32>,
-    out_values: &mut Array<u32>,
+    src: &[u32],
+    values: &[u32],
+    counts: &[u32],
+    out: &mut [u32],
+    out_values: &mut [u32],
 ) {
     // See count_kernel: the cube position must be linearized to survive
     // CubeCountSelection spreading the grid over Y/Z.
@@ -112,8 +112,8 @@ fn scatter_kernel(
         terminate!();
     }
 
-    let mut bin_offsets = SharedMemory::<u32>::new(SORT_BINS as usize);
-    let histogram = SharedMemory::<Atomic<u32>>::new(SORT_BINS as usize);
+    let mut bin_offsets = Shared::<[u32]>::new_slice(SORT_BINS as usize);
+    let histogram = Shared::<[Atomic<u32>]>::new_slice(SORT_BINS as usize);
     if UNIT_POS < SORT_BINS {
         bin_offsets[UNIT_POS as usize] = counts[(UNIT_POS * num_wgs + wg) as usize];
         histogram[UNIT_POS as usize].store(0u32);
@@ -171,8 +171,8 @@ pub fn radix_argsort(
             num_wgs,
             shift,
             n,
-            cur_keys.as_array_arg(),
-            count_buf.as_array_arg(),
+            cur_keys.as_buffer_arg(),
+            count_buf.as_buffer_arg(),
         );
 
         prefix_kernel::launch::<WgpuRuntime>(
@@ -180,7 +180,7 @@ pub fn radix_argsort(
             CubeCount::new_single(),
             cube_dim,
             n,
-            count_buf.as_array_arg(),
+            count_buf.as_buffer_arg(),
         );
 
         scatter_kernel::launch::<WgpuRuntime>(
@@ -190,11 +190,11 @@ pub fn radix_argsort(
             num_wgs,
             shift,
             n,
-            cur_keys.as_array_arg(),
-            cur_vals.as_array_arg(),
-            count_buf.as_array_arg(),
-            dst_keys.as_array_arg(),
-            dst_vals.as_array_arg(),
+            cur_keys.as_buffer_arg(),
+            cur_vals.as_buffer_arg(),
+            count_buf.as_buffer_arg(),
+            dst_keys.as_buffer_arg(),
+            dst_vals.as_buffer_arg(),
         );
 
         std::mem::swap(&mut cur_keys, &mut dst_keys);
@@ -402,10 +402,13 @@ mod radix_sort_tests {
         assert_eq!(out.len(), cap); // tensor shape unchanged; only first n are sorted
 
         // Scratch (dst pair + counts) must track n, not the tensor capacity.
+        // cubecl 0.11 may reclaim pages between the two readings, so measure
+        // growth only — a decrease still passes the budget property.
+        let grown = after.saturating_sub(before);
         assert!(
-            after - before < 256 * 1024,
+            grown < 256 * 1024,
             "scratch allocation {} bytes exceeds n-sized budget",
-            after - before
+            grown
         );
         let sv: Vec<u32> = sorted_vals.read_vec();
         let mut sorted = keys_inp[..n].to_vec();
