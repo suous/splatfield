@@ -72,22 +72,33 @@ pub fn parse_ply(mut reader: impl BufRead) -> Result<CpuSplats> {
     drop(reader);
 
     let float_data: &[f32] = bytemuck::cast_slice(&buf);
-    let mut attributes = Vec::with_capacity(vertex_count * 11);
-    let mut shs = Vec::with_capacity(vertex_count * (rest_keys.len() + 3));
     let n = rest_keys.len() / 3;
+    let vc = vertex_count;
+    // Field-major output (see CpuSplats docs): plane k of splat i at [k*vc + i].
+    let mut attributes = vec![0f32; vc * 11];
+    let mut shs = vec![0f32; vc * (rest_keys.len() + 3)];
 
-    for d in float_data.chunks(stride).take(vertex_count) {
-        let p = glam::Vec3::new(d[idx_x], d[idx_y], d[idx_z]);
+    for (i, d) in float_data.chunks(stride).take(vc).enumerate() {
         let q = glam::Quat::from_xyzw(d[idx_r1], d[idx_r2], d[idx_r3], d[idx_r0]).normalize();
-        attributes.extend_from_slice(&[
-            p.x, p.y, p.z, q.w, q.x, q.y, q.z, d[idx_s0], d[idx_s1], d[idx_s2], d[idx_op],
-        ]);
+        attributes[i] = d[idx_x];
+        attributes[vc + i] = d[idx_y];
+        attributes[2 * vc + i] = d[idx_z];
+        attributes[3 * vc + i] = q.w;
+        attributes[4 * vc + i] = q.x;
+        attributes[5 * vc + i] = q.y;
+        attributes[6 * vc + i] = q.z;
+        attributes[7 * vc + i] = d[idx_s0];
+        attributes[8 * vc + i] = d[idx_s1];
+        attributes[9 * vc + i] = d[idx_s2];
+        attributes[10 * vc + i] = d[idx_op];
 
-        shs.extend_from_slice(&[d[idx_dc0], d[idx_dc1], d[idx_dc2]]);
-        for i in 0..n {
-            shs.push(d[rest_keys[i]]);
-            shs.push(d[rest_keys[n + i]]);
-            shs.push(d[rest_keys[2 * n + i]]);
+        shs[i] = d[idx_dc0];
+        shs[vc + i] = d[idx_dc1];
+        shs[2 * vc + i] = d[idx_dc2];
+        for j in 0..n {
+            shs[((j + 1) * 3) * vc + i] = d[rest_keys[j]];
+            shs[((j + 1) * 3 + 1) * vc + i] = d[rest_keys[n + j]];
+            shs[((j + 1) * 3 + 2) * vc + i] = d[rest_keys[2 * n + j]];
         }
     }
 
@@ -143,23 +154,25 @@ mod tests {
             f32::from_le_bytes(bytes[start..start + 4].try_into().unwrap())
         };
 
-        // Attribute layout: x, y, z, q(wxyz), scale, opacity.
-        assert_eq!(cpu.attributes[0], file(0, 0));
-        assert_eq!(cpu.attributes[1], file(0, 1));
-        assert_eq!(cpu.attributes[2], file(0, 2));
-        assert_eq!(cpu.attributes[7], file(0, 7));
-        assert_eq!(cpu.attributes[8], file(0, 8));
-        assert_eq!(cpu.attributes[9], file(0, 9));
-        assert_eq!(cpu.attributes[10], file(0, 10));
+        // Field-major attribute planes: [x | y | z | qw.. | sx.. | opacity],
+        // plane k of splat i at attributes[k * n + i] (n = 3 here).
+        assert_eq!(cpu.attributes[0], file(0, 0)); // x, splat 0
+        assert_eq!(cpu.attributes[3], file(0, 1)); // y, splat 0
+        assert_eq!(cpu.attributes[6], file(0, 2)); // z, splat 0
+        assert_eq!(cpu.attributes[7 * 3], file(0, 7)); // scale_0, splat 0
+        assert_eq!(cpu.attributes[8 * 3], file(0, 8)); // scale_1, splat 0
+        assert_eq!(cpu.attributes[9 * 3], file(0, 9)); // scale_2, splat 0
+        assert_eq!(cpu.attributes[10 * 3], file(0, 10)); // opacity, splat 0
 
-        // SH is channel-interleaved: [dc_r, dc_g, dc_b, rest_r, rest_g, rest_b].
-        // File property order rest_0, rest_2, rest_1 is sorted to rest_0, rest_1, rest_2,
-        // i.e. file indices 14, 16, 15 feed rest slots R, G, B in that order.
+        // SH planes: dc channel c at c * n + i, rest coefficient 1 channel c
+        // at (3 + c) * n + i. File property order rest_0, rest_2, rest_1 is
+        // sorted to rest_0, rest_1, rest_2, i.e. file indices 14, 16, 15 feed
+        // rest planes R, G, B in that order.
         let sorted_rest = [14usize, 16, 15];
         for i in 0..3usize {
             for (c, &rest) in sorted_rest.iter().enumerate() {
-                assert_eq!(cpu.sh_coeffs[i * 6 + c], file(i, 11 + c));
-                assert_eq!(cpu.sh_coeffs[i * 6 + 3 + c], file(i, rest));
+                assert_eq!(cpu.sh_coeffs[c * 3 + i], file(i, 11 + c));
+                assert_eq!(cpu.sh_coeffs[(3 + c) * 3 + i], file(i, rest));
             }
         }
     }

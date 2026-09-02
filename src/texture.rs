@@ -36,16 +36,14 @@ impl GpuTexture {
             .is_none_or(|(t, _)| t.width() != size.x || t.height() != size.y);
 
         if needs_resize {
-            self.texture = Some(self.ensure_texture(size));
+            self.recreate_texture(size);
         }
 
-        let Some((texture, _)) = &self.texture else {
-            unreachable!("texture is always set by the resize branch");
-        };
+        let (texture, _) = self.texture.as_ref().expect("set by recreate_texture");
         self.copy_to_texture(img, texture);
     }
 
-    fn ensure_texture(&mut self, size: glam::UVec2) -> (wgpu::Texture, TextureId) {
+    fn recreate_texture(&mut self, size: glam::UVec2) {
         let texture = self.device.create_texture(&wgpu::TextureDescriptor {
             label: None,
             size: wgpu::Extent3d {
@@ -77,7 +75,7 @@ impl GpuTexture {
             None => renderer.register_native_texture(&self.device, &view, wgpu::FilterMode::Linear),
         };
 
-        (texture, id)
+        self.texture = Some((texture, id));
     }
 
     fn copy_to_texture(&self, img: &GpuTensor, texture: &wgpu::Texture) {

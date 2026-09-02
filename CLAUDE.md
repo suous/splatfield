@@ -34,8 +34,8 @@ GPU-accelerated Gaussian Splatting renderer. egui GUI loads PLY files via drag-a
 
 | Buffer | Shape | Contents |
 |---|---|---|
-| `attributes` | `[n, 11]` | `x, y, z, qw, qx, qy, qz, sx, sy, sz, opacity` |
-| `sh_coeffs` | `[n, channels, 3]` | interleaved RGB spherical harmonics |
+| `attributes` | `[n, 11]` | field-major planes `x, y, z, qw, qx, qy, qz, sx, sy, sz, opacity` — plane k of splat i at `k * n + i` (warp-coalesced reads) |
+| `sh_coeffs` | `[n, channels, 3]` | field-major SH: coefficient k channel c of splat i at `(k * 3 + c) * n + i` |
 | `projected` | `[n, 9]` | `mean2d_xy, conic_xyz, rgb, opacity` |
 | output | `[h, w]` | packed `u32` RGBA8 |
 

@@ -3,6 +3,12 @@ use cubecl::server::Handle;
 use cubecl::wgpu::WgpuRuntime;
 use cubecl::zspace::Shape;
 
+/// Serializes GPU-touching tests: concurrent clients share one physical GPU,
+/// and the memory pressure makes pool-reclaim–sensitive assertions (memory
+/// accounting) flaky. CPU-only tests don't take this lock.
+#[cfg(test)]
+pub(crate) static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[derive(Clone)]
 pub struct GpuTensor {
     pub client: ComputeClient<WgpuRuntime>,

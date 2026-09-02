@@ -49,6 +49,7 @@ fn decode_rgba<R: Read + Seek>(
     let mut file = zip
         .by_name(name)
         .with_context(|| format!("missing {name}"))?;
+    // Zip entries aren't Seek but the WebP decoder needs it — buffer the entry.
     let mut buf = Vec::with_capacity(file.size() as usize);
     file.read_to_end(&mut buf)?;
     let img = image::load_from_memory_with_format(&buf, image::ImageFormat::WebP)
@@ -102,36 +103,34 @@ pub fn parse_sog(reader: impl Read + Seek) -> Result<CpuSplats> {
     let mins = glam::Vec3::from_array(meta.means.mins);
     let spans = glam::Vec3::from_array(meta.means.maxs) - mins;
 
-    for ((attr, lc), hc) in attributes
-        .chunks_exact_mut(11)
-        .zip(lo.chunks_exact(4))
-        .zip(hi.chunks_exact(4))
-    {
-        let p = glam::Vec3::new(
-            inv_log(mins.x + spans.x * u16::from_le_bytes([lc[0], hc[0]]) as f32 / u16::MAX as f32),
-            inv_log(mins.y + spans.y * u16::from_le_bytes([lc[1], hc[1]]) as f32 / u16::MAX as f32),
-            inv_log(mins.z + spans.z * u16::from_le_bytes([lc[2], hc[2]]) as f32 / u16::MAX as f32),
-        );
-
-        attr[0..3].copy_from_slice(&p.to_array());
+    for (i, (lc, hc)) in lo.chunks_exact(4).zip(hi.chunks_exact(4)).enumerate().take(n) {
+        // Field-major output (see CpuSplats docs): plane k of splat i at [k*n + i].
+        attributes[i] =
+            inv_log(mins.x + spans.x * u16::from_le_bytes([lc[0], hc[0]]) as f32 / u16::MAX as f32);
+        attributes[n + i] =
+            inv_log(mins.y + spans.y * u16::from_le_bytes([lc[1], hc[1]]) as f32 / u16::MAX as f32);
+        attributes[2 * n + i] =
+            inv_log(mins.z + spans.z * u16::from_le_bytes([lc[2], hc[2]]) as f32 / u16::MAX as f32);
     }
 
     let (sl, _) = decode_rgba(&mut zip, &meta.scales.files[0], n)?;
     let scale_cb = &meta.scales.codebook;
-    for (attr, chunk) in attributes.chunks_exact_mut(11).zip(sl.chunks_exact(4)) {
-        for i in 0..3 {
-            attr[7 + i] = scale_cb[chunk[i] as usize];
+    for (i, chunk) in sl.chunks_exact(4).enumerate().take(n) {
+        for k in 0..3 {
+            attributes[(7 + k) * n + i] = scale_cb[chunk[k] as usize];
         }
     }
 
     let (qr, _) = decode_rgba(&mut zip, &meta.quats.files[0], n)?;
-    for (attr, chunk) in attributes.chunks_exact_mut(11).zip(qr.chunks_exact(4)) {
+    for (i, chunk) in qr.chunks_exact(4).enumerate().take(n) {
         let tag = chunk[3];
         let q = match tag {
             252..=255 => unpack_quat(chunk[0], chunk[1], chunk[2], tag),
             _ => [1.0, 0.0, 0.0, 0.0],
         };
-        attr[3..7].copy_from_slice(&q);
+        for k in 0..4 {
+            attributes[(3 + k) * n + i] = q[k];
+        }
     }
 
     let (c0, _) = decode_rgba(&mut zip, &meta.sh0.files[0], n)?;
@@ -139,15 +138,11 @@ pub fn parse_sog(reader: impl Read + Seek) -> Result<CpuSplats> {
     let mut sh_coeffs = vec![0f32; n * sh_per_ch * 3];
     let sh0_cb = &meta.sh0.codebook;
 
-    for ((attr, chunk), sh_chunk) in attributes
-        .chunks_exact_mut(11)
-        .zip(c0.chunks_exact(4))
-        .zip(sh_coeffs.chunks_exact_mut(sh_per_ch * 3))
-    {
-        for i in 0..3 {
-            sh_chunk[i] = sh0_cb[chunk[i] as usize];
+    for (i, chunk) in c0.chunks_exact(4).enumerate().take(n) {
+        for k in 0..3 {
+            sh_coeffs[k * n + i] = sh0_cb[chunk[k] as usize];
         }
-        attr[10] = logit(chunk[3] as f32 / u8::MAX as f32);
+        attributes[10 * n + i] = logit(chunk[3] as f32 / u8::MAX as f32);
     }
 
     if let Some(ref sh_n) = meta.sh_n {
@@ -159,10 +154,7 @@ pub fn parse_sog(reader: impl Read + Seek) -> Result<CpuSplats> {
         let codebook = &sh_n.codebook;
         let palette_count = (cw / sh_coeffs_per_ch) * (centroids.len() / 4 / cw);
 
-        for (label_chunk, sh_chunk) in labels
-            .chunks_exact(4)
-            .zip(sh_coeffs.chunks_exact_mut(sh_per_ch * 3))
-        {
+        for (i, label_chunk) in labels.chunks_exact(4).enumerate().take(n) {
             let label = label_chunk[0] as usize | (label_chunk[1] as usize) << 8;
             if label >= palette_count {
                 continue;
@@ -171,9 +163,8 @@ pub fn parse_sog(reader: impl Read + Seek) -> Result<CpuSplats> {
 
             for j in 0..sh_coeffs_per_ch {
                 let p = (base_y * cw + base_x + j) * 4;
-                let c_idx = (j + 1) * 3;
                 for k in 0..3 {
-                    sh_chunk[c_idx + k] = codebook[centroids[p + k] as usize];
+                    sh_coeffs[((j + 1) * 3 + k) * n + i] = codebook[centroids[p + k] as usize];
                 }
             }
         }

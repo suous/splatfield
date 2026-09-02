@@ -7,10 +7,14 @@ use cubecl::calculate_cube_count_elemwise;
 use cubecl::prelude::*;
 use cubecl::wgpu::WgpuRuntime;
 
-const SORT_WG: u32 = 32;
+const SORT_WG: u32 = 128;
 const SORT_BINS: u32 = 16;
-const ELEMS_PER_THREAD: u32 = 32;
+const ELEMS_PER_THREAD: u32 = 8;
 const SORT_BLOCK: u32 = SORT_WG * ELEMS_PER_THREAD;
+// scatter scan: SORT_WG lanes are scanned by SORT_BINS x SCAN_GROUPS threads
+// (group sums -> group offsets -> apply), shortening the serial chain.
+const SCAN_GROUPS: u32 = 8;
+const SCAN_CHUNK: u32 = SORT_WG / SCAN_GROUPS;
 
 // Shared memory fallback for WASM — cubecl's built-in plane ops generate
 // subgroup ops which aren't available on WebGPU. Native uses the built-in.
@@ -89,6 +93,75 @@ fn prefix_kernel(num_keys: u32, counts: &mut [u32]) {
     }
 }
 
+/// Parallel variant of prefix_kernel for large grids: each bin's
+/// per-workgroup counts are scanned by SCAN_PARTS threads (chunk totals ->
+/// chunk offsets -> apply), shortening the serial chain 32x.
+const SCAN_PARTS: u32 = 32;
+const PREFIX_WG: u32 = SORT_BINS * SCAN_PARTS;
+
+#[cube(launch)]
+fn prefix_kernel_parallel(num_keys: u32, counts: &mut [u32]) {
+    let num_wgs = num_keys.div_ceil(SORT_BLOCK);
+    let bin = UNIT_POS / SCAN_PARTS;
+    let part = UNIT_POS % SCAN_PARTS;
+    let mut partials = Shared::<[u32]>::new_slice(PREFIX_WG as usize);
+    let mut totals = Shared::<[u32]>::new_slice(SORT_BINS as usize);
+
+    let chunk = num_wgs.div_ceil(SCAN_PARTS);
+    let lo = part * chunk;
+    let hi = (lo + chunk).min(num_wgs);
+
+    let mut sum = 0u32;
+    for w in lo..hi {
+        sum += counts[(bin * num_wgs + w) as usize];
+    }
+    partials[UNIT_POS as usize] = sum;
+    if UNIT_POS < SORT_BINS {
+        totals[UNIT_POS as usize] = 0u32;
+    }
+    sync_cube();
+
+    // Per-bin totals, then exclusive bin offsets (single thread, 16 bins).
+    if UNIT_POS < SORT_BINS {
+        let mut total = 0u32;
+        for p in 0..SCAN_PARTS {
+            total += partials[(UNIT_POS * SCAN_PARTS + p) as usize];
+        }
+        totals[UNIT_POS as usize] = total;
+    }
+    sync_cube();
+    if UNIT_POS == 0 {
+        let mut running = 0u32;
+        for b in 0..SORT_BINS {
+            let t = totals[b as usize];
+            totals[b as usize] = running;
+            running += t;
+        }
+    }
+    sync_cube();
+
+    // Exclusive scan of chunk totals within each bin, offset by the bin base.
+    if UNIT_POS < SORT_BINS {
+        let mut running = totals[UNIT_POS as usize];
+        for p in 0..SCAN_PARTS {
+            let cell = (UNIT_POS * SCAN_PARTS + p) as usize;
+            let c = partials[cell];
+            partials[cell] = running;
+            running += c;
+        }
+    }
+    sync_cube();
+
+    // Apply: rewrite each per-workgroup count as its global exclusive offset.
+    let mut running = partials[UNIT_POS as usize];
+    for w in lo..hi {
+        let idx = (bin * num_wgs + w) as usize;
+        let c = counts[idx];
+        counts[idx] = running;
+        running += c;
+    }
+}
+
 #[cube(launch)]
 fn scatter_kernel(
     num_wgs: u32,
@@ -107,23 +180,72 @@ fn scatter_kernel(
         terminate!();
     }
 
-    let mut bin_offsets = Shared::<[u32]>::new_slice(SORT_BINS as usize);
-    let histogram = Shared::<[Atomic<u32>]>::new_slice(SORT_BINS as usize);
-    if UNIT_POS < SORT_BINS {
-        bin_offsets[UNIT_POS as usize] = counts[(UNIT_POS * num_wgs + wg) as usize];
-        histogram[UNIT_POS as usize].store(0u32);
+    // Stable block scatter: each thread owns a contiguous ELEMS_PER_THREAD
+    // chunk and a PRIVATE column of the [bin][lane] histogram, so ranking
+    // needs no atomics and equal keys keep their relative order. The tile
+    // sort of the render pipeline relies on this stability to preserve depth
+    // order within a tile.
+    let mut hist = Shared::<[u32]>::new_slice((SORT_BINS * SORT_WG) as usize);
+    for i in 0..SORT_BINS {
+        hist[(UNIT_POS + i * SORT_WG) as usize] = 0u32;
     }
     sync_cube();
 
-    let base = SORT_BLOCK * wg + UNIT_POS;
+    let base = SORT_BLOCK * wg + UNIT_POS * ELEMS_PER_THREAD;
     for e in 0..ELEMS_PER_THREAD {
-        let idx = base + e * SORT_WG;
+        let idx = base + e;
+        if idx < num_keys {
+            let bin = (src[idx as usize] >> shift) & 0xf;
+            hist[(bin * SORT_WG + UNIT_POS) as usize] += 1u32;
+        }
+    }
+    sync_cube();
+
+    // One thread per (bin, lane-group): group sums of the private lane
+    // counts. Lane order matches the chunk layout (lane-major), which is what
+    // makes the scatter stable across the block.
+    let mut partials = Shared::<[u32]>::new_slice((SORT_BINS * SCAN_GROUPS) as usize);
+    let bin = UNIT_POS % SORT_BINS;
+    let group = UNIT_POS / SORT_BINS;
+    let lane0 = group * SCAN_CHUNK;
+    let mut sum = 0u32;
+    for l in lane0..lane0 + SCAN_CHUNK {
+        sum += hist[(bin * SORT_WG + l) as usize];
+    }
+    partials[UNIT_POS as usize] = sum;
+    sync_cube();
+
+    // One thread per bin: group sums -> global exclusive offsets.
+    if UNIT_POS < SORT_BINS {
+        let mut running = counts[(UNIT_POS * num_wgs + wg) as usize];
+        for g in 0..SCAN_GROUPS {
+            let cell = (g * SORT_BINS + UNIT_POS) as usize;
+            let c = partials[cell];
+            partials[cell] = running;
+            running += c;
+        }
+    }
+    sync_cube();
+
+    // Apply the offsets to each lane's private count.
+    let mut running = partials[UNIT_POS as usize];
+    for l in lane0..lane0 + SCAN_CHUNK {
+        let cell = (bin * SORT_WG + l) as usize;
+        let c = hist[cell];
+        hist[cell] = running;
+        running += c;
+    }
+    sync_cube();
+
+    for e in 0..ELEMS_PER_THREAD {
+        let idx = base + e;
         if idx < num_keys {
             let key = src[idx as usize];
             let val = values[idx as usize];
             let bin = (key >> shift) & 0xf;
-            let rank = histogram[bin as usize].fetch_add(1u32);
-            let pos = bin_offsets[bin as usize] + rank;
+            let cell = (bin * SORT_WG + UNIT_POS) as usize;
+            let pos = hist[cell];
+            hist[cell] = pos + 1u32;
             out[pos as usize] = key;
             out_values[pos as usize] = val;
         }
@@ -135,6 +257,28 @@ pub(crate) fn bits_for(max_exclusive: u32) -> u32 {
     u32::BITS - max_exclusive.saturating_sub(1).leading_zeros()
 }
 
+/// Reusable ping-pong buffers for [`radix_argsort_with`], sized for a maximum
+/// element count so repeated sorts allocate nothing. Two sorts whose output
+/// feeds the next sort's input must use *separate* scratch instances: after an
+/// odd pass count the returned tensors alias the scratch.
+#[derive(Debug)]
+pub struct RadixScratch {
+    count_buf: GpuTensor,
+    dst_keys: GpuTensor,
+    dst_vals: GpuTensor,
+}
+
+impl RadixScratch {
+    pub fn new(client: &ComputeClient<WgpuRuntime>, max_elems: usize) -> Self {
+        let max_wgs = (max_elems as u32).div_ceil(SORT_BLOCK);
+        Self {
+            count_buf: GpuTensor::empty(client, [(max_wgs * SORT_BINS) as usize]),
+            dst_keys: GpuTensor::empty(client, [max_elems]),
+            dst_vals: GpuTensor::empty(client, [max_elems]),
+        }
+    }
+}
+
 pub fn radix_argsort(
     keys: GpuTensor,
     vals: GpuTensor,
@@ -144,7 +288,25 @@ pub fn radix_argsort(
     if n <= 1 || bits == 0 {
         return (keys, vals);
     }
+    let scratch = RadixScratch::new(&keys.client, n as usize);
+    radix_argsort_with(keys, vals, n, bits, &scratch)
+}
+
+pub fn radix_argsort_with(
+    keys: GpuTensor,
+    vals: GpuTensor,
+    n: u32,
+    bits: u32,
+    scratch: &RadixScratch,
+) -> (GpuTensor, GpuTensor) {
+    if n <= 1 || bits == 0 {
+        return (keys, vals);
+    }
     let client = keys.client.clone();
+    debug_assert!(
+        (n as usize) <= scratch.dst_keys.shape[0],
+        "radix scratch undersized for {n} elements"
+    );
     // The launched grid may exceed the hardware X limit and get spread over
     // Y/Z (CubeCountSelection), so kernels linearize the workgroup id.
     let num_wgs = n.div_ceil(SORT_BLOCK);
@@ -152,9 +314,9 @@ pub fn radix_argsort(
         calculate_cube_count_elemwise(&client, n as usize, CubeDim::new_1d(SORT_BLOCK));
     let cube_dim = CubeDim::new_1d(SORT_WG);
 
-    let count_buf = GpuTensor::empty(&client, [(num_wgs * SORT_BINS) as usize]);
-    let mut dst_keys = GpuTensor::empty(&client, [n as usize]);
-    let mut dst_vals = GpuTensor::empty(&client, [n as usize]);
+    let count_buf = &scratch.count_buf;
+    let mut dst_keys = scratch.dst_keys.clone();
+    let mut dst_vals = scratch.dst_vals.clone();
 
     let mut cur_keys = keys;
     let mut cur_vals = vals;
@@ -171,13 +333,25 @@ pub fn radix_argsort(
             count_buf.as_buffer_arg(),
         );
 
-        prefix_kernel::launch::<WgpuRuntime>(
-            &client,
-            CubeCount::new_single(),
-            cube_dim,
-            n,
-            count_buf.as_buffer_arg(),
-        );
+        // Serial prefix is cheaper for tiny grids; the parallel variant
+        // wins once num_wgs outgrows one scan chunk.
+        if num_wgs < SCAN_PARTS {
+            prefix_kernel::launch::<WgpuRuntime>(
+                &client,
+                CubeCount::new_single(),
+                cube_dim,
+                n,
+                count_buf.as_buffer_arg(),
+            );
+        } else {
+            prefix_kernel_parallel::launch::<WgpuRuntime>(
+                &client,
+                CubeCount::new_single(),
+                CubeDim::new_1d(PREFIX_WG),
+                n,
+                count_buf.as_buffer_arg(),
+            );
+        }
 
         scatter_kernel::launch::<WgpuRuntime>(
             &client,
@@ -291,6 +465,7 @@ mod radix_sort_tests {
     fn test_sorting_large() {
         const NUM_ELEMENTS: usize = 500_000;
 
+        let _gpu = crate::tensor::GPU_TEST_LOCK.lock().unwrap();
         let client = WgpuRuntime::client(&WgpuDevice::default());
         let mut rng = rand::rng();
 
@@ -341,11 +516,24 @@ mod radix_sort_tests {
         let keys = GpuTensor::from(&client, [cap], &keys_inp[..]);
         let vals = GpuTensor::from(&client, [cap], &vals_inp[..]);
 
+        // Warm every buffer class the measurement window will touch (sort
+        // scratch, readback staging), then quiesce: other tests' deferred
+        // frees and this client's page setup must not leak into the delta.
+        {
+            let (sk, sv) = radix_argsort(keys.clone(), vals.clone(), n as u32, 32);
+            let _ = sk.read_vec::<u32>();
+            let _ = sv.read_vec::<u32>();
+        }
+        pollster::block_on(client.sync()).unwrap();
+
         let before = client.memory_usage().unwrap().bytes_in_use;
         let (sorted_keys, sorted_vals) = radix_argsort(keys, vals, n as u32, 32);
         let out: Vec<u32> = sorted_keys.read_vec(); // forces completion before measuring
         let after = client.memory_usage().unwrap().bytes_in_use;
-        assert_eq!(out.len(), cap); // tensor shape unchanged; only first n are sorted
+        // An even pass count ends on the original (capacity-sized) tensors;
+        // an odd count ends on the n-sized ping-pong scratch. Either is a
+        // valid result — only the first n entries are read downstream.
+        assert!(out.len() == cap || out.len() == n);
 
         // Scratch (dst pair + counts) must track n, not the tensor capacity.
         // cubecl 0.11 may reclaim pages between the two readings, so measure

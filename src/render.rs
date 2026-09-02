@@ -1,6 +1,6 @@
 use crate::camera::Camera;
 use crate::helpers;
-use crate::sort::{bits_for, radix_argsort};
+use crate::sort::{RadixScratch, bits_for, radix_argsort_with};
 use crate::tensor::GpuTensor;
 use cubecl::calculate_cube_count_elemwise;
 use cubecl::prelude::*;
@@ -9,10 +9,18 @@ use cubecl::wgpu::WgpuRuntime;
 // Safety cap: 2 * max_tiles_per_dim * max_splats
 const INTERSECTS_UPPER_BOUND: usize = 2 * 512 * 65535;
 
-// z ∈ (0.1, 1e4) keeps the top 4 mantissa-bits constant; dropping them saves a radix pass.
-const DEPTH_KEY_BITS: u32 = 28;
+// z ∈ (0.1, 1e4) keeps the top 4 mantissa bits of the f32 bit pattern constant;
+// dropping 8 low mantissa bits (relative granularity 2^-15) saves two radix
+// passes vs full keys. Ties within the band blend in arbitrary order — the
+// same treatment equal keys already get.
+const DEPTH_KEY_BITS: u32 = 24;
 
-/// Host-side splat payload produced by the PLY/SOG parsers, uploaded once by `Splats::new`.
+/// Host-side splat payload produced by the PLY/SOG parsers, uploaded once by
+/// `Splats::new`. Both arrays are FIELD-MAJOR (plane-per-field) so the
+/// projection kernel's per-thread reads coalesce across a warp:
+/// attribute plane k of splat i is `attributes[k * n + i]` with plane order
+/// `x, y, z, qw, qx, qy, qz, sx, sy, sz, opacity`; SH coefficient k channel c
+/// of splat i is `sh_coeffs[(k * 3 + c) * n + i]`.
 #[derive(Debug, Clone, Default)]
 pub struct CpuSplats {
     pub attributes: Vec<f32>,
@@ -31,6 +39,12 @@ pub struct RenderScratch {
     gaussian_ids: GpuTensor,
     tile_ranges: GpuTensor,
     bitmap: GpuTensor,
+    // Ping-pong scratch for the three sorts. The gid/tile sorts must not
+    // share one: an odd pass count returns buffers aliasing the scratch,
+    // and the tile sort reads the gid sort's output.
+    sort_depth: RadixScratch,
+    sort_gid: RadixScratch,
+    sort_tile: RadixScratch,
     total: usize,
     img_size: glam::UVec2,
     num_tiles: usize,
@@ -52,6 +66,9 @@ impl RenderScratch {
             gaussian_ids: GpuTensor::empty(client, [isect_capacity]),
             tile_ranges: GpuTensor::empty(client, [num_tiles * 2]),
             bitmap: GpuTensor::empty(client, [img_size.y as usize, row_stride as usize]),
+            sort_depth: RadixScratch::new(client, total),
+            sort_gid: RadixScratch::new(client, isect_capacity),
+            sort_tile: RadixScratch::new(client, isect_capacity),
             total,
             img_size,
             num_tiles,
@@ -83,8 +100,8 @@ impl Splats {
 
         let mut min = glam::Vec3::splat(f32::MAX);
         let mut max = glam::Vec3::splat(f32::MIN);
-        for attr in attributes.chunks_exact(11) {
-            let p = glam::Vec3::from_slice(&attr[..3]);
+        for i in 0..n {
+            let p = glam::vec3(attributes[i], attributes[n + i], attributes[2 * n + i]);
             min = min.min(p);
             max = max.max(p);
         }
@@ -181,13 +198,16 @@ impl Splats {
                 scratch.isect_capacity = new_cap;
                 scratch.tile_ids = GpuTensor::empty(client, [new_cap]);
                 scratch.gaussian_ids = GpuTensor::empty(client, [new_cap]);
+                scratch.sort_gid = RadixScratch::new(client, new_cap);
+                scratch.sort_tile = RadixScratch::new(client, new_cap);
             }
         }
-        let (inv_perm, depth_order) = radix_argsort(
+        let (inv_perm, depth_order) = radix_argsort_with(
             scratch.depth_keys.clone(),
             scratch.depth_order.clone(),
             num_visible,
             DEPTH_KEY_BITS,
+            &scratch.sort_depth,
         );
 
         invert_permutation::launch::<WgpuRuntime>(
@@ -216,11 +236,14 @@ impl Splats {
             num_isects,
         );
 
-        // Two radix sorts equivalent to the paper's single composite key sort — the sort itself is not stable within equal keys, which is harmless for alpha blending.
+        // Two radix sorts equivalent to the paper's single composite key sort;
+        // the sort is stable, so the tile pass preserves depth order in-tile.
         let gid_bits = bits_for(num_visible);
-        let (gaussian_ids, tile_ids) = radix_argsort(gaussian_ids, tile_ids, num_isects, gid_bits);
+        let (gaussian_ids, tile_ids) =
+            radix_argsort_with(gaussian_ids, tile_ids, num_isects, gid_bits, &scratch.sort_gid);
         let tile_bits = bits_for(num_tiles as u32);
-        let (tile_ids, gaussian_ids) = radix_argsort(tile_ids, gaussian_ids, num_isects, tile_bits);
+        let (tile_ids, gaussian_ids) =
+            radix_argsort_with(tile_ids, gaussian_ids, num_isects, tile_bits, &scratch.sort_tile);
 
         build_tile_ranges::launch::<WgpuRuntime>(
             client,
@@ -309,50 +332,90 @@ fn rasterize_kernel(
     let px = ABSOLUTE_POS_X;
     let py = ABSOLUTE_POS_Y;
     let tile_id = CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X;
-    if px < img_size_x && py < img_size_y {
-        let pixel_x = px as f32 + 0.5f32;
-        let pixel_y = py as f32 + 0.5f32;
-        let range_start = tile_ranges[tile_id as usize * 2];
-        let range_end = tile_ranges[tile_id as usize * 2 + 1];
+    let in_bounds = px < img_size_x && py < img_size_y;
 
-        let mut transmittance = 1.0f32;
-        let mut pix_r = 0.0;
-        let mut pix_g = 0.0;
-        let mut pix_b = 0.0;
+    let range_start = tile_ranges[tile_id as usize * 2];
+    let range_end = tile_ranges[tile_id as usize * 2 + 1];
 
-        for i in range_start..range_end {
-            let depth_idx = gaussian_ids_by_tile[i as usize];
+    // Stage one workgroup-sized chunk of isects in shared memory: each isect's
+    // 36-byte row is fetched from global memory once per tile instead of once
+    // per pixel. All threads run the chunk loop uniformly so sync_cube never
+    // diverges; converged threads just stop accumulating.
+    let mut stage = Shared::<[f32]>::new_slice(helpers::TILE_SIZE as usize * 9);
+    let done_count = Shared::<[Atomic<u32>]>::new_slice(1usize);
+    if UNIT_POS == 0 {
+        done_count[0usize].store(0u32);
+    }
+    if !in_bounds {
+        done_count[0usize].fetch_add(1u32);
+    }
+
+    let mut transmittance = 1.0f32;
+    let mut pix_r = 0.0;
+    let mut pix_g = 0.0;
+    let mut pix_b = 0.0;
+    let mut done = !in_bounds;
+
+    let pixel_x = px as f32 + 0.5f32;
+    let pixel_y = py as f32 + 0.5f32;
+
+    let num_chunks = (range_end - range_start).div_ceil(helpers::TILE_SIZE);
+    for c in 0..num_chunks {
+        let chunk = range_start + c * helpers::TILE_SIZE;
+        let idx = chunk + UNIT_POS;
+        sync_cube();
+        if idx < range_end {
+            let depth_idx = gaussian_ids_by_tile[idx as usize];
             // Projected layout: [mean2d_x, mean2d_y, conic_x, conic_y, conic_z, r, g, b, opacity]
-            let base = (depth_order[depth_idx as usize] * 9u32) as usize;
+            let src = (depth_order[depth_idx as usize] * 9u32) as usize;
+            let dst = UNIT_POS as usize * 9;
+            for k in 0..9 {
+                stage[dst + k] = projected[src + k];
+            }
+        }
+        sync_cube();
 
-            let mean_x = projected[base];
-            let mean_y = projected[base + 1];
-            let conic = helpers::Vec3F {
-                x: projected[base + 2],
-                y: projected[base + 3],
-                z: projected[base + 4],
-            };
-            let color_r = projected[base + 5];
-            let color_g = projected[base + 6];
-            let color_b = projected[base + 7];
-            let color_a = projected[base + 8];
+        // Whole tile converged: every remaining chunk would be a no-op.
+        if done_count[0usize].load() == helpers::TILE_SIZE {
+            break;
+        }
 
-            let power = gaussian_power(conic, mean_x - pixel_x, mean_y - pixel_y);
-            let alpha = (color_a * (-power).exp()).min(0.999);
+        let n_in_chunk = (range_end - chunk).min(helpers::TILE_SIZE);
+        for j in 0..n_in_chunk {
+            if !done {
+                let base = j as usize * 9;
+                let mean_x = stage[base];
+                let mean_y = stage[base + 1];
+                let conic = helpers::Vec3F {
+                    x: stage[base + 2],
+                    y: stage[base + 3],
+                    z: stage[base + 4],
+                };
+                let color_r = stage[base + 5];
+                let color_g = stage[base + 6];
+                let color_b = stage[base + 7];
+                let color_a = stage[base + 8];
 
-            if alpha >= 1.0f32 / u8::MAX as f32 {
-                let vis = alpha * transmittance;
-                pix_r += color_r * vis;
-                pix_g += color_g * vis;
-                pix_b += color_b * vis;
-                transmittance *= 1.0f32 - alpha;
-                // Remaining weight < 1 LSB of the final 8-bit channels.
-                if transmittance < 1.0f32 / 255.0f32 {
-                    break;
+                let power = gaussian_power(conic, mean_x - pixel_x, mean_y - pixel_y);
+                let alpha = (color_a * (-power).exp()).min(0.999);
+
+                if alpha >= 1.0f32 / u8::MAX as f32 {
+                    let vis = alpha * transmittance;
+                    pix_r += color_r * vis;
+                    pix_g += color_g * vis;
+                    pix_b += color_b * vis;
+                    transmittance *= 1.0f32 - alpha;
+                    // Remaining weight < 1 LSB of the final 8-bit channels.
+                    if transmittance < 1.0f32 / 255.0f32 {
+                        done = true;
+                        done_count[0usize].fetch_add(1u32);
+                    }
                 }
             }
         }
+    }
 
+    if in_bounds {
         let r = helpers::quantize_u8(pix_r);
         let g = helpers::quantize_u8(pix_g);
         let b = helpers::quantize_u8(pix_b);
@@ -374,12 +437,19 @@ mod tests {
 
     #[test]
     fn test_render_stacked_opaque_splats() {
+        let _gpu = crate::tensor::GPU_TEST_LOCK.lock().unwrap();
         let client = WgpuRuntime::client(&WgpuDevice::default());
         // Five opaque splats stacked in depth at the same XY, nearest at z = 1.0.
-        let mut attributes = Vec::new();
-        for i in 0..5u32 {
-            let z = 1.0 + i as f32 * 0.5;
-            attributes.extend_from_slice(&[0.0, 0.0, z, 1.0, 0.0, 0.0, 0.0, -2.0, -2.0, -2.0, 8.0]);
+        // Field-major attribute planes: [x | y | z | qw | qx | qy | qz | sx | sy | sz | opacity].
+        let n = 5usize;
+        let mut attributes = vec![0f32; n * 11];
+        for i in 0..n {
+            attributes[2 * n + i] = 1.0 + i as f32 * 0.5; // z
+            attributes[3 * n + i] = 1.0; // qw
+            attributes[7 * n + i] = -2.0; // sx
+            attributes[8 * n + i] = -2.0; // sy
+            attributes[9 * n + i] = -2.0; // sz
+            attributes[10 * n + i] = 8.0; // opacity
         }
         let sh = vec![0.0; 5 * 3];
         let splats = Splats::new(attributes, sh, &client);
@@ -418,6 +488,7 @@ mod tests {
 
     #[test]
     fn test_render_reuses_scratch() {
+        let _gpu = crate::tensor::GPU_TEST_LOCK.lock().unwrap();
         let client = WgpuRuntime::client(&WgpuDevice::default());
         let attributes: Vec<f32> = (0..50 * 11)
             .map(|i| (i as f32 * 0.13).sin() * 0.5)
@@ -439,6 +510,7 @@ mod tests {
 
     #[test]
     fn test_scratch_stops_allocating_after_first_frame() {
+        let _gpu = crate::tensor::GPU_TEST_LOCK.lock().unwrap();
         let client = WgpuRuntime::client(&WgpuDevice::default());
         let attributes: Vec<f32> = (0..100 * 11)
             .map(|i| (i as f32 * 0.07).sin() * 0.4)
@@ -463,6 +535,7 @@ mod tests {
 
     #[test]
     fn test_tile_ranges_zeroed_for_empty_tiles() {
+        let _gpu = crate::tensor::GPU_TEST_LOCK.lock().unwrap();
         let client = WgpuRuntime::client(&WgpuDevice::default());
         let num_tiles = 8usize;
         // Sorted tile ids: tiles 0, 1, 2, 5 have intersections; 3, 4, 6, 7 are empty.

@@ -73,7 +73,10 @@ stored in contiguous flat tensors.
 
 ### Input Attributes (`Splats::attributes`)
 
-All $N$ Gaussians are packed into a contiguous `[N, 11]` tensor.
+All $N$ Gaussians are packed into a contiguous `[N, 11]` tensor. The flat
+buffer is **field-major** (plane k of splat i at `k * N + i`, plane order
+`x, y, z, qw, qx, qy, qz, sx, sy, sz, opacity`) so a warp of threads reads
+consecutive addresses — the data is written once at load and read every frame.
 
 | Offset | Field | Components | Description |
 | :--- | :--- | :--- | :--- |
@@ -82,7 +85,8 @@ All $N$ Gaussians are packed into a contiguous `[N, 11]` tensor.
 | `7–9` | $\boldsymbol{\sigma}_{log}$ | $(\sigma_x, \sigma_y, \sigma_z)$ | Log-scale. Actual scales: $s_i = e^{\sigma_i}$. |
 | `10` | $o_{raw}$ | $o$ | Raw opacity. Sigmoid: $\alpha = \frac{1}{1 + e^{-o}}$. |
 
-> SH coefficients are stored in a separate tensor (e.g., `[N, K, 3]`).
+> SH coefficients are stored in a separate tensor (shape `[N, K, 3]`), also
+> field-major: coefficient k channel c of splat i at `(k * 3 + c) * N + i`.
 
 ### Projected Output (`Splats::projected`)
 

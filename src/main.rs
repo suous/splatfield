@@ -108,11 +108,7 @@ impl App {
         }
     }
 
-    fn load_dropped(&self, file: egui::DroppedFileHandle, ctx: egui::Context) {
-        let Some(format) = splat_format(file.as_ref()) else {
-            return;
-        };
-
+    fn load_dropped(&self, file: egui::DroppedFileHandle, format: SplatFormat, ctx: egui::Context) {
         let client = self.client.clone();
         let splats = Arc::clone(&self.splats);
         let reframe = Arc::clone(&self.reframe);
@@ -171,11 +167,10 @@ impl eframe::App for App {
             i.raw
                 .dropped_files
                 .iter()
-                .find(|f| splat_format(f.as_ref()).is_some())
-                .cloned()
+                .find_map(|f| splat_format(f.as_ref()).map(|format| (f.clone(), format)))
         });
-        if let Some(file) = dropped {
-            self.load_dropped(file, ui.ctx().clone());
+        if let Some((file, format)) = dropped {
+            self.load_dropped(file, format, ui.ctx().clone());
         }
 
         let binding = self.splats.read().unwrap();

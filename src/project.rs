@@ -176,25 +176,29 @@ pub(crate) fn project_splats(
     gaussian_ids: &mut [u32],
 ) {
     if ABSOLUTE_POS_X < depth_order.len() as u32 {
-        // Splat attributes layout: [x, y, z, qw, qx, qy, qz, sx, sy, sz, opacity]
-        let base = (ABSOLUTE_POS_X * 11u32) as usize;
+        // Splat attributes are FIELD-MAJOR: 11 planes of n floats —
+        // [x][y][z][qw][qx][qy][qz][sx][sy][sz][opacity] — so a warp's loads
+        // coalesce (write-once, read-per-frame data).
+        let total = depth_order.len() as u32;
+        let i = ABSOLUTE_POS_X as usize;
+        let stride = depth_order.len();
         let mean = Vec3F {
-            x: attributes[base],
-            y: attributes[base + 1],
-            z: attributes[base + 2],
+            x: attributes[i],
+            y: attributes[stride + i],
+            z: attributes[2 * stride + i],
         };
         let quat = Vec4F {
-            w: attributes[base + 3],
-            x: attributes[base + 4],
-            y: attributes[base + 5],
-            z: attributes[base + 6],
+            w: attributes[3 * stride + i],
+            x: attributes[4 * stride + i],
+            y: attributes[5 * stride + i],
+            z: attributes[6 * stride + i],
         };
         let scale = Vec3F {
-            x: attributes[base + 7].exp(),
-            y: attributes[base + 8].exp(),
-            z: attributes[base + 9].exp(),
+            x: attributes[7 * stride + i].exp(),
+            y: attributes[8 * stride + i].exp(),
+            z: attributes[9 * stride + i].exp(),
         };
-        let opacity = helpers::sigmoid(attributes[base + 10]);
+        let opacity = helpers::sigmoid(attributes[10 * stride + i]);
         if opacity < ALPHA_CUTOFF {
             terminate!();
         }
@@ -208,14 +212,14 @@ pub(crate) fn project_splats(
 
         let vis_slot = counters[1].fetch_add(1u32);
         depth_order[vis_slot as usize] = vis_slot;
-        depth_keys[vis_slot as usize] = cam.z.to_bits() >> 4;
+        depth_keys[vis_slot as usize] = cam.z.to_bits() >> 8;
 
         let dir = Vec3F {
             x: mean.x - camera_pos.x,
             y: mean.y - camera_pos.y,
             z: mean.z - camera_pos.z,
         };
-        let (r, g, b) = helpers::sh_to_rgb(sh_per_ch, normalize(dir), ABSOLUTE_POS_X, sh_coeffs);
+        let (r, g, b) = helpers::sh_to_rgb(sh_per_ch, normalize(dir), ABSOLUTE_POS_X, total, sh_coeffs);
 
         let inv_cam_z = cam.z.recip();
         let mean2d = Vec2F {
@@ -263,6 +267,7 @@ mod tests {
 
     #[test]
     fn test_project_respects_isect_cap() {
+        let _gpu = crate::tensor::GPU_TEST_LOCK.lock().unwrap();
         let client = WgpuRuntime::client(&WgpuDevice::default());
         // One splat at the image center, scale ~1, near-full opacity: with a
         // 64x64 image and 16x16 tiles it intersects all 16 tiles.
