@@ -4,7 +4,9 @@ version = "0.1.3"
 edition = "2024"
 
 [dependencies]
-cubecl = { version = "=0.11.0-pre.3", features = ["wgpu"] }
+# default-features off: cubecl's `stdlib` runtime kernel templates (matmul etc.)
+# are unused — only custom #[cube] kernels are launched here.
+cubecl = { version = "=0.11.0-pre.3", default-features = false, features = ["wgpu"] }
 bytemuck = "1.25"
 glam = "0.33"
 egui = "0.36"
