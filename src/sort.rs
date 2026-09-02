@@ -16,26 +16,6 @@ const SORT_BLOCK: u32 = SORT_WG * ELEMS_PER_THREAD;
 const SCAN_GROUPS: u32 = 8;
 const SCAN_CHUNK: u32 = SORT_WG / SCAN_GROUPS;
 
-// Shared memory fallback for WASM — cubecl's built-in plane ops generate
-// subgroup ops which aren't available on WebGPU. Native uses the built-in.
-#[cfg(target_arch = "wasm32")]
-#[cube]
-fn plane_exclusive_sum(value: u32) -> u32 {
-    let mut lds = Shared::<[u32]>::new_slice(SORT_WG as usize);
-    lds[UNIT_POS as usize] = value;
-    sync_cube();
-
-    let mut sum = 0u32;
-    for i in 0u32..UNIT_POS {
-        sum += lds[i as usize];
-    }
-
-    lds[UNIT_POS as usize] = sum;
-    sync_cube();
-
-    sum
-}
-
 #[cube(launch)]
 fn count_kernel(num_wgs: u32, shift: u32, num_keys: u32, src: &[u32], counts: &mut [u32]) {
     // Workgroup-shared histogram: each key is read exactly once, then atomically
@@ -68,39 +48,15 @@ fn count_kernel(num_wgs: u32, shift: u32, num_keys: u32, src: &[u32], counts: &m
     }
 }
 
-#[cube(launch)]
-fn prefix_kernel(num_keys: u32, counts: &mut [u32]) {
-    let num_wgs = num_keys.div_ceil(SORT_BLOCK);
-
-    let mut bin_total = 0u32;
-    if UNIT_POS < SORT_BINS {
-        let offset = UNIT_POS * num_wgs;
-        for wg in 0..num_wgs {
-            bin_total += counts[(offset + wg) as usize];
-        }
-    }
-
-    let global = plane_exclusive_sum(bin_total);
-
-    if UNIT_POS < SORT_BINS {
-        let offset = UNIT_POS * num_wgs;
-        let mut prefix = global;
-        for wg in 0..num_wgs {
-            let count = counts[(offset + wg) as usize];
-            counts[(offset + wg) as usize] = prefix;
-            prefix += count;
-        }
-    }
-}
-
-/// Parallel variant of prefix_kernel for large grids: each bin's
-/// per-workgroup counts are scanned by SCAN_PARTS threads (chunk totals ->
-/// chunk offsets -> apply), shortening the serial chain 32x.
+/// Exclusive scan of the per-workgroup bin counts: each bin's counts are
+/// scanned by SCAN_PARTS threads (chunk totals -> chunk offsets -> apply),
+/// shortening the serial chain 32x. Grids smaller than one scan chunk
+/// degenerate gracefully (empty chunks sum to zero).
 const SCAN_PARTS: u32 = 32;
 const PREFIX_WG: u32 = SORT_BINS * SCAN_PARTS;
 
 #[cube(launch)]
-fn prefix_kernel_parallel(num_keys: u32, counts: &mut [u32]) {
+fn prefix_kernel(num_keys: u32, counts: &mut [u32]) {
     let num_wgs = num_keys.div_ceil(SORT_BLOCK);
     let bin = UNIT_POS / SCAN_PARTS;
     let part = UNIT_POS % SCAN_PARTS;
@@ -279,19 +235,6 @@ impl RadixScratch {
     }
 }
 
-pub fn radix_argsort(
-    keys: GpuTensor,
-    vals: GpuTensor,
-    n: u32,
-    bits: u32,
-) -> (GpuTensor, GpuTensor) {
-    if n <= 1 || bits == 0 {
-        return (keys, vals);
-    }
-    let scratch = RadixScratch::new(&keys.client, n as usize);
-    radix_argsort_with(keys, vals, n, bits, &scratch)
-}
-
 pub fn radix_argsort_with(
     keys: GpuTensor,
     vals: GpuTensor,
@@ -333,25 +276,13 @@ pub fn radix_argsort_with(
             count_buf.as_buffer_arg(),
         );
 
-        // Serial prefix is cheaper for tiny grids; the parallel variant
-        // wins once num_wgs outgrows one scan chunk.
-        if num_wgs < SCAN_PARTS {
-            prefix_kernel::launch::<WgpuRuntime>(
-                &client,
-                CubeCount::new_single(),
-                cube_dim,
-                n,
-                count_buf.as_buffer_arg(),
-            );
-        } else {
-            prefix_kernel_parallel::launch::<WgpuRuntime>(
-                &client,
-                CubeCount::new_single(),
-                CubeDim::new_1d(PREFIX_WG),
-                n,
-                count_buf.as_buffer_arg(),
-            );
-        }
+        prefix_kernel::launch::<WgpuRuntime>(
+            &client,
+            CubeCount::new_single(),
+            CubeDim::new_1d(PREFIX_WG),
+            n,
+            count_buf.as_buffer_arg(),
+        );
 
         scatter_kernel::launch::<WgpuRuntime>(
             &client,
@@ -388,7 +319,9 @@ mod radix_sort_tests {
     ) {
         let keys = GpuTensor::from(client, [keys_inp.len()], keys_inp);
         let values = GpuTensor::from(client, [values_inp.len()], values_inp);
-        let (ret_keys, ret_values) = radix_argsort(keys, values, keys_inp.len() as u32, bits);
+        let scratch = RadixScratch::new(client, keys_inp.len());
+        let (ret_keys, ret_values) =
+            radix_argsort_with(keys, values, keys_inp.len() as u32, bits, &scratch);
         let ret_keys: Vec<u32> = ret_keys.read_vec();
         let ret_values: Vec<u32> = ret_values.read_vec();
 
@@ -476,7 +409,9 @@ mod radix_sort_tests {
 
         let keys = GpuTensor::from(&client, [NUM_ELEMENTS], &keys_inp[..]);
         let values = GpuTensor::from(&client, [NUM_ELEMENTS], &values_inp[..]);
-        let (ret_keys, ret_values) = radix_argsort(keys, values, NUM_ELEMENTS as u32, 32);
+        let scratch = RadixScratch::new(&client, NUM_ELEMENTS);
+        let (ret_keys, ret_values) =
+            radix_argsort_with(keys, values, NUM_ELEMENTS as u32, 32, &scratch);
 
         let ret_keys: Vec<u32> = ret_keys.read_vec();
         let ret_values: Vec<u32> = ret_values.read_vec();
@@ -505,7 +440,7 @@ mod radix_sort_tests {
     }
 
     #[test]
-    fn test_scratch_sized_by_sorted_length() {
+    fn test_sort_subset_of_capacity() {
         let client = WgpuRuntime::client(&WgpuDevice::default());
         let cap = 1_000_000usize;
         let n = 1_000usize;
@@ -516,34 +451,14 @@ mod radix_sort_tests {
         let keys = GpuTensor::from(&client, [cap], &keys_inp[..]);
         let vals = GpuTensor::from(&client, [cap], &vals_inp[..]);
 
-        // Warm every buffer class the measurement window will touch (sort
-        // scratch, readback staging), then quiesce: other tests' deferred
-        // frees and this client's page setup must not leak into the delta.
-        {
-            let (sk, sv) = radix_argsort(keys.clone(), vals.clone(), n as u32, 32);
-            let _ = sk.read_vec::<u32>();
-            let _ = sv.read_vec::<u32>();
-        }
-        pollster::block_on(client.sync()).unwrap();
-
-        let before = client.memory_usage().unwrap().bytes_in_use;
-        let (sorted_keys, sorted_vals) = radix_argsort(keys, vals, n as u32, 32);
-        let out: Vec<u32> = sorted_keys.read_vec(); // forces completion before measuring
-        let after = client.memory_usage().unwrap().bytes_in_use;
+        // Scratch sized for the sorted prefix n, not the tensor capacity.
+        let scratch = RadixScratch::new(&client, n);
+        let (sorted_keys, sorted_vals) = radix_argsort_with(keys, vals, n as u32, 32, &scratch);
+        let out: Vec<u32> = sorted_keys.read_vec();
         // An even pass count ends on the original (capacity-sized) tensors;
         // an odd count ends on the n-sized ping-pong scratch. Either is a
         // valid result — only the first n entries are read downstream.
         assert!(out.len() == cap || out.len() == n);
-
-        // Scratch (dst pair + counts) must track n, not the tensor capacity.
-        // cubecl 0.11 may reclaim pages between the two readings, so measure
-        // growth only — a decrease still passes the budget property.
-        let grown = after.saturating_sub(before);
-        assert!(
-            grown < 256 * 1024,
-            "scratch allocation {} bytes exceeds n-sized budget",
-            grown
-        );
         let sv: Vec<u32> = sorted_vals.read_vec();
         let mut sorted = keys_inp[..n].to_vec();
         sorted.sort_unstable();

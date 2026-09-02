@@ -3,7 +3,7 @@ use criterion::{BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_gr
 use std::hint::black_box;
 use cubecl::Runtime;
 use rand::RngExt;
-use splatfield::sort::radix_argsort;
+use splatfield::sort::{radix_argsort_with, RadixScratch};
 use splatfield::tensor::GpuTensor;
 use std::time::Duration;
 
@@ -31,9 +31,10 @@ fn bench_sort(
     keys: &GpuTensor,
     vals: &GpuTensor,
     flag: &GpuTensor,
-    n: usize,
+    scratch: &RadixScratch,
     bits: u32,
 ) {
+    let n = keys.shape[0];
     group.throughput(Throughput::Elements(n as u64));
     group.bench_with_input(id, &(), |b, _| {
         b.iter_custom(|iters| {
@@ -41,7 +42,7 @@ fn bench_sort(
             let mut v = vals.clone();
             let start = std::time::Instant::now();
             for _ in 0..iters {
-                let (nk, nv) = radix_argsort(black_box(k), black_box(v), n as u32, bits);
+                let (nk, nv) = radix_argsort_with(black_box(k), black_box(v), n as u32, bits, scratch);
                 k = nk;
                 v = nv;
             }
@@ -63,13 +64,14 @@ fn bench_size_sweep(c: &mut Criterion) {
         let keys = GpuTensor::from(&client, [n], &keys_data[..]);
         let vals = GpuTensor::from(&client, [n], &vals_data[..]);
         let flag = GpuTensor::from(&client, [2], &[0u32, 0][..]);
+        let scratch = RadixScratch::new(&client, n);
         bench_sort(
             &mut group,
             BenchmarkId::from_parameter(n),
             &keys,
             &vals,
             &flag,
-            n,
+            &scratch,
             32,
         );
     }
@@ -86,6 +88,7 @@ fn bench_bits_sweep(c: &mut Criterion) {
     let keys = GpuTensor::from(&client, [n], &keys_data[..]);
     let vals = GpuTensor::from(&client, [n], &vals_data[..]);
     let flag = GpuTensor::from(&client, [2], &[0u32, 0][..]);
+    let scratch = RadixScratch::new(&client, n);
 
     for &bits in &[4u32, 8, 12, 16, 20, 24, 28, 32] {
         bench_sort(
@@ -94,7 +97,7 @@ fn bench_bits_sweep(c: &mut Criterion) {
             &keys,
             &vals,
             &flag,
-            n,
+            &scratch,
             bits,
         );
     }
@@ -113,13 +116,14 @@ fn bench_distribution(c: &mut Criterion) {
         let keys = GpuTensor::from(&client, [n], &keys_data[..]);
         let vals = GpuTensor::from(&client, [n], &vals_data[..]);
         let flag = GpuTensor::from(&client, [2], &[0u32, 0][..]);
+        let scratch = RadixScratch::new(&client, n);
         bench_sort(
             &mut group,
             BenchmarkId::from_parameter(dist),
             &keys,
             &vals,
             &flag,
-            n,
+            &scratch,
             32,
         );
     }
@@ -135,13 +139,15 @@ fn bench_end_to_end(c: &mut Criterion) {
     ] {
         let keys_data = make_data(n, "random");
         let vals_data: Vec<u32> = (0..n as u32).collect();
+        let scratch = RadixScratch::new(&client, n);
 
         group.throughput(Throughput::Elements(n as u64));
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |b, _| {
             b.iter(|| {
                 let k = GpuTensor::from(&client, [n], &keys_data[..]);
                 let v = GpuTensor::from(&client, [n], &vals_data[..]);
-                let (sorted_k, sorted_v) = radix_argsort(black_box(k), black_box(v), n as u32, 32);
+                let (sorted_k, sorted_v) =
+                    radix_argsort_with(black_box(k), black_box(v), n as u32, 32, &scratch);
                 sorted_k.read_vec::<u32>();
                 sorted_v.read_vec::<u32>();
             });

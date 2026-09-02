@@ -27,6 +27,15 @@ impl Camera {
     pub fn w2c(&self) -> Affine3A {
         Affine3A::from_rotation_translation(self.rotation, self.position).inverse()
     }
+
+    /// Center on `bounds` and pull back along -Y, pitched -90° around X, so
+    /// the whole model is in view. Returns the focus distance used.
+    pub fn frame_bounds(&mut self, (min, max): (Vec3, Vec3)) -> f32 {
+        let d = (max - min).max_element() * 2.0;
+        self.position = (min + max) * 0.5 - Vec3::Y * d;
+        self.rotation = Quat::from_rotation_x((-90f32).to_radians());
+        d
+    }
 }
 
 pub struct Controller {
@@ -54,11 +63,8 @@ impl Default for Controller {
 }
 
 impl Controller {
-    pub fn frame_bounds(&mut self, (min, max): (Vec3, Vec3)) {
-        let d = (max - min).max_element() * 2.0;
-        self.camera.position = (min + max) * 0.5 - Vec3::Y * d;
-        self.camera.rotation = Quat::from_rotation_x((-90f32).to_radians());
-        self.focus_distance = d;
+    pub fn frame_bounds(&mut self, bounds: (Vec3, Vec3)) {
+        self.focus_distance = self.camera.frame_bounds(bounds);
     }
 
     pub fn tick(&mut self, response: &Response, ui: &egui::Ui) {

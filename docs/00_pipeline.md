@@ -88,9 +88,11 @@ consecutive addresses — the data is written once at load and read every frame.
 > SH coefficients are stored in a separate tensor (shape `[N, K, 3]`), also
 > field-major: coefficient k channel c of splat i at `(k * 3 + c) * N + i`.
 
-### Projected Output (`Splats::projected`)
+### Projected Output (`RenderScratch.projected`)
 
-After projection, each Gaussian yields a 9-float record stored in a `[N, 9]` tensor.
+After projection, each Gaussian yields a 9-float record stored in a `[N, 9]
+`RenderScratch` tensor, allocated per (splat count, image size) and reused
+across frames.
 
 | Offset | Field | Components | Description |
 | :--- | :--- | :--- | :--- |

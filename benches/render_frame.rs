@@ -51,16 +51,15 @@ fn load_bear() -> Option<(Splats, usize)> {
     Some((splats, n))
 }
 
-/// Mirrors `camera::Controller::frame_bounds`: centered, pulled back along -Y,
-/// pitched -90° around X, fov 0.8.
+/// Centered, pulled back along -Y, pitched -90° around X (`Camera::frame_bounds`), fov 0.8.
 fn fixed_camera(splats: &Splats) -> Camera {
-    let (min, max) = splats.bounds;
-    let d = (max - min).max_element() * 2.0;
-    Camera {
+    let mut camera = Camera {
         fov: glam::Vec2::splat(0.8),
-        position: (min + max) * 0.5 - glam::Vec3::Y * d,
-        rotation: glam::Quat::from_rotation_x((-90f32).to_radians()),
-    }
+        position: glam::Vec3::ZERO,
+        rotation: glam::Quat::IDENTITY,
+    };
+    camera.frame_bounds(splats.bounds);
+    camera
 }
 
 criterion_group!(benches, bench_frame);
