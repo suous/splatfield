@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use crate::tensor::GpuTensor;
+// Use eframe's re-export so wgpu types always match the render state's device/queue.
 use eframe::egui_wgpu::Renderer;
+use eframe::wgpu;
 use egui::{TextureId, epaint::mutex::RwLock};
 
 pub struct GpuTexture {

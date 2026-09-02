@@ -1,7 +1,6 @@
 use criterion::measurement::WallTime;
-use criterion::{
-    BenchmarkGroup, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
-};
+use criterion::{BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use std::hint::black_box;
 use cubecl::Runtime;
 use rand::RngExt;
 use splatfield::sort::radix_argsort;

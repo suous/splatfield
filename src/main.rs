@@ -12,9 +12,10 @@ use wasm_bindgen::JsCast;
 #[cfg(not(target_arch = "wasm32"))]
 use anyhow::Context;
 
-use cubecl::prelude::*;
+use cubecl::{client::ComputeClient, Runtime};
 use cubecl::wgpu::{MemoryConfiguration, RuntimeOptions, WgpuRuntime, WgpuSetup, init_device};
 use eframe::egui;
+use eframe::wgpu;
 use egui::{Color32, Rect};
 use splatfield::{camera, ply, render, sog, texture};
 
@@ -31,14 +32,13 @@ struct App {
     rendering: Rc<Cell<bool>>,
 }
 
-fn device_descriptor(adapter: &eframe::wgpu::Adapter) -> eframe::wgpu::DeviceDescriptor<'static> {
-    eframe::wgpu::DeviceDescriptor {
+fn device_descriptor(adapter: &wgpu::Adapter) -> wgpu::DeviceDescriptor<'static> {
+    wgpu::DeviceDescriptor {
         required_features: adapter
             .features()
-            .difference(eframe::wgpu::Features::MAPPABLE_PRIMARY_BUFFERS)
-            .difference(eframe::wgpu::Features::all_experimental_mask()),
+            .difference(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS | wgpu::Features::all_experimental_mask()),
         required_limits: adapter.limits(),
-        memory_hints: eframe::wgpu::MemoryHints::MemoryUsage,
+        memory_hints: wgpu::MemoryHints::MemoryUsage,
         ..Default::default()
     }
 }
@@ -47,7 +47,7 @@ fn wgpu_config() -> eframe::egui_wgpu::WgpuConfiguration {
     eframe::egui_wgpu::WgpuConfiguration {
         wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(
             eframe::egui_wgpu::WgpuSetupCreateNew {
-                device_descriptor: std::sync::Arc::new(device_descriptor),
+                device_descriptor: Arc::new(device_descriptor),
                 ..eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle()
             },
         ),
@@ -155,6 +155,14 @@ impl App {
             });
         }
     }
+
+    /// (Re)create the reusable render scratch when the splat count or image size changed.
+    fn ensure_scratch(&self, total: usize, pixel: glam::UVec2) {
+        let mut slot = self.scratch.borrow_mut();
+        if !slot.as_ref().is_some_and(|s| s.matches(total, pixel)) {
+            *slot = Some(render::RenderScratch::new(&self.client, total, pixel));
+        }
+    }
 }
 
 impl eframe::App for App {
@@ -188,45 +196,41 @@ impl eframe::App for App {
         self.controller.tick(&response, ui);
         self.controller.camera.fit_fov(pixel);
 
-        #[cfg(not(target_arch = "wasm32"))]
         if pixel.x > 8 && pixel.y > 8 {
             let total = splats.attributes.shape[0];
-            let mut slot = self.scratch.borrow_mut();
-            if !slot.as_ref().is_some_and(|s| s.matches(total, pixel)) {
-                *slot = Some(render::RenderScratch::new(&self.client, total, pixel));
-            }
-            let img = pollster::block_on(splats.render_with(
-                slot.as_mut().unwrap(),
-                &self.controller.camera,
-                pixel,
-            ));
-            self.backbuffer.borrow_mut().update_texture(&img, pixel);
-        }
 
-        #[cfg(target_arch = "wasm32")]
-        if pixel.x > 8 && pixel.y > 8 && !self.rendering.get() {
-            self.rendering.set(true);
-            let total = splats.attributes.shape[0];
+            #[cfg(not(target_arch = "wasm32"))]
             {
-                let mut slot = self.scratch.borrow_mut();
-                if !slot.as_ref().is_some_and(|s| s.matches(total, pixel)) {
-                    *slot = Some(render::RenderScratch::new(&self.client, total, pixel));
-                }
+                self.ensure_scratch(total, pixel);
+                let img = pollster::block_on(splats.render_with(
+                    self.scratch.borrow_mut().as_mut().unwrap(),
+                    &self.controller.camera,
+                    pixel,
+                ));
+                self.backbuffer.borrow_mut().update_texture(&img, pixel);
             }
-            let camera = self.controller.camera.clone();
-            let scratch = self.scratch.clone();
-            let backbuffer = self.backbuffer.clone();
-            let rendering = self.rendering.clone();
-            let ctx = ui.ctx().clone();
 
-            wasm_bindgen_futures::spawn_local(async move {
-                let img = splats
-                    .render_with(scratch.borrow_mut().as_mut().unwrap(), &camera, pixel)
-                    .await;
-                backbuffer.borrow_mut().update_texture(&img, pixel);
-                rendering.set(false);
-                ctx.request_repaint();
-            });
+            // `rendering` also guards the scratch borrow: an in-flight async
+            // render on wasm holds it across the await.
+            #[cfg(target_arch = "wasm32")]
+            if !self.rendering.get() {
+                self.ensure_scratch(total, pixel);
+                self.rendering.set(true);
+                let camera = self.controller.camera.clone();
+                let scratch = self.scratch.clone();
+                let backbuffer = self.backbuffer.clone();
+                let rendering = self.rendering.clone();
+                let ctx = ui.ctx().clone();
+
+                wasm_bindgen_futures::spawn_local(async move {
+                    let img = splats
+                        .render_with(scratch.borrow_mut().as_mut().unwrap(), &camera, pixel)
+                        .await;
+                    backbuffer.borrow_mut().update_texture(&img, pixel);
+                    rendering.set(false);
+                    ctx.request_repaint();
+                });
+            }
         }
 
         if let Some(id) = self.backbuffer.borrow().texture_id() {

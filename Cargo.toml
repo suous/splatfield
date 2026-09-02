@@ -8,18 +8,18 @@ cubecl = { version = "=0.11.0-pre.3", features = ["wgpu"] }
 bytemuck = "1.25"
 glam = "0.33"
 egui = "0.36"
-wgpu = "30"
-anyhow = "1.0.102"
+anyhow = "1.0.104"
 log = "0.4"
 image = { version = "0.25", default-features = false, features = ["webp"] }
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 eframe = { version = "0.36", default-features = false, features = ["wgpu", "x11", "wayland"] }
-pollster = "0.4"
-env_logger = "0.11.9"
+pollster = "1.0"
+# Only auto color detection; drop regex (log-filter) and humantime features.
+env_logger = { version = "0.11.11", default-features = false, features = ["auto-color"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Pinning cubecl-common for the wasm target: since 0.11 the `bytes` module is
@@ -35,7 +35,7 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 
 [dev-dependencies]
 rand = "0.10"
-criterion = "0.5"
+criterion = "0.8"
 
 [[bench]]
 name = "radix_sort"
@@ -47,6 +47,8 @@ harness = false
 
 [profile.release]
 lto = true
-opt-level = 's'
+opt-level = 'z'
 codegen-units = 1
 panic = "abort"
+# Match the CI release artifact: strip symbol tables at link time.
+strip = true
