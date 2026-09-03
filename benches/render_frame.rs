@@ -1,9 +1,9 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use std::hint::black_box;
 use cubecl::Runtime;
 use splatfield::camera::Camera;
 use splatfield::render::{RenderScratch, Splats};
 use splatfield::sog;
+use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 fn bench_frame(c: &mut Criterion) {
@@ -46,7 +46,9 @@ fn load_bear() -> Option<(Splats, usize)> {
         return None;
     }
     let client = cubecl::wgpu::WgpuRuntime::client(&Default::default());
-    let splats = sog::load_sog(std::fs::File::open(path).ok()?, &client).ok()?;
+    let splats = sog::parse_sog(std::fs::File::open(path).ok()?)
+        .ok()?
+        .upload(&client);
     let n = splats.attributes.shape[0];
     Some((splats, n))
 }

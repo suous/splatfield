@@ -3,6 +3,7 @@ mod helpers;
 pub mod ply;
 mod project;
 pub mod render;
+mod scan;
 pub mod sog;
 pub mod sort;
 pub mod tensor;

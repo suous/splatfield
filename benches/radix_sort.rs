@@ -1,10 +1,12 @@
 use criterion::measurement::WallTime;
-use criterion::{BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use std::hint::black_box;
+use criterion::{
+    BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
+};
 use cubecl::Runtime;
 use rand::RngExt;
-use splatfield::sort::{radix_argsort_with, RadixScratch};
+use splatfield::sort::{RadixScratch, radix_argsort_with};
 use splatfield::tensor::GpuTensor;
+use std::hint::black_box;
 use std::time::Duration;
 
 fn make_data(n: usize, dist: &str) -> Vec<u32> {
@@ -42,7 +44,8 @@ fn bench_sort(
             let mut v = vals.clone();
             let start = std::time::Instant::now();
             for _ in 0..iters {
-                let (nk, nv) = radix_argsort_with(black_box(k), black_box(v), n as u32, bits, scratch);
+                let (nk, nv) =
+                    radix_argsort_with(black_box(k), black_box(v), n as u32, bits, scratch);
                 k = nk;
                 v = nv;
             }

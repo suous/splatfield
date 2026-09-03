@@ -1,7 +1,6 @@
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex};
 
 #[cfg(target_arch = "wasm32")]
 use std::cell::Cell;
@@ -12,8 +11,8 @@ use wasm_bindgen::JsCast;
 #[cfg(not(target_arch = "wasm32"))]
 use anyhow::Context;
 
-use cubecl::{client::ComputeClient, Runtime};
 use cubecl::wgpu::{MemoryConfiguration, RuntimeOptions, WgpuRuntime, WgpuSetup, init_device};
+use cubecl::{Runtime, client::ComputeClient};
 use eframe::egui;
 use eframe::wgpu;
 use egui::{Color32, Rect};
@@ -21,22 +20,29 @@ use splatfield::{camera, ply, render, sog, texture};
 
 const UV_RECT: Rect = Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
 
+/// The loaded model plus its "reframe the camera" flag under one lock: the
+/// loader callback and the UI thread coordinate through this alone.
+#[derive(Default)]
+struct Loaded {
+    splats: Option<render::Splats>,
+    reframe: bool,
+}
+
 struct App {
     backbuffer: Rc<RefCell<texture::GpuTexture>>,
     scratch: Rc<RefCell<Option<render::RenderScratch>>>,
     controller: camera::Controller,
     client: ComputeClient<WgpuRuntime>,
-    splats: Arc<RwLock<Option<render::Splats>>>,
-    reframe: Arc<AtomicBool>,
+    splats: Arc<Mutex<Loaded>>,
     #[cfg(target_arch = "wasm32")]
     rendering: Rc<Cell<bool>>,
 }
 
 fn device_descriptor(adapter: &wgpu::Adapter) -> wgpu::DeviceDescriptor<'static> {
     wgpu::DeviceDescriptor {
-        required_features: adapter
-            .features()
-            .difference(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS | wgpu::Features::all_experimental_mask()),
+        required_features: adapter.features().difference(
+            wgpu::Features::MAPPABLE_PRIMARY_BUFFERS | wgpu::Features::all_experimental_mask(),
+        ),
         required_limits: adapter.limits(),
         memory_hints: wgpu::MemoryHints::MemoryUsage,
         ..Default::default()
@@ -101,8 +107,7 @@ impl App {
             controller: camera::Controller::new(),
             client: WgpuRuntime::client(&device),
             scratch: Rc::new(RefCell::new(None)),
-            splats: Arc::new(RwLock::new(None)),
-            reframe: Arc::new(AtomicBool::new(false)),
+            splats: Arc::new(Mutex::new(Loaded::default())),
             #[cfg(target_arch = "wasm32")]
             rendering: Rc::new(Cell::new(false)),
         }
@@ -111,19 +116,20 @@ impl App {
     fn load_dropped(&self, file: egui::DroppedFileHandle, format: SplatFormat, ctx: egui::Context) {
         let client = self.client.clone();
         let splats = Arc::clone(&self.splats);
-        let reframe = Arc::clone(&self.reframe);
 
         let load = move |reader| -> anyhow::Result<render::Splats> {
             match format {
-                SplatFormat::Sog => sog::load_sog(reader, &client),
-                SplatFormat::Ply => ply::load_ply(reader, &client),
+                SplatFormat::Sog => Ok(sog::parse_sog(reader)?.upload(&client)),
+                SplatFormat::Ply => Ok(ply::parse_ply(reader)?.upload(&client)),
             }
         };
 
         let on_loaded = move |result: anyhow::Result<render::Splats>| match result {
             Ok(data) => {
-                *splats.write().unwrap() = Some(data);
-                reframe.store(true, Ordering::Release);
+                let mut slot = splats.lock().unwrap();
+                slot.splats = Some(data);
+                slot.reframe = true;
+                drop(slot);
                 ctx.request_repaint();
             }
             Err(e) => log::error!("Failed to load splat: {e:?}"),
@@ -151,14 +157,6 @@ impl App {
             });
         }
     }
-
-    /// (Re)create the reusable render scratch when the splat count or image size changed.
-    fn ensure_scratch(&self, total: usize, pixel: glam::UVec2) {
-        let mut slot = self.scratch.borrow_mut();
-        if !slot.as_ref().is_some_and(|s| s.matches(total, pixel)) {
-            *slot = Some(render::RenderScratch::new(&self.client, total, pixel));
-        }
-    }
 }
 
 impl eframe::App for App {
@@ -173,17 +171,18 @@ impl eframe::App for App {
             self.load_dropped(file, format, ui.ctx().clone());
         }
 
-        let binding = self.splats.read().unwrap();
-        let Some(splats) = binding.as_ref() else {
+        let mut slot = self.splats.lock().unwrap();
+        if slot.reframe {
+            if let Some(s) = &slot.splats {
+                self.controller.frame_bounds(s.bounds);
+            }
+            slot.reframe = false;
+        }
+        let Some(splats) = slot.splats.clone() else {
             ui.centered_and_justified(|ui| ui.heading("Drag and drop a .ply or .sog file"));
             return;
         };
-
-        if self.reframe.swap(false, Ordering::AcqRel) {
-            self.controller.frame_bounds(splats.bounds);
-        }
-        let splats = splats.clone(); // cheap: GpuTensor clones are handle refcounts
-        drop(binding); // release the read lock before rendering the frame
+        drop(slot); // release the lock before rendering the frame
 
         let size = ui.available_size();
         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::drag());
@@ -196,9 +195,10 @@ impl eframe::App for App {
 
             #[cfg(not(target_arch = "wasm32"))]
             {
-                self.ensure_scratch(total, pixel);
                 let img = pollster::block_on(splats.render_with(
-                    self.scratch.borrow_mut().as_mut().unwrap(),
+                    self.scratch.borrow_mut().get_or_insert_with(|| {
+                        render::RenderScratch::new(&self.client, total, pixel)
+                    }),
                     &self.controller.camera,
                     pixel,
                 ));
@@ -209,17 +209,23 @@ impl eframe::App for App {
             // render on wasm holds it across the await.
             #[cfg(target_arch = "wasm32")]
             if !self.rendering.get() {
-                self.ensure_scratch(total, pixel);
                 self.rendering.set(true);
                 let camera = self.controller.camera.clone();
                 let scratch = self.scratch.clone();
                 let backbuffer = self.backbuffer.clone();
                 let rendering = self.rendering.clone();
+                let client = self.client.clone();
                 let ctx = ui.ctx().clone();
 
                 wasm_bindgen_futures::spawn_local(async move {
                     let img = splats
-                        .render_with(scratch.borrow_mut().as_mut().unwrap(), &camera, pixel)
+                        .render_with(
+                            scratch.borrow_mut().get_or_insert_with(|| {
+                                render::RenderScratch::new(&client, total, pixel)
+                            }),
+                            &camera,
+                            pixel,
+                        )
                         .await;
                     backbuffer.borrow_mut().update_texture(&img, pixel);
                     rendering.set(false);

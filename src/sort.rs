@@ -2,6 +2,7 @@
 //!
 //! References:
 //! - <https://github.com/ArthurBrussee/brush/blob/main/crates/brush-sort/src/lib.rs>
+use crate::scan::exclusive_scan_buf;
 use crate::tensor::GpuTensor;
 use cubecl::calculate_cube_count_elemwise;
 use cubecl::prelude::*;
@@ -16,6 +17,10 @@ const SORT_BLOCK: u32 = SORT_WG * ELEMS_PER_THREAD;
 const SCAN_GROUPS: u32 = 8;
 const SCAN_CHUNK: u32 = SORT_WG / SCAN_GROUPS;
 
+/// Histogram each 4-bit digit into per-workgroup counts, BIN-MAJOR:
+/// `counts[bin * num_wgs + wg]`. This layout lets one flat exclusive scan
+/// (scan::exclusive_scan_buf) produce each (bin, wg) cell's global scatter
+/// offset directly — lower bins' totals plus this bin's lower workgroups.
 #[cube(launch)]
 fn count_kernel(num_wgs: u32, shift: u32, num_keys: u32, src: &[u32], counts: &mut [u32]) {
     // Workgroup-shared histogram: each key is read exactly once, then atomically
@@ -27,10 +32,9 @@ fn count_kernel(num_wgs: u32, shift: u32, num_keys: u32, src: &[u32], counts: &m
     }
     sync_cube();
 
-    // The grid may be spread over Y/Z when the X count exceeds the hardware
-    // limit (cubecl's CubeCountSelection), so flatten the cube position
-    // instead of addressing work by CUBE_POS_X alone.
-    let wg = CUBE_POS_X + CUBE_COUNT_X * (CUBE_POS_Y + CUBE_COUNT_Y * CUBE_POS_Z);
+    // CUBE_POS linearizes the workgroup id: the grid may be spread over Y/Z
+    // when the X count exceeds the hardware limit (CubeCountSelection).
+    let wg = CUBE_POS as u32;
     if wg < num_wgs {
         let base = SORT_BLOCK * wg + UNIT_POS;
         for e in 0..ELEMS_PER_THREAD {
@@ -48,76 +52,6 @@ fn count_kernel(num_wgs: u32, shift: u32, num_keys: u32, src: &[u32], counts: &m
     }
 }
 
-/// Exclusive scan of the per-workgroup bin counts: each bin's counts are
-/// scanned by SCAN_PARTS threads (chunk totals -> chunk offsets -> apply),
-/// shortening the serial chain 32x. Grids smaller than one scan chunk
-/// degenerate gracefully (empty chunks sum to zero).
-const SCAN_PARTS: u32 = 32;
-const PREFIX_WG: u32 = SORT_BINS * SCAN_PARTS;
-
-#[cube(launch)]
-fn prefix_kernel(num_keys: u32, counts: &mut [u32]) {
-    let num_wgs = num_keys.div_ceil(SORT_BLOCK);
-    let bin = UNIT_POS / SCAN_PARTS;
-    let part = UNIT_POS % SCAN_PARTS;
-    let mut partials = Shared::<[u32]>::new_slice(PREFIX_WG as usize);
-    let mut totals = Shared::<[u32]>::new_slice(SORT_BINS as usize);
-
-    let chunk = num_wgs.div_ceil(SCAN_PARTS);
-    let lo = part * chunk;
-    let hi = (lo + chunk).min(num_wgs);
-
-    let mut sum = 0u32;
-    for w in lo..hi {
-        sum += counts[(bin * num_wgs + w) as usize];
-    }
-    partials[UNIT_POS as usize] = sum;
-    if UNIT_POS < SORT_BINS {
-        totals[UNIT_POS as usize] = 0u32;
-    }
-    sync_cube();
-
-    // Per-bin totals, then exclusive bin offsets (single thread, 16 bins).
-    if UNIT_POS < SORT_BINS {
-        let mut total = 0u32;
-        for p in 0..SCAN_PARTS {
-            total += partials[(UNIT_POS * SCAN_PARTS + p) as usize];
-        }
-        totals[UNIT_POS as usize] = total;
-    }
-    sync_cube();
-    if UNIT_POS == 0 {
-        let mut running = 0u32;
-        for b in 0..SORT_BINS {
-            let t = totals[b as usize];
-            totals[b as usize] = running;
-            running += t;
-        }
-    }
-    sync_cube();
-
-    // Exclusive scan of chunk totals within each bin, offset by the bin base.
-    if UNIT_POS < SORT_BINS {
-        let mut running = totals[UNIT_POS as usize];
-        for p in 0..SCAN_PARTS {
-            let cell = (UNIT_POS * SCAN_PARTS + p) as usize;
-            let c = partials[cell];
-            partials[cell] = running;
-            running += c;
-        }
-    }
-    sync_cube();
-
-    // Apply: rewrite each per-workgroup count as its global exclusive offset.
-    let mut running = partials[UNIT_POS as usize];
-    for w in lo..hi {
-        let idx = (bin * num_wgs + w) as usize;
-        let c = counts[idx];
-        counts[idx] = running;
-        running += c;
-    }
-}
-
 #[cube(launch)]
 fn scatter_kernel(
     num_wgs: u32,
@@ -129,9 +63,8 @@ fn scatter_kernel(
     out: &mut [u32],
     out_values: &mut [u32],
 ) {
-    // See count_kernel: the cube position must be linearized to survive
-    // CubeCountSelection spreading the grid over Y/Z.
-    let wg = CUBE_POS_X + CUBE_COUNT_X * (CUBE_POS_Y + CUBE_COUNT_Y * CUBE_POS_Z);
+    // CUBE_POS linearizes the workgroup id; see count_kernel.
+    let wg = CUBE_POS as u32;
     if wg >= num_wgs {
         terminate!();
     }
@@ -276,13 +209,7 @@ pub fn radix_argsort_with(
             count_buf.as_buffer_arg(),
         );
 
-        prefix_kernel::launch::<WgpuRuntime>(
-            &client,
-            CubeCount::new_single(),
-            CubeDim::new_1d(PREFIX_WG),
-            n,
-            count_buf.as_buffer_arg(),
-        );
+        exclusive_scan_buf(&client, count_buf, SORT_BINS * num_wgs);
 
         scatter_kernel::launch::<WgpuRuntime>(
             &client,
@@ -328,8 +255,8 @@ mod radix_sort_tests {
         assert_eq!(ret_keys.len(), keys_inp.len());
         assert_eq!(ret_values.len(), keys_inp.len());
 
-        // The GPU radix sort is not stable within equal keys, so assert sorted
-        // order and key/value pairing instead of an exact stable reference.
+        // Stability is asserted separately in test_sorting_stable; here
+        // assert sorted order and key/value pairing only.
         for i in 1..keys_inp.len() {
             assert!(
                 ret_keys[i - 1] <= ret_keys[i],
@@ -360,6 +287,28 @@ mod radix_sort_tests {
         assert_eq!(bits_for(257), 9);
         assert_eq!(bits_for(65536), 16);
         assert_eq!(bits_for(u32::MAX), 32);
+    }
+
+    #[test]
+    fn test_sorting_stable() {
+        // The render pipeline relies on stability: intersections are emitted
+        // in depth order and the tile sort must preserve that order among
+        // equal tile ids. Assert exact stable argsort, not just sortedness.
+        let client = WgpuRuntime::client(&WgpuDevice::default());
+        let mut rng = rand::rng();
+        for n in [1000usize, 5000, 200_000] {
+            let keys_inp: Vec<u32> = (0..n).map(|_| rng.random_range(0..37)).collect();
+            let values_inp: Vec<u32> = (0..n as u32).collect();
+            let keys = GpuTensor::from(&client, [n], &keys_inp[..]);
+            let values = GpuTensor::from(&client, [n], &values_inp[..]);
+            let scratch = RadixScratch::new(&client, n);
+            let (_, ret_values) = radix_argsort_with(keys, values, n as u32, 8, &scratch);
+            let ret_values: Vec<u32> = ret_values.read_vec();
+
+            let mut reference: Vec<u32> = (0..n as u32).collect();
+            reference.sort_by_key(|&i| keys_inp[i as usize]); // stable
+            assert_eq!(ret_values, reference, "n={n}: sort must be stable");
+        }
     }
 
     #[test]

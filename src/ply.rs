@@ -1,12 +1,6 @@
-use crate::render::{CpuSplats, Splats};
+use crate::render::CpuSplats;
 use anyhow::{Context, Result, anyhow};
-use cubecl::{client::ComputeClient, wgpu::WgpuRuntime};
 use std::io::BufRead;
-
-pub fn load_ply(reader: impl BufRead, client: &ComputeClient<WgpuRuntime>) -> Result<Splats> {
-    let cpu = parse_ply(reader)?;
-    Ok(Splats::new(cpu.attributes, cpu.sh_coeffs, client))
-}
 
 pub fn parse_ply(mut reader: impl BufRead) -> Result<CpuSplats> {
     let mut vertex_count = 0;

@@ -1,5 +1,6 @@
 use crate::camera::Camera;
 use crate::helpers;
+use crate::scan::{ScanScratch, exclusive_scan_gather};
 use crate::sort::{RadixScratch, bits_for, radix_argsort_with};
 use crate::tensor::GpuTensor;
 use cubecl::calculate_cube_count_elemwise;
@@ -15,6 +16,13 @@ const INTERSECTS_UPPER_BOUND: usize = 2 * 512 * 65535;
 // same treatment equal keys already get.
 const DEPTH_KEY_BITS: u32 = 24;
 
+/// Monotonic depth key for `z > 0` (float order == depth order): project.rs
+/// packs keys with this, render.rs sorts with `DEPTH_KEY_BITS`.
+#[cube]
+pub(crate) fn depth_key(z: f32) -> u32 {
+    z.to_bits() >> (32 - DEPTH_KEY_BITS)
+}
+
 /// Host-side splat payload produced by the PLY/SOG parsers, uploaded once by
 /// `Splats::new`. Both arrays are FIELD-MAJOR (plane-per-field) so the
 /// projection kernel's per-thread reads coalesce across a warp:
@@ -27,6 +35,13 @@ pub struct CpuSplats {
     pub sh_coeffs: Vec<f32>,
 }
 
+impl CpuSplats {
+    /// Upload to the GPU, keeping the parsers client-free.
+    pub fn upload(self, client: &ComputeClient<WgpuRuntime>) -> Splats {
+        Splats::new(self.attributes, self.sh_coeffs, client)
+    }
+}
+
 /// Per-frame GPU buffers, reused across frames so steady-state rendering
 /// allocates nothing new. Rebuild when `matches` returns false.
 #[derive(Debug)]
@@ -35,19 +50,20 @@ pub struct RenderScratch {
     depth_keys: GpuTensor,
     projected: GpuTensor,
     counters: GpuTensor,
+    tile_counts: GpuTensor,
+    tile_bbox: GpuTensor,
     tile_ids: GpuTensor,
     gaussian_ids: GpuTensor,
     tile_ranges: GpuTensor,
     bitmap: GpuTensor,
-    // Ping-pong scratch for the three sorts. The gid/tile sorts must not
-    // share one: an odd pass count returns buffers aliasing the scratch,
-    // and the tile sort reads the gid sort's output.
+    // Ping-pong scratch for the two sorts. The tile sort must not share the
+    // depth sort's: an odd pass count returns buffers aliasing the scratch.
     sort_depth: RadixScratch,
-    sort_gid: RadixScratch,
     sort_tile: RadixScratch,
+    scan: ScanScratch,
     total: usize,
     img_size: glam::UVec2,
-    num_tiles: usize,
+    tile_bounds: glam::UVec2,
     isect_capacity: usize,
 }
 
@@ -55,29 +71,53 @@ impl RenderScratch {
     pub fn new(client: &ComputeClient<WgpuRuntime>, total: usize, img_size: glam::UVec2) -> Self {
         let tile_bounds = img_size.map(|c| c.div_ceil(helpers::TILE_WIDTH));
         let num_tiles = (tile_bounds.x * tile_bounds.y) as usize;
-        let isect_capacity = num_tiles.saturating_mul(total).min(1 << 22);
+        // Power of two: the growth check is one `next_power_of_two()` compare.
+        let isect_capacity = (num_tiles.saturating_mul(total).min(1 << 22)).next_power_of_two();
+        // 256-byte rows: wgpu buffer→texture copies align rows to
+        // COPY_BYTES_PER_ROW_ALIGNMENT; texture.rs copies with this stride.
         let row_stride = (img_size.x * 4).next_multiple_of(256) / 4;
         Self {
             depth_order: GpuTensor::empty(client, [total]),
             depth_keys: GpuTensor::empty(client, [total]),
             projected: GpuTensor::empty(client, [total, 9]),
             counters: GpuTensor::empty(client, [2]),
+            tile_counts: GpuTensor::empty(client, [total]),
+            tile_bbox: GpuTensor::empty(client, [total, 2]),
             tile_ids: GpuTensor::empty(client, [isect_capacity]),
             gaussian_ids: GpuTensor::empty(client, [isect_capacity]),
             tile_ranges: GpuTensor::empty(client, [num_tiles * 2]),
             bitmap: GpuTensor::empty(client, [img_size.y as usize, row_stride as usize]),
             sort_depth: RadixScratch::new(client, total),
-            sort_gid: RadixScratch::new(client, isect_capacity),
             sort_tile: RadixScratch::new(client, isect_capacity),
+            scan: ScanScratch::new(client, total),
             total,
             img_size,
-            num_tiles,
+            tile_bounds,
             isect_capacity,
         }
     }
 
-    pub fn matches(&self, total: usize, img_size: glam::UVec2) -> bool {
+    fn matches(&self, total: usize, img_size: glam::UVec2) -> bool {
         self.total == total && self.img_size == img_size
+    }
+
+    /// Grow the isect buffers when `raw` exceeded capacity this frame. This
+    /// frame stays truncated at the old capacity (frame-local clones); at the
+    /// ceiling the computed capacity equals the current one: no realloc, no warn.
+    fn grow_isects(&mut self, client: &ComputeClient<WgpuRuntime>, raw: u32) {
+        let new_cap = (raw as usize)
+            .next_power_of_two()
+            .min(INTERSECTS_UPPER_BOUND);
+        if new_cap > self.isect_capacity {
+            log::warn!(
+                "intersection capacity {} reached ({raw} emitted); growing to {new_cap}",
+                self.isect_capacity
+            );
+            self.isect_capacity = new_cap;
+            self.tile_ids = GpuTensor::empty(client, [new_cap]);
+            self.gaussian_ids = GpuTensor::empty(client, [new_cap]);
+            self.sort_tile = RadixScratch::new(client, new_cap);
+        }
     }
 }
 
@@ -116,9 +156,8 @@ impl Splats {
     /// Render one frame into `scratch`'s buffers; the returned bitmap aliases
     /// `scratch.bitmap` and is valid until the next `render_with` on it.
     ///
-    /// `scratch` must satisfy `matches(self.attributes.shape[0], img_size)`
-    /// (debug_asserted); a mismatched scratch in release yields garbage-clamped
-    /// output, not UB.
+    /// A `scratch` that doesn't match the splat count or image size is rebuilt
+    /// in place.
     pub async fn render_with(
         &self,
         scratch: &mut RenderScratch,
@@ -127,10 +166,13 @@ impl Splats {
     ) -> GpuTensor {
         let client = &self.attributes.client;
         let total = self.attributes.shape[0];
-        debug_assert!(scratch.matches(total, img_size));
-        let tile_bounds = img_size.map(|c| c.div_ceil(helpers::TILE_WIDTH));
-        let num_tiles = scratch.num_tiles;
+        if !scratch.matches(total, img_size) {
+            *scratch = RenderScratch::new(client, total, img_size);
+        }
+        let tile_bounds = scratch.tile_bounds;
+        let num_tiles = (tile_bounds.x * tile_bounds.y) as usize;
         let max_isects = scratch.isect_capacity;
+        let cube_dim = CubeDim::new_1d(helpers::TILE_SIZE);
 
         let focal = camera.focal(img_size);
         let camera_pos = camera.position;
@@ -148,20 +190,16 @@ impl Splats {
 
         zero_buffers::launch::<WgpuRuntime>(
             client,
-            calculate_cube_count_elemwise(
-                client,
-                2 + 2 * num_tiles,
-                CubeDim::new_1d(helpers::TILE_SIZE),
-            ),
-            CubeDim::new_1d(helpers::TILE_SIZE),
+            calculate_cube_count_elemwise(client, 2 + 2 * num_tiles, cube_dim),
+            cube_dim,
             scratch.counters.as_buffer_arg(),
             scratch.tile_ranges.as_buffer_arg(),
         );
 
         crate::project::project_splats::launch::<WgpuRuntime>(
             client,
-            calculate_cube_count_elemwise(client, total, CubeDim::new_1d(helpers::TILE_SIZE)),
-            CubeDim::new_1d(helpers::TILE_SIZE),
+            calculate_cube_count_elemwise(client, total, cube_dim),
+            cube_dim,
             viewmat.as_buffer_arg(),
             helpers::Vec2FLaunch::new(focal.x, focal.y),
             helpers::Vec3FLaunch::new(camera_pos.x, camera_pos.y, camera_pos.z),
@@ -174,35 +212,14 @@ impl Splats {
             scratch.depth_keys.as_buffer_arg(),
             scratch.projected.as_buffer_arg(),
             scratch.counters.as_buffer_arg(),
-            max_isects as u32,
-            tile_ids.as_buffer_arg(),
-            gaussian_ids.as_buffer_arg(),
+            scratch.tile_counts.as_buffer_arg(),
+            scratch.tile_bbox.as_buffer_arg(),
         );
 
         let [num_isects_raw, num_visible] = scratch.counters.read_pair().await;
         let num_isects = num_isects_raw.min(max_isects as u32);
-        if num_isects_raw as usize >= max_isects {
-            // Saturated: this frame is truncated to the clamped count; grow so
-            // the next frame fits. Reallocating now is safe — everything below
-            // runs on the frame-local clones of the old buffers. Once the
-            // ceiling is reached the computed capacity equals the current one
-            // and no realloc (or warn) happens.
-            let new_cap = (num_isects_raw as usize)
-                .next_power_of_two()
-                .min(INTERSECTS_UPPER_BOUND);
-            if new_cap > scratch.isect_capacity {
-                log::warn!(
-                    "intersection capacity {max_isects} reached ({num_isects_raw} emitted); growing to {}",
-                    new_cap
-                );
-                scratch.isect_capacity = new_cap;
-                scratch.tile_ids = GpuTensor::empty(client, [new_cap]);
-                scratch.gaussian_ids = GpuTensor::empty(client, [new_cap]);
-                scratch.sort_gid = RadixScratch::new(client, new_cap);
-                scratch.sort_tile = RadixScratch::new(client, new_cap);
-            }
-        }
-        let (inv_perm, depth_order) = radix_argsort_with(
+        scratch.grow_isects(client, num_isects_raw);
+        let (_sorted_keys, depth_order) = radix_argsort_with(
             scratch.depth_keys.clone(),
             scratch.depth_order.clone(),
             num_visible,
@@ -210,7 +227,21 @@ impl Splats {
             &scratch.sort_depth,
         );
 
-        invert_permutation::launch::<WgpuRuntime>(
+        // Emission offsets in depth order: offsets[rank] = number of
+        // intersections emitted by all nearer splats. The map kernel then
+        // writes each splat's tile intersections contiguously, so the isect
+        // array arrives pre-sorted by depth rank. depth_keys is dead here —
+        // the depth sort discarded its output keys — so it doubles as the
+        // scan's offsets scratch (no dedicated buffer).
+        exclusive_scan_gather(
+            depth_order.clone(),
+            scratch.tile_counts.clone(),
+            scratch.depth_keys.clone(),
+            num_visible,
+            &scratch.scan,
+        );
+
+        map_isects::launch::<WgpuRuntime>(
             client,
             calculate_cube_count_elemwise(
                 client,
@@ -219,31 +250,26 @@ impl Splats {
             ),
             CubeDim::new_1d(helpers::TILE_SIZE),
             depth_order.as_buffer_arg(),
-            inv_perm.as_buffer_arg(),
+            scratch.tile_bbox.as_buffer_arg(),
+            scratch.depth_keys.as_buffer_arg(),
+            tile_bounds.x,
+            max_isects as u32,
+            tile_ids.as_buffer_arg(),
+            gaussian_ids.as_buffer_arg(),
             num_visible,
         );
 
-        remap_global_ids::launch::<WgpuRuntime>(
-            client,
-            calculate_cube_count_elemwise(
-                client,
-                num_isects as usize,
-                CubeDim::new_1d(helpers::TILE_SIZE),
-            ),
-            CubeDim::new_1d(helpers::TILE_SIZE),
-            gaussian_ids.as_buffer_arg(),
-            inv_perm.as_buffer_arg(),
-            num_isects,
-        );
-
-        // Two radix sorts equivalent to the paper's single composite key sort;
-        // the sort is stable, so the tile pass preserves depth order in-tile.
-        let gid_bits = bits_for(num_visible);
-        let (gaussian_ids, tile_ids) =
-            radix_argsort_with(gaussian_ids, tile_ids, num_isects, gid_bits, &scratch.sort_gid);
+        // Isects are emitted in depth order, so this single stable sort by
+        // tile id yields tile-major, depth-minor order — no separate gid sort
+        // or composite key needed.
         let tile_bits = bits_for(num_tiles as u32);
-        let (tile_ids, gaussian_ids) =
-            radix_argsort_with(tile_ids, gaussian_ids, num_isects, tile_bits, &scratch.sort_tile);
+        let (tile_ids, gaussian_ids) = radix_argsort_with(
+            tile_ids,
+            gaussian_ids,
+            num_isects,
+            tile_bits,
+            &scratch.sort_tile,
+        );
 
         build_tile_ranges::launch::<WgpuRuntime>(
             client,
@@ -269,24 +295,53 @@ impl Splats {
             gaussian_ids.as_buffer_arg(),
             scratch.tile_ranges.as_buffer_arg(),
             scratch.projected.as_buffer_arg(),
-            depth_order.as_buffer_arg(),
             scratch.bitmap.as_buffer_arg(),
         );
         scratch.bitmap.clone()
     }
 }
 
+/// Emit each visible splat's tile intersections at its prefix-sum offset.
+/// Ranks are dispatched in ascending depth order and each splat's tiles are
+/// walked in ascending tile id, so the output is sorted by (rank, tile id);
+/// the stable tile sort that follows only has to move tiles together. The
+/// payload is the splat id — inert for ordering, but it lets the rasterizer
+/// index `projected` directly instead of re-translating through depth_order.
 #[cube(launch)]
-fn invert_permutation(perm: &mut [u32], inv: &mut [u32], n: u32) {
-    if ABSOLUTE_POS_X < n {
-        inv[perm[ABSOLUTE_POS_X as usize] as usize] = ABSOLUTE_POS_X;
+fn map_isects(
+    depth_order: &[u32],
+    tile_bbox: &[u32],
+    offsets: &[u32],
+    tiles_per_row: u32,
+    max_isects: u32,
+    tile_ids: &mut [u32],
+    gaussian_ids: &mut [u32],
+    num_visible: u32,
+) {
+    let rank = ABSOLUTE_POS_X;
+    if rank >= num_visible {
+        terminate!();
     }
-}
+    let vis = depth_order[rank as usize];
+    let lo = tile_bbox[vis as usize * 2];
+    let hi = tile_bbox[vis as usize * 2 + 1];
+    let min_x = lo & 0xFFFFu32;
+    let min_y = lo >> 16u32;
+    let max_x = hi & 0xFFFFu32;
+    let max_y = hi >> 16u32;
 
-#[cube(launch)]
-fn remap_global_ids(gids: &mut [u32], inv_perm: &[u32], n: u32) {
-    if ABSOLUTE_POS_X < n {
-        gids[ABSOLUTE_POS_X as usize] = inv_perm[gids[ABSOLUTE_POS_X as usize] as usize];
+    let mut slot = offsets[rank as usize];
+    for ty in min_y..max_y {
+        for tx in min_x..max_x {
+            // Past capacity this frame is truncated (the buffers grow for the
+            // next frame); the offset walk must continue regardless so all
+            // ranks stay consistent.
+            if slot < max_isects {
+                tile_ids[slot as usize] = tx + ty * tiles_per_row;
+                gaussian_ids[slot as usize] = vis;
+            }
+            slot += 1;
+        }
     }
 }
 
@@ -326,7 +381,6 @@ fn rasterize_kernel(
     gaussian_ids_by_tile: &[u32],
     tile_ranges: &[u32],
     projected: &[f32],
-    depth_order: &[u32],
     bitmap: &mut [u32],
 ) {
     let px = ABSOLUTE_POS_X;
@@ -365,9 +419,8 @@ fn rasterize_kernel(
         let idx = chunk + UNIT_POS;
         sync_cube();
         if idx < range_end {
-            let depth_idx = gaussian_ids_by_tile[idx as usize];
             // Projected layout: [mean2d_x, mean2d_y, conic_x, conic_y, conic_z, r, g, b, opacity]
-            let src = (depth_order[depth_idx as usize] * 9u32) as usize;
+            let src = (gaussian_ids_by_tile[idx as usize] * 9u32) as usize;
             let dst = UNIT_POS as usize * 9;
             for k in 0..9 {
                 stage[dst + k] = projected[src + k];
