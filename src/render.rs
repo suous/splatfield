@@ -16,6 +16,10 @@ const INTERSECTS_UPPER_BOUND: usize = 2 * 512 * 65535;
 // same treatment equal keys already get.
 const DEPTH_KEY_BITS: u32 = 24;
 
+/// Web builds compile the rasterizer without the shared-memory early exit —
+/// browsers reject the break-on-shared-count it needs (see rasterize_kernel).
+const EARLY_EXIT: bool = !cfg!(target_arch = "wasm32");
+
 /// Monotonic depth key for `z > 0` (float order == depth order): project.rs
 /// packs keys with this, render.rs sorts with `DEPTH_KEY_BITS`.
 #[cube]
@@ -296,6 +300,9 @@ impl Splats {
             scratch.tile_ranges.as_buffer_arg(),
             scratch.projected.as_buffer_arg(),
             scratch.bitmap.as_buffer_arg(),
+            // Browser shader validation forbids the shared-memory early exit
+            // (see the kernel); native keeps it.
+            EARLY_EXIT,
         );
         scratch.bitmap.clone()
     }
@@ -382,6 +389,7 @@ fn rasterize_kernel(
     tile_ranges: &[u32],
     projected: &[f32],
     bitmap: &mut [u32],
+    #[comptime] early_exit: bool,
 ) {
     let px = ABSOLUTE_POS_X;
     let py = ABSOLUTE_POS_Y;
@@ -395,13 +403,23 @@ fn rasterize_kernel(
     // 36-byte row is fetched from global memory once per tile instead of once
     // per pixel. All threads run the chunk loop uniformly so sync_cube never
     // diverges; converged threads just stop accumulating.
+    //
+    // The whole-tile early exit skips the remaining chunks once every pixel is
+    // saturated. It counts finishers in a shared atomic and `break`s the chunk
+    // loop on the count — which the WGSL uniformity analysis rejects, because
+    // it treats every load from workgroup memory as non-uniform, making the
+    // break (and with it the next iteration's sync_cube) divergent. Browsers
+    // refuse to compile the shader, so web builds specialize with early_exit
+    // off and pay only per-thread `done` latching; native keeps the exit.
     let mut stage = Shared::<[f32]>::new_slice(helpers::TILE_SIZE as usize * 9);
     let done_count = Shared::<[Atomic<u32>]>::new_slice(1usize);
-    if UNIT_POS == 0 {
-        done_count[0usize].store(0u32);
-    }
-    if !in_bounds {
-        done_count[0usize].fetch_add(1u32);
+    if early_exit {
+        if UNIT_POS == 0 {
+            done_count[0usize].store(0u32);
+        }
+        if !in_bounds {
+            done_count[0usize].fetch_add(1u32);
+        }
     }
 
     let mut transmittance = 1.0f32;
@@ -429,7 +447,7 @@ fn rasterize_kernel(
         sync_cube();
 
         // Whole tile converged: every remaining chunk would be a no-op.
-        if done_count[0usize].load() == helpers::TILE_SIZE {
+        if early_exit && done_count[0usize].load() == helpers::TILE_SIZE {
             break;
         }
 
@@ -461,7 +479,9 @@ fn rasterize_kernel(
                     // Remaining weight < 1 LSB of the final 8-bit channels.
                     if transmittance < 1.0f32 / 255.0f32 {
                         done = true;
-                        done_count[0usize].fetch_add(1u32);
+                        if early_exit {
+                            done_count[0usize].fetch_add(1u32);
+                        }
                     }
                 }
             }

@@ -106,14 +106,99 @@ fn scan_block_sums(num_blocks: u32, block_sums: &mut [u32]) {
     }
 }
 
+/// Reduce each `SCAN_BLOCK`-cell block of `buf` to a per-block total. The
+/// gather-free counterpart of [`gather_block_sums`].
+#[cube(launch)]
+fn reduce_block_sums(n: u32, buf: &[u32], block_sums: &mut [u32]) {
+    let wg = CUBE_POS as u32;
+    if wg >= n.div_ceil(SCAN_BLOCK) {
+        terminate!();
+    }
+
+    let mut partials = Shared::<[u32]>::new_slice(SCAN_WG as usize);
+    let base = SCAN_BLOCK * wg + UNIT_POS * SCAN_EPT;
+    let mut sum = 0u32;
+    for e in 0..SCAN_EPT {
+        let idx = base + e;
+        if idx < n {
+            sum += buf[idx as usize];
+        }
+    }
+    partials[UNIT_POS as usize] = sum;
+    sync_cube();
+
+    if UNIT_POS == 0 {
+        let mut total = 0u32;
+        for t in 0..SCAN_WG {
+            total += partials[t as usize];
+        }
+        block_sums[wg as usize] = total;
+    }
+}
+
+/// Per-block totals scratch for [`exclusive_scan_buf`].
+#[derive(Debug)]
+pub(crate) struct ScanBufScratch {
+    block_sums: GpuTensor,
+}
+
+impl ScanBufScratch {
+    /// Sized for the largest cell count `exclusive_scan_buf` will see.
+    pub fn new(client: &ComputeClient<WgpuRuntime>, max_cells: usize) -> Self {
+        let max_blocks = max_cells.div_ceil(SCAN_BLOCK as usize);
+        Self {
+            block_sums: GpuTensor::empty(client, [max_blocks]),
+        }
+    }
+}
+
 /// Exclusive-scan the first `n` cells of `buf` in place. Exposed for the
-/// radix sort's per-pass counter scan.
-pub(crate) fn exclusive_scan_buf(client: &ComputeClient<WgpuRuntime>, buf: &GpuTensor, n: u32) {
+/// radix sort's per-pass counter scan. Large cell counts (the plane path's
+/// 64-bin counters) go through a hierarchical scan; a single workgroup
+/// serial scan would bottleneck them.
+pub(crate) fn exclusive_scan_buf(
+    client: &ComputeClient<WgpuRuntime>,
+    buf: &GpuTensor,
+    n: u32,
+    scratch: &ScanBufScratch,
+) {
+    // The single-workgroup scan is one launch; the hierarchical path is
+    // three. Dispatch costs ~110us per launch, so the extra two only pay
+    // once the serial scan's GPU time outgrows them — past 16K cells, not
+    // at 1K. At 64 bins that keeps key counts up to ~512K on the cheap
+    // path; larger sorts are GPU-bound and win from the parallel scan.
+    if n <= SCAN_BLOCK * 16 {
+        scan_block_sums::launch::<WgpuRuntime>(
+            client,
+            CubeCount::new_single(),
+            CubeDim::new_1d(SCAN_WG),
+            n,
+            buf.as_buffer_arg(),
+        );
+        return;
+    }
+    let cube_count = calculate_cube_count_elemwise(client, n as usize, CubeDim::new_1d(SCAN_BLOCK));
+    reduce_block_sums::launch::<WgpuRuntime>(
+        client,
+        cube_count.clone(),
+        CubeDim::new_1d(SCAN_WG),
+        n,
+        buf.as_buffer_arg(),
+        scratch.block_sums.as_buffer_arg(),
+    );
     scan_block_sums::launch::<WgpuRuntime>(
         client,
         CubeCount::new_single(),
         CubeDim::new_1d(SCAN_WG),
+        n.div_ceil(SCAN_BLOCK),
+        scratch.block_sums.as_buffer_arg(),
+    );
+    apply_block_offsets::launch::<WgpuRuntime>(
+        client,
+        cube_count.clone(),
+        CubeDim::new_1d(SCAN_WG),
         n,
+        scratch.block_sums.as_buffer_arg(),
         buf.as_buffer_arg(),
     );
 }

@@ -6,7 +6,12 @@ edition = "2024"
 [dependencies]
 # default-features off: cubecl's `stdlib` runtime kernel templates (matmul etc.)
 # are unused — only custom #[cube] kernels are launched here.
-cubecl = { version = "=0.11.0-pre.3", default-features = false, features = ["wgpu"] }
+# exclusive-memory-only stops the allocator slicing multiple tensors into one
+# buffer, which lets cubecl bind read-only args as `storage, read`. Without it
+# every buffer is bound read_write, and the WGSL uniformity analysis (which
+# browsers enforce) rejects any barrier loop bounded by a loaded value — e.g.
+# the rasterizer's per-tile intersection ranges.
+cubecl = { version = "=0.11.0-pre.3", default-features = false, features = ["wgpu", "exclusive-memory-only"] }
 bytemuck = "1.25"
 glam = "0.33"
 egui = "0.36"

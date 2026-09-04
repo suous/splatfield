@@ -38,14 +38,19 @@ fn bench_sort(
 ) {
     let n = keys.shape[0];
     group.throughput(Throughput::Elements(n as u64));
+    // Each iteration feeds the previous sort's output back in, so scratch
+    // must alternate: after an odd pass count the output aliases the scratch
+    // dst buffers, and with exclusive-memory-only bindings a buffer can't be
+    // src (read-only) and out (read-write) in the same dispatch.
+    let scratch_b = RadixScratch::new(&keys.client, n);
     group.bench_with_input(id, &(), |b, _| {
         b.iter_custom(|iters| {
             let mut k = keys.clone();
             let mut v = vals.clone();
             let start = std::time::Instant::now();
-            for _ in 0..iters {
-                let (nk, nv) =
-                    radix_argsort_with(black_box(k), black_box(v), n as u32, bits, scratch);
+            for i in 0..iters {
+                let s = if i % 2 == 0 { scratch } else { &scratch_b };
+                let (nk, nv) = radix_argsort_with(black_box(k), black_box(v), n as u32, bits, s);
                 k = nk;
                 v = nv;
             }
