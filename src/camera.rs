@@ -8,6 +8,16 @@ pub struct Camera {
     pub rotation: Quat,
 }
 
+impl Default for Camera {
+    fn default() -> Self {
+        Self {
+            fov: Vec2::splat(0.8),
+            position: Vec3::ZERO,
+            rotation: Quat::IDENTITY,
+        }
+    }
+}
+
 impl Camera {
     pub fn fit_fov(&mut self, pixel_size: UVec2) {
         let tan = (self.fov * 0.5).map(f32::tan);
@@ -43,22 +53,12 @@ pub struct Controller {
     focus_distance: f32,
 }
 
-impl Controller {
-    pub fn new() -> Self {
-        Self {
-            camera: Camera {
-                position: Vec3::ZERO,
-                rotation: Quat::IDENTITY,
-                fov: Vec2::splat(0.8),
-            },
-            focus_distance: 2.5,
-        }
-    }
-}
-
 impl Default for Controller {
     fn default() -> Self {
-        Self::new()
+        Self {
+            camera: Camera::default(),
+            focus_distance: 2.5,
+        }
     }
 }
 

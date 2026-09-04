@@ -1,6 +1,6 @@
 use crate::camera::Camera;
 use crate::helpers;
-use crate::scan::{ScanScratch, exclusive_scan_gather};
+use crate::scan::exclusive_scan_gather;
 use crate::sort::{RadixScratch, bits_for, radix_argsort_with};
 use crate::tensor::GpuTensor;
 use cubecl::calculate_cube_count_elemwise;
@@ -58,17 +58,16 @@ pub struct RenderScratch {
     tile_bbox: GpuTensor,
     tile_ids: GpuTensor,
     gaussian_ids: GpuTensor,
-    tile_ranges: GpuTensor,
     bitmap: GpuTensor,
     // Ping-pong scratch for the two sorts. The tile sort must not share the
     // depth sort's: an odd pass count returns buffers aliasing the scratch.
     sort_depth: RadixScratch,
     sort_tile: RadixScratch,
-    scan: ScanScratch,
-    total: usize,
     img_size: glam::UVec2,
     tile_bounds: glam::UVec2,
-    isect_capacity: usize,
+    // Last frame's raw intersection emission, stashed for the next frame's
+    // capacity check — growth only ever happens between frames.
+    last_isects_raw: u32,
 }
 
 impl RenderScratch {
@@ -89,35 +88,33 @@ impl RenderScratch {
             tile_bbox: GpuTensor::empty(client, [total, 2]),
             tile_ids: GpuTensor::empty(client, [isect_capacity]),
             gaussian_ids: GpuTensor::empty(client, [isect_capacity]),
-            tile_ranges: GpuTensor::empty(client, [num_tiles * 2]),
             bitmap: GpuTensor::empty(client, [img_size.y as usize, row_stride as usize]),
             sort_depth: RadixScratch::new(client, total),
             sort_tile: RadixScratch::new(client, isect_capacity),
-            scan: ScanScratch::new(client, total),
-            total,
             img_size,
             tile_bounds,
-            isect_capacity,
+            last_isects_raw: 0,
         }
     }
 
     fn matches(&self, total: usize, img_size: glam::UVec2) -> bool {
-        self.total == total && self.img_size == img_size
+        self.depth_order.shape[0] == total && self.img_size == img_size
     }
 
-    /// Grow the isect buffers when `raw` exceeded capacity this frame. This
-    /// frame stays truncated at the old capacity (frame-local clones); at the
-    /// ceiling the computed capacity equals the current one: no realloc, no warn.
+    /// Grow the isect buffers when the previous frame's raw emission `raw`
+    /// exceeded their capacity — that frame stayed truncated, this one runs
+    /// on the larger buffers. At the ceiling the computed capacity equals the
+    /// current one: no realloc, no warn. Growing here, between frames, keeps
+    /// every frame on one set of buffers for its whole duration.
     fn grow_isects(&mut self, client: &ComputeClient<WgpuRuntime>, raw: u32) {
         let new_cap = (raw as usize)
             .next_power_of_two()
             .min(INTERSECTS_UPPER_BOUND);
-        if new_cap > self.isect_capacity {
+        if new_cap > self.tile_ids.shape[0] {
             log::warn!(
                 "intersection capacity {} reached ({raw} emitted); growing to {new_cap}",
-                self.isect_capacity
+                self.tile_ids.shape[0]
             );
-            self.isect_capacity = new_cap;
             self.tile_ids = GpuTensor::empty(client, [new_cap]);
             self.gaussian_ids = GpuTensor::empty(client, [new_cap]);
             self.sort_tile = RadixScratch::new(client, new_cap);
@@ -173,9 +170,11 @@ impl Splats {
         if !scratch.matches(total, img_size) {
             *scratch = RenderScratch::new(client, total, img_size);
         }
+        // Grow from last frame's raw emission, before anything is in flight.
+        scratch.grow_isects(client, scratch.last_isects_raw);
         let tile_bounds = scratch.tile_bounds;
         let num_tiles = (tile_bounds.x * tile_bounds.y) as usize;
-        let max_isects = scratch.isect_capacity;
+        let max_isects = scratch.tile_ids.shape[0] as u32;
         let cube_dim = CubeDim::new_1d(helpers::TILE_SIZE);
 
         let focal = camera.focal(img_size);
@@ -183,21 +182,19 @@ impl Splats {
         let viewmat = glam::Mat4::from(camera.w2c()).transpose().to_cols_array();
         let sh_per_ch = self.sh_coeffs.shape[1] as u32;
 
-        // Frame-local clones of the growable buffers: if they are reallocated
-        // after the counters readback below, this frame still finishes on the
-        // old buffers and the larger ones take effect next frame.
+        // The sorts consume their inputs by value, so the frame works on
+        // clones of the scratch's isect tensors (a handle clone, not a copy).
         let tile_ids = scratch.tile_ids.clone();
         let gaussian_ids = scratch.gaussian_ids.clone();
         // viewmat stays a per-frame 64-byte upload — measured negligible,
         // not worth scalar-arg plumbing.
         let viewmat = GpuTensor::from(client, [16], viewmat);
 
-        zero_buffers::launch::<WgpuRuntime>(
+        zero_counters::launch::<WgpuRuntime>(
             client,
-            calculate_cube_count_elemwise(client, 2 + 2 * num_tiles, cube_dim),
+            calculate_cube_count_elemwise(client, 2, cube_dim),
             cube_dim,
             scratch.counters.as_buffer_arg(),
-            scratch.tile_ranges.as_buffer_arg(),
         );
 
         crate::project::project_splats::launch::<WgpuRuntime>(
@@ -221,8 +218,7 @@ impl Splats {
         );
 
         let [num_isects_raw, num_visible] = scratch.counters.read_pair().await;
-        let num_isects = num_isects_raw.min(max_isects as u32);
-        scratch.grow_isects(client, num_isects_raw);
+        let num_isects = num_isects_raw.min(max_isects);
         let (_sorted_keys, depth_order) = radix_argsort_with(
             scratch.depth_keys.clone(),
             scratch.depth_order.clone(),
@@ -242,22 +238,18 @@ impl Splats {
             scratch.tile_counts.clone(),
             scratch.depth_keys.clone(),
             num_visible,
-            &scratch.scan,
+            &scratch.sort_depth.scan,
         );
 
         map_isects::launch::<WgpuRuntime>(
             client,
-            calculate_cube_count_elemwise(
-                client,
-                num_visible as usize,
-                CubeDim::new_1d(helpers::TILE_SIZE),
-            ),
-            CubeDim::new_1d(helpers::TILE_SIZE),
+            calculate_cube_count_elemwise(client, num_visible as usize, cube_dim),
+            cube_dim,
             depth_order.as_buffer_arg(),
             scratch.tile_bbox.as_buffer_arg(),
             scratch.depth_keys.as_buffer_arg(),
             tile_bounds.x,
-            max_isects as u32,
+            max_isects,
             tile_ids.as_buffer_arg(),
             gaussian_ids.as_buffer_arg(),
             num_visible,
@@ -275,19 +267,6 @@ impl Splats {
             &scratch.sort_tile,
         );
 
-        build_tile_ranges::launch::<WgpuRuntime>(
-            client,
-            calculate_cube_count_elemwise(
-                client,
-                num_isects as usize,
-                CubeDim::new_1d(helpers::TILE_SIZE),
-            ),
-            CubeDim::new_1d(helpers::TILE_SIZE),
-            tile_ids.as_buffer_arg(),
-            scratch.tile_ranges.as_buffer_arg(),
-            num_isects,
-        );
-
         let row_stride = scratch.bitmap.shape[1] as u32;
         rasterize_kernel::launch::<WgpuRuntime>(
             client,
@@ -296,14 +275,16 @@ impl Splats {
             img_size.x,
             img_size.y,
             row_stride,
+            num_isects,
+            tile_ids.as_buffer_arg(),
             gaussian_ids.as_buffer_arg(),
-            scratch.tile_ranges.as_buffer_arg(),
             scratch.projected.as_buffer_arg(),
             scratch.bitmap.as_buffer_arg(),
             // Browser shader validation forbids the shared-memory early exit
             // (see the kernel); native keeps it.
             EARLY_EXIT,
         );
+        scratch.last_isects_raw = num_isects_raw;
         scratch.bitmap.clone()
     }
 }
@@ -353,26 +334,28 @@ fn map_isects(
 }
 
 #[cube(launch)]
-fn zero_buffers(counters: &mut [u32], tile_ranges: &mut [u32]) {
+fn zero_counters(counters: &mut [u32]) {
     let idx = ABSOLUTE_POS_X as usize;
-    if idx < 2 {
+    if idx < counters.len() {
         counters[idx] = 0;
-    } else if idx < 2 + tile_ranges.len() {
-        tile_ranges[idx - 2] = 0;
     }
 }
 
-#[cube(launch)]
-fn build_tile_ranges(ids: &[u32], ranges: &mut [u32], num_isects: u32) {
-    if ABSOLUTE_POS_X < num_isects {
-        let cur = ids[ABSOLUTE_POS_X as usize];
-        if ABSOLUTE_POS_X == 0 || ids[(ABSOLUTE_POS_X - 1) as usize] != cur {
-            ranges[cur as usize * 2] = ABSOLUTE_POS_X;
-        }
-        if ABSOLUTE_POS_X == num_isects - 1 || ids[(ABSOLUTE_POS_X + 1) as usize] != cur {
-            ranges[cur as usize * 2 + 1] = ABSOLUTE_POS_X + 1;
+/// Index of the first isect in the sorted ids whose tile is >= `target` —
+/// this tile's run start; searching for `tile + 1` gives its end.
+#[cube]
+fn lower_bound(ids: &[u32], n: u32, target: u32) -> u32 {
+    let mut lo = 0u32;
+    let mut hi = n;
+    while lo < hi {
+        let mid = (lo + hi) / 2u32;
+        if ids[mid as usize] < target {
+            lo = mid + 1u32;
+        } else {
+            hi = mid;
         }
     }
+    lo
 }
 
 #[cube]
@@ -385,8 +368,9 @@ fn rasterize_kernel(
     img_size_x: u32,
     img_size_y: u32,
     row_stride: u32,
+    num_isects: u32,
+    tile_ids: &[u32],
     gaussian_ids_by_tile: &[u32],
-    tile_ranges: &[u32],
     projected: &[f32],
     bitmap: &mut [u32],
     #[comptime] early_exit: bool,
@@ -396,8 +380,11 @@ fn rasterize_kernel(
     let tile_id = CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X;
     let in_bounds = px < img_size_x && py < img_size_y;
 
-    let range_start = tile_ranges[tile_id as usize * 2];
-    let range_end = tile_ranges[tile_id as usize * 2 + 1];
+    // Each tile locates its run in the sorted isects with two lower-bound
+    // searches — no separate range-building pass; empty tiles fall out as
+    // start == end.
+    let range_start = lower_bound(tile_ids, num_isects, tile_id);
+    let range_end = lower_bound(tile_ids, num_isects, tile_id + 1u32);
 
     // Stage one workgroup-sized chunk of isects in shared memory: each isect's
     // 36-byte row is fetched from global memory once per tile instead of once
@@ -503,8 +490,6 @@ mod tests {
     use crate::tensor::GpuTensor;
     use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
 
-    const SENTINEL: u32 = 0xDEAD_BEEF;
-
     // Golden from current rasterizer; regenerate only with documented behavior change.
     const GOLDEN_CENTER: [i32; 3] = [127, 127, 127];
 
@@ -526,11 +511,7 @@ mod tests {
         }
         let sh = vec![0.0; 5 * 3];
         let splats = Splats::new(attributes, sh, &client);
-        let camera = crate::camera::Camera {
-            fov: glam::Vec2::splat(0.8),
-            position: glam::Vec3::ZERO,
-            rotation: glam::Quat::IDENTITY,
-        };
+        let camera = crate::camera::Camera::default();
         let mut scratch = RenderScratch::new(&client, 5, glam::uvec2(32, 32));
         let bitmap =
             pollster::block_on(splats.render_with(&mut scratch, &camera, glam::uvec2(32, 32)));
@@ -569,9 +550,8 @@ mod tests {
         let sh = vec![0.1f32; 50 * 3];
         let splats = Splats::new(attributes, sh, &client);
         let camera = crate::camera::Camera {
-            fov: glam::Vec2::splat(0.8),
             position: glam::Vec3::new(0.0, -1.0, 0.0),
-            rotation: glam::Quat::IDENTITY,
+            ..Camera::default()
         };
         let mut scratch = RenderScratch::new(&client, 50, glam::uvec2(64, 64));
         let b = pollster::block_on(splats.render_with(&mut scratch, &camera, glam::uvec2(64, 64)))
@@ -590,9 +570,8 @@ mod tests {
             .collect();
         let splats = Splats::new(attributes, vec![0.0; 100 * 3], &client);
         let camera = crate::camera::Camera {
-            fov: glam::Vec2::splat(0.8),
             position: glam::Vec3::new(0.0, -1.2, 0.0),
-            rotation: glam::Quat::IDENTITY,
+            ..Camera::default()
         };
         let mut scratch = RenderScratch::new(&client, 100, glam::uvec2(64, 64));
         pollster::block_on(splats.render_with(&mut scratch, &camera, glam::uvec2(64, 64)));
@@ -614,46 +593,54 @@ mod tests {
         assert!(steady, "steady-state frames keep allocating memory");
     }
 
+    /// Test-only probe of the rasterizer's per-tile range lookup, sharing
+    /// the production `lower_bound`.
+    #[cube(launch)]
+    fn probe_tile_range(ids: &[u32], num_isects: u32, tile: u32, range: &mut [u32]) {
+        if UNIT_POS == 0 {
+            range[0] = lower_bound(ids, num_isects, tile);
+            range[1] = lower_bound(ids, num_isects, tile + 1u32);
+        }
+    }
+
     #[test]
-    fn test_tile_ranges_zeroed_for_empty_tiles() {
+    fn test_tile_ranges_binary_search_matches_cpu() {
         let _gpu = crate::tensor::GPU_TEST_LOCK.lock().unwrap();
         let client = WgpuRuntime::client(&WgpuDevice::default());
-        let num_tiles = 8usize;
-        // Sorted tile ids: tiles 0, 1, 2, 5 have intersections; 3, 4, 6, 7 are empty.
+        // Sorted tile ids: tiles 0, 1, 2, 5 have intersections; 3, 4, 6, 7
+        // are empty. Every tile's rasterizer range must match a CPU
+        // lower-bound pair over the same ids.
         let ids: Vec<u32> = vec![0, 0, 1, 2, 2, 2, 5, 5];
         let ids_t = GpuTensor::from(&client, [ids.len()], &ids[..]);
-        let ranges = GpuTensor::from(&client, [num_tiles * 2], &vec![SENTINEL; num_tiles * 2][..]);
-        let counters = GpuTensor::from(&client, [2], &[SENTINEL, SENTINEL][..]);
 
-        zero_buffers::launch::<WgpuRuntime>(
-            &client,
-            calculate_cube_count_elemwise(
+        let lower_bound_host = |target: u32| {
+            let mut lo = 0usize;
+            let mut hi = ids.len();
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if ids[mid] < target {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            lo as u32
+        };
+
+        for tile in 0..8u32 {
+            let range = GpuTensor::empty(&client, [2]);
+            probe_tile_range::launch::<WgpuRuntime>(
                 &client,
-                2 + 2 * num_tiles,
+                CubeCount::new_single(),
                 CubeDim::new_1d(helpers::TILE_SIZE),
-            ),
-            CubeDim::new_1d(helpers::TILE_SIZE),
-            counters.as_buffer_arg(),
-            ranges.as_buffer_arg(),
-        );
-        build_tile_ranges::launch::<WgpuRuntime>(
-            &client,
-            calculate_cube_count_elemwise(&client, ids.len(), CubeDim::new_1d(helpers::TILE_SIZE)),
-            CubeDim::new_1d(helpers::TILE_SIZE),
-            ids_t.as_buffer_arg(),
-            ranges.as_buffer_arg(),
-            ids.len() as u32,
-        );
-
-        let r: Vec<u32> = ranges.read_vec();
-        assert_eq!(&r[0..2], &[0, 2], "tile 0 range");
-        assert_eq!(&r[2..4], &[2, 3], "tile 1 range");
-        assert_eq!(&r[4..6], &[3, 6], "tile 2 range");
-        assert_eq!(&r[10..12], &[6, 8], "tile 5 range");
-        for t in [3usize, 4, 6, 7] {
-            assert_eq!(&r[t * 2..t * 2 + 2], &[0, 0], "tile {t} must be zeroed");
+                ids_t.as_buffer_arg(),
+                ids.len() as u32,
+                tile,
+                range.as_buffer_arg(),
+            );
+            let r: Vec<u32> = range.read_vec();
+            let expect = [lower_bound_host(tile), lower_bound_host(tile + 1)];
+            assert_eq!(r, expect, "tile {tile}: rasterizer range");
         }
-        let c: Vec<u32> = counters.read_vec();
-        assert_eq!(c, vec![0, 0]);
     }
 }

@@ -55,11 +55,7 @@ fn load_bear() -> Option<(Splats, usize)> {
 
 /// Centered, pulled back along -Y, pitched -90° around X (`Camera::frame_bounds`), fov 0.8.
 fn fixed_camera(splats: &Splats) -> Camera {
-    let mut camera = Camera {
-        fov: glam::Vec2::splat(0.8),
-        position: glam::Vec3::ZERO,
-        rotation: glam::Quat::IDENTITY,
-    };
+    let mut camera = Camera::default();
     camera.frame_bounds(splats.bounds);
     camera
 }

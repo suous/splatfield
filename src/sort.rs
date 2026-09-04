@@ -3,7 +3,7 @@
 //! References:
 //! - <https://github.com/ArthurBrussee/brush/blob/main/crates/brush-sort/src/lib.rs>
 //! - libcusort (onesweep-style warp ranking, see data/libcusort)
-use crate::scan::{ScanBufScratch, exclusive_scan_buf};
+use crate::scan::{ScanScratch, exclusive_scan_buf};
 use crate::tensor::GpuTensor;
 use cubecl::calculate_cube_count_elemwise;
 use cubecl::prelude::*;
@@ -41,37 +41,34 @@ fn count_kernel(
     src: &[u32],
     counts: &mut [u32],
 ) {
-    // Workgroup-shared histogram: each key is read exactly once, then atomically
-    // bucketed — replacing a per-bin loop that re-read every key `bins` times.
-    let histogram = Shared::<[Atomic<u32>]>::new_slice(bins as usize);
-    let mut c = UNIT_POS;
-    while c < bins {
-        histogram[c as usize].store(0u32);
-        c += SORT_WG;
-    }
-    sync_cube();
-
     // CUBE_POS linearizes the workgroup id: the grid may be spread over Y/Z
     // when the X count exceeds the hardware limit (CubeCountSelection).
     let wg = CUBE_POS as u32;
-    if wg < num_wgs {
-        let base = block * wg + UNIT_POS;
-        for e in 0..(block / SORT_WG) {
-            let idx = base + e * SORT_WG;
-            if idx < num_keys {
-                let bin = (src[idx as usize] >> shift) & (bins - 1u32);
-                histogram[bin as usize].fetch_add(1u32);
-            }
+    if wg >= num_wgs {
+        terminate!();
+    }
+
+    // Workgroup-shared histogram: each key is read exactly once, then atomically
+    // bucketed — replacing a per-bin loop that re-read every key `bins` times.
+    let histogram = Shared::<[Atomic<u32>]>::new_slice(bins as usize);
+    if UNIT_POS < bins {
+        histogram[UNIT_POS as usize].store(0u32);
+    }
+    sync_cube();
+
+    let base = block * wg + UNIT_POS;
+    for e in 0..(block / SORT_WG) {
+        let idx = base + e * SORT_WG;
+        if idx < num_keys {
+            let bin = (src[idx as usize] >> shift) & (bins - 1u32);
+            histogram[bin as usize].fetch_add(1u32);
         }
     }
     sync_cube();
 
-    let mut b = UNIT_POS;
-    while b < bins {
-        if wg < num_wgs {
-            counts[(b * num_wgs + wg) as usize] = histogram[b as usize].load();
-        }
-        b += SORT_WG;
+    // bins is comptime and below SORT_WG: one bin per thread.
+    if UNIT_POS < bins {
+        counts[(UNIT_POS * num_wgs + wg) as usize] = histogram[UNIT_POS as usize].load();
     }
 }
 
@@ -180,7 +177,8 @@ fn ballot_word(v: u32, bit: u32) -> u32 {
 
 /// Bitmask of the plane lanes whose 7-bit value equals `v`: the 6-bit digit
 /// plus a caller-supplied validity bit (the scatter kernel folds it in) so
-/// tail lanes' placeholder digits never join a real digit group.
+/// tail lanes' placeholder digits never join a real digit group. ANDing one
+/// ballot per bit leaves exactly the lanes equal in all seven.
 #[cube]
 fn match_any9(v: u32) -> u32 {
     ballot_word(v, 0u32)
@@ -190,6 +188,15 @@ fn match_any9(v: u32) -> u32 {
         & ballot_word(v, 4u32)
         & ballot_word(v, 5u32)
         & ballot_word(v, 6u32)
+}
+
+/// Match-any peers of `v` and this lane's rank within the group — the pair
+/// the scatter kernels turn into a slot via a group leader's fetch_add.
+#[cube]
+fn plane_rank(v: u32) -> (u32, u32) {
+    let peers = match_any9(v);
+    let lane_mask = (1u32 << (UNIT_POS_PLANE % 32)) - 1u32;
+    (peers, (peers & lane_mask).count_ones())
 }
 
 /// One 6-bit radix plane pass. Planes rank their items with
@@ -317,9 +324,7 @@ fn scatter8_kernel(
         if valid {
             d = (keys[i as usize] >> shift) & 63u32;
         }
-        let peers = match_any9(d + (valid as u32) * 64u32);
-        let lane_mask = (1u32 << (UNIT_POS_PLANE % 32)) - 1u32;
-        let r = (peers & lane_mask).count_ones();
+        let (peers, r) = plane_rank(d + (valid as u32) * 64u32);
         let leader = peers.trailing_zeros();
         let mut base = 0u32;
         if r == 0 && valid {
@@ -418,7 +423,9 @@ fn plane_sort_path(client: &ComputeClient<WgpuRuntime>) -> Option<u32> {
 #[derive(Debug)]
 pub struct RadixScratch {
     count_buf: GpuTensor,
-    scan: ScanBufScratch,
+    /// Public so callers can share one scratch between sorts and their own
+    /// scans (it is sized for `max_elems`-cell scans, not just the counters).
+    pub(crate) scan: ScanScratch,
     dst_keys: GpuTensor,
     dst_vals: GpuTensor,
 }
@@ -432,7 +439,10 @@ impl RadixScratch {
         ) as usize;
         Self {
             count_buf: GpuTensor::empty(client, [cells]),
-            scan: ScanBufScratch::new(client, cells),
+            // Sized by max_elems (not the smaller counter cell count) so one
+            // instance can also serve outside scans of max_elems cells —
+            // render.rs reuses sort_depth's for the tile-count offsets scan.
+            scan: ScanScratch::new(client, max_elems),
             dst_keys: GpuTensor::empty(client, [max_elems]),
             dst_vals: GpuTensor::empty(client, [max_elems]),
         }
@@ -470,10 +480,9 @@ fn radix_argsort_path(
     let mut cur_vals = vals;
 
     for shift in (0..bits).step_by(passes as usize) {
-        let count_cube = cube_count.clone();
         count_kernel::launch::<WgpuRuntime>(
             &client,
-            count_cube,
+            cube_count.clone(),
             cube_dim,
             num_wgs,
             shift,
@@ -486,11 +495,10 @@ fn radix_argsort_path(
 
         exclusive_scan_buf(&client, count_buf, bins * num_wgs, &scratch.scan);
 
-        let scatter_cube = cube_count.clone();
         match planes {
             Some(num_planes) => scatter8_kernel::launch::<WgpuRuntime>(
                 &client,
-                scatter_cube,
+                cube_count.clone(),
                 cube_dim,
                 num_wgs,
                 shift,
@@ -504,7 +512,7 @@ fn radix_argsort_path(
             ),
             None => scatter_kernel::launch::<WgpuRuntime>(
                 &client,
-                scatter_cube,
+                cube_count.clone(),
                 cube_dim,
                 num_wgs,
                 shift,
@@ -544,43 +552,51 @@ pub fn radix_argsort_with(
     radix_argsort_path(keys, vals, n, bits, planes, scratch)
 }
 
-/// Canary for the plane primitives the 8-bit path builds on: emulated
-/// match-any, group-leader slot reservation, and leader broadcast.
-#[cube(launch)]
-fn probe_plane_kernel(
-    digits: &[u32],
-    ranks: &mut [u32],
-    peers_out: &mut [u32],
-    plane_dims: &mut [u32],
-) {
-    let d = digits[UNIT_POS as usize];
-    let peers = match_any9(d + 256u32);
-    let lane_mask = (1u32 << (UNIT_POS_PLANE % 32)) - 1u32;
-    let rank = (peers & lane_mask).count_ones();
-    peers_out[UNIT_POS as usize] = peers;
-
-    let hist = Shared::<[Atomic<u32>]>::new_slice(128usize);
-    hist[UNIT_POS as usize].store(16u32 * (PLANE_POS + 1u32));
-    sync_cube();
-
-    let leader_lane = peers.trailing_zeros();
-    let mut base = 0u32;
-    if rank == 0 {
-        base = hist[(PLANE_POS * 32u32 + d) as usize].fetch_add(peers.count_ones());
-    }
-    ranks[UNIT_POS as usize] = plane_shuffle(base, leader_lane) + rank;
-
-    if UNIT_POS == 0 {
-        plane_dims[0] = PLANE_DIM;
-    }
-}
-
 #[cfg(test)]
 mod radix_sort_tests {
     use super::*;
     use cubecl::client::ComputeClient;
     use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
     use rand::RngExt;
+
+    /// Canary for the plane primitives the 8-bit path builds on: emulated
+    /// match-any, group-leader slot reservation, and leader broadcast.
+    #[cube(launch)]
+    fn probe_plane_kernel(
+        digits: &[u32],
+        ranks: &mut [u32],
+        peers_out: &mut [u32],
+        plane_dims: &mut [u32],
+    ) {
+        let d = digits[UNIT_POS as usize];
+        let (peers, rank) = plane_rank(d + 256u32);
+        peers_out[UNIT_POS as usize] = peers;
+
+        let hist = Shared::<[Atomic<u32>]>::new_slice(128usize);
+        hist[UNIT_POS as usize].store(16u32 * (PLANE_POS + 1u32));
+        sync_cube();
+
+        let leader_lane = peers.trailing_zeros();
+        let mut base = 0u32;
+        if rank == 0 {
+            base = hist[(PLANE_POS * 32u32 + d) as usize].fetch_add(peers.count_ones());
+        }
+        ranks[UNIT_POS as usize] = plane_shuffle(base, leader_lane) + rank;
+
+        if UNIT_POS == 0 {
+            plane_dims[0] = PLANE_DIM;
+        }
+    }
+
+    /// Both dispatch paths: the 4-bit fallback always, plus the plane path
+    /// when the device supports it.
+    fn all_paths(client: &ComputeClient<WgpuRuntime>) -> Vec<Option<u32>> {
+        let mut paths = vec![None];
+        if let Some(planes) = plane_sort_path(client) {
+            paths.push(Some(planes));
+        }
+        paths
+    }
 
     #[test]
     fn test_plane_probe() {
@@ -638,10 +654,7 @@ mod radix_sort_tests {
         values_inp: &[u32],
         bits: u32,
     ) {
-        let mut paths: Vec<Option<u32>> = vec![None]; // 4-bit fallback always
-        if let Some(planes) = plane_sort_path(client) {
-            paths.push(Some(planes)); // plane path when supported
-        }
+        let paths = all_paths(client);
         for planes in &paths {
             let keys = GpuTensor::from(client, [keys_inp.len()], keys_inp);
             let values = GpuTensor::from(client, [values_inp.len()], values_inp);
@@ -698,10 +711,7 @@ mod radix_sort_tests {
         // Both dispatch paths are exercised so the fallback stays correct on
         // plane-capable machines too.
         let client = WgpuRuntime::client(&WgpuDevice::default());
-        let mut paths: Vec<Option<u32>> = vec![None]; // 4-bit fallback always
-        if let Some(planes) = plane_sort_path(&client) {
-            paths.push(Some(planes)); // 8-bit path when supported
-        }
+        let paths = all_paths(&client);
         let mut rng = rand::rng();
         for n in [1000usize, 5000, 200_000] {
             let keys_inp: Vec<u32> = (0..n).map(|_| rng.random_range(0..37)).collect();

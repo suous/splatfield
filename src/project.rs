@@ -174,93 +174,94 @@ pub(crate) fn project_splats(
     tile_counts: &mut [u32],
     tile_bbox: &mut [u32],
 ) {
-    if ABSOLUTE_POS_X < depth_order.len() as u32 {
-        // Splat attributes are FIELD-MAJOR: 11 planes of n floats —
-        // [x][y][z][qw][qx][qy][qz][sx][sy][sz][opacity] — so a warp's loads
-        // coalesce (write-once, read-per-frame data).
-        let n = depth_order.len();
-        let i = ABSOLUTE_POS_X as usize;
-        let mean = Vec3F {
-            x: attributes[i],
-            y: attributes[n + i],
-            z: attributes[2 * n + i],
-        };
-        let quat = Vec4F {
-            w: attributes[3 * n + i],
-            x: attributes[4 * n + i],
-            y: attributes[5 * n + i],
-            z: attributes[6 * n + i],
-        };
-        let scale = Vec3F {
-            x: attributes[7 * n + i].exp(),
-            y: attributes[8 * n + i].exp(),
-            z: attributes[9 * n + i].exp(),
-        };
-        let opacity = helpers::sigmoid(attributes[10 * n + i]);
-        if opacity < ALPHA_CUTOFF {
-            terminate!();
-        }
-
-        let (cam, rot) = to_camera_space(viewmat, mean);
-        if cam.z <= 0.1f32 {
-            terminate!();
-        }
-        let cov2d = compute_cov2d(scale, quat, &rot, focal, cam, img_size);
-        let conic = compute_conic(cov2d.x, cov2d.y, cov2d.z);
-
-        // Downstream state (depth_order payload, projected rows, tile_counts,
-        // tile_bbox) is all indexed by splat id.
-        let vis_slot = counters[1].fetch_add(1u32);
-        depth_order[vis_slot as usize] = ABSOLUTE_POS_X;
-        depth_keys[vis_slot as usize] = crate::render::depth_key(cam.z);
-
-        let dir = Vec3F {
-            x: mean.x - camera_pos.x,
-            y: mean.y - camera_pos.y,
-            z: mean.z - camera_pos.z,
-        };
-        let (r, g, b) = helpers::sh_to_rgb(
-            sh_per_ch,
-            normalize(dir),
-            ABSOLUTE_POS_X,
-            n as u32,
-            sh_coeffs,
-        );
-
-        let inv_cam_z = cam.z.recip();
-        let mean2d = Vec2F {
-            x: focal.x * cam.x * inv_cam_z + img_size.x * 0.5,
-            y: focal.y * cam.y * inv_cam_z + img_size.y * 0.5,
-        };
-        let out_base = i * 9;
-        projected_splats[out_base] = mean2d.x;
-        projected_splats[out_base + 1] = mean2d.y;
-        projected_splats[out_base + 2] = conic.x;
-        projected_splats[out_base + 3] = conic.y;
-        projected_splats[out_base + 4] = conic.z;
-        projected_splats[out_base + 5] = r + 0.5f32;
-        projected_splats[out_base + 6] = g + 0.5f32;
-        projected_splats[out_base + 7] = b + 0.5f32;
-        projected_splats[out_base + 8] = opacity;
-
-        let cutoff = (opacity / ALPHA_CUTOFF).ln();
-        let ext = Vec2F {
-            x: (2.0 * cutoff * cov2d.x).sqrt(),
-            y: (2.0 * cutoff * cov2d.z).sqrt(),
-        };
-        let bb = helpers::tile_bbox(mean2d, ext, tile_bounds);
-        // Count, don't emit: the map kernel re-emits from this exact bbox
-        // after the depth sort, at prefix-sum offsets, so intersections land
-        // in depth order and a single stable tile sort suffices. The bbox is
-        // stored (packed u16 coords) rather than recomputed so the emission
-        // count can never diverge from this count.
-        let num_tiles = (bb.max_x - bb.min_x) * (bb.max_y - bb.min_y);
-        tile_counts[i] = num_tiles;
-        counters[0].fetch_add(num_tiles);
-        let pack = i * 2;
-        tile_bbox[pack] = bb.min_x | (bb.min_y << 16u32);
-        tile_bbox[pack + 1] = bb.max_x | (bb.max_y << 16u32);
+    if ABSOLUTE_POS_X >= depth_order.len() as u32 {
+        terminate!();
     }
+    // Splat attributes are FIELD-MAJOR: 11 planes of n floats —
+    // [x][y][z][qw][qx][qy][qz][sx][sy][sz][opacity] — so a warp's loads
+    // coalesce (write-once, read-per-frame data).
+    let n = depth_order.len();
+    let i = ABSOLUTE_POS_X as usize;
+    let mean = Vec3F {
+        x: attributes[i],
+        y: attributes[n + i],
+        z: attributes[2 * n + i],
+    };
+    let quat = Vec4F {
+        w: attributes[3 * n + i],
+        x: attributes[4 * n + i],
+        y: attributes[5 * n + i],
+        z: attributes[6 * n + i],
+    };
+    let scale = Vec3F {
+        x: attributes[7 * n + i].exp(),
+        y: attributes[8 * n + i].exp(),
+        z: attributes[9 * n + i].exp(),
+    };
+    let opacity = helpers::sigmoid(attributes[10 * n + i]);
+    if opacity < ALPHA_CUTOFF {
+        terminate!();
+    }
+
+    let (cam, rot) = to_camera_space(viewmat, mean);
+    if cam.z <= 0.1f32 {
+        terminate!();
+    }
+    let cov2d = compute_cov2d(scale, quat, &rot, focal, cam, img_size);
+    let conic = compute_conic(cov2d.x, cov2d.y, cov2d.z);
+
+    // Downstream state (depth_order payload, projected rows, tile_counts,
+    // tile_bbox) is all indexed by splat id.
+    let vis_slot = counters[1].fetch_add(1u32);
+    depth_order[vis_slot as usize] = ABSOLUTE_POS_X;
+    depth_keys[vis_slot as usize] = crate::render::depth_key(cam.z);
+
+    let dir = Vec3F {
+        x: mean.x - camera_pos.x,
+        y: mean.y - camera_pos.y,
+        z: mean.z - camera_pos.z,
+    };
+    let (r, g, b) = helpers::sh_to_rgb(
+        sh_per_ch,
+        normalize(dir),
+        ABSOLUTE_POS_X,
+        n as u32,
+        sh_coeffs,
+    );
+
+    let inv_cam_z = cam.z.recip();
+    let mean2d = Vec2F {
+        x: focal.x * cam.x * inv_cam_z + img_size.x * 0.5,
+        y: focal.y * cam.y * inv_cam_z + img_size.y * 0.5,
+    };
+    let out_base = i * 9;
+    projected_splats[out_base] = mean2d.x;
+    projected_splats[out_base + 1] = mean2d.y;
+    projected_splats[out_base + 2] = conic.x;
+    projected_splats[out_base + 3] = conic.y;
+    projected_splats[out_base + 4] = conic.z;
+    projected_splats[out_base + 5] = r + 0.5f32;
+    projected_splats[out_base + 6] = g + 0.5f32;
+    projected_splats[out_base + 7] = b + 0.5f32;
+    projected_splats[out_base + 8] = opacity;
+
+    let cutoff = (opacity / ALPHA_CUTOFF).ln();
+    let ext = Vec2F {
+        x: (2.0 * cutoff * cov2d.x).sqrt(),
+        y: (2.0 * cutoff * cov2d.z).sqrt(),
+    };
+    let bb = helpers::tile_bbox(mean2d, ext, tile_bounds);
+    // Count, don't emit: the map kernel re-emits from this exact bbox
+    // after the depth sort, at prefix-sum offsets, so intersections land
+    // in depth order and a single stable tile sort suffices. The bbox is
+    // stored (packed u16 coords) rather than recomputed so the emission
+    // count can never diverge from this count.
+    let num_tiles = (bb.max_x - bb.min_x) * (bb.max_y - bb.min_y);
+    tile_counts[i] = num_tiles;
+    counters[0].fetch_add(num_tiles);
+    let pack = i * 2;
+    tile_bbox[pack] = bb.min_x | (bb.min_y << 16u32);
+    tile_bbox[pack + 1] = bb.max_x | (bb.max_y << 16u32);
 }
 
 #[cfg(test)]

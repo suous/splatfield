@@ -104,7 +104,7 @@ impl App {
                 render_state.device.clone(),
                 render_state.queue.clone(),
             ))),
-            controller: camera::Controller::new(),
+            controller: camera::Controller::default(),
             client: WgpuRuntime::client(&device),
             scratch: Rc::new(RefCell::new(None)),
             splats: Arc::new(Mutex::new(Loaded::default())),

@@ -30,20 +30,30 @@ pub fn parse_ply(mut reader: impl BufRead) -> Result<CpuSplats> {
             .ok_or_else(|| anyhow!("Missing property: {name}"))
     };
 
-    let idx_x = get_idx("x")?;
-    let idx_y = get_idx("y")?;
-    let idx_z = get_idx("z")?;
-    let idx_s0 = get_idx("scale_0")?;
-    let idx_s1 = get_idx("scale_1")?;
-    let idx_s2 = get_idx("scale_2")?;
-    let idx_op = get_idx("opacity")?;
-    let idx_r0 = get_idx("rot_0")?;
-    let idx_r1 = get_idx("rot_1")?;
-    let idx_r2 = get_idx("rot_2")?;
-    let idx_r3 = get_idx("rot_3")?;
-    let idx_dc0 = get_idx("f_dc_0")?;
-    let idx_dc1 = get_idx("f_dc_1")?;
-    let idx_dc2 = get_idx("f_dc_2")?;
+    // Required property order matches the destructured index names below.
+    let mut idx = [0usize; 14];
+    for (slot, name) in idx.iter_mut().zip([
+        "x", "y", "z", "scale_0", "scale_1", "scale_2", "opacity", "rot_0", "rot_1", "rot_2",
+        "rot_3", "f_dc_0", "f_dc_1", "f_dc_2",
+    ]) {
+        *slot = get_idx(name)?;
+    }
+    let [
+        idx_x,
+        idx_y,
+        idx_z,
+        idx_s0,
+        idx_s1,
+        idx_s2,
+        idx_op,
+        idx_r0,
+        idx_r1,
+        idx_r2,
+        idx_r3,
+        idx_dc0,
+        idx_dc1,
+        idx_dc2,
+    ] = idx;
 
     let mut rest_keys: Vec<(usize, usize)> = properties
         .iter()

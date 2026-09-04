@@ -153,7 +153,8 @@ pub fn parse_sog(reader: impl Read + Seek) -> Result<CpuSplats> {
         let (centroids, cw) = decode_rgba(&mut zip, &sh_n.files[0], 0)?;
         let (labels, _) = decode_rgba(&mut zip, &sh_n.files[1], n)?;
         let codebook = &sh_n.codebook;
-        let palette_count = (cw / sh_coeffs_per_ch) * (centroids.len() / 4 / cw);
+        // Rows hold whole palettes: total palettes is just pixels / coeffs.
+        let palette_count = centroids.len() / 4 / sh_coeffs_per_ch;
 
         for (i, c) in rgba_pixels(&labels).take(n) {
             let label = c[0] as usize | (c[1] as usize) << 8;

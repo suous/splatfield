@@ -24,11 +24,7 @@ fn main() {
         attributes[10 * n + i] = 8.0;
     }
     let splats = Splats::new(attributes, vec![0.0; n * 3], &client);
-    let camera = Camera {
-        fov: glam::Vec2::splat(0.8),
-        position: glam::Vec3::ZERO,
-        rotation: glam::Quat::IDENTITY,
-    };
+    let camera = Camera::default();
     let mut scratch = RenderScratch::new(&client, n, glam::uvec2(32, 32));
     let bitmap = pollster::block_on(splats.render_with(&mut scratch, &camera, glam::uvec2(32, 32)));
     let px: Vec<u32> = bitmap.read_vec();
