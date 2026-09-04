@@ -9,6 +9,19 @@ use cubecl::zspace::Shape;
 #[cfg(test)]
 pub(crate) static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Lock the GPU and hand back a client on the shared test device. Hold the
+/// guard for the whole test body.
+#[cfg(test)]
+pub(crate) fn test_client() -> (
+    std::sync::MutexGuard<'static, ()>,
+    ComputeClient<WgpuRuntime>,
+) {
+    (
+        GPU_TEST_LOCK.lock().unwrap(),
+        WgpuRuntime::client(&cubecl::wgpu::WgpuDevice::default()),
+    )
+}
+
 #[derive(Clone)]
 pub struct GpuTensor {
     pub client: ComputeClient<WgpuRuntime>,
@@ -35,6 +48,7 @@ impl GpuTensor {
 
     pub fn empty(client: &ComputeClient<WgpuRuntime>, shape: impl Into<Shape>) -> GpuTensor {
         let shape = shape.into();
+        // All buffers hold 4-byte elements (f32/u32), so f32 sizing covers both.
         let buffer = client.empty(shape.iter().product::<usize>() * size_of::<f32>());
         Self::new(client.clone(), shape, buffer)
     }
@@ -53,6 +67,12 @@ impl GpuTensor {
     pub fn read_vec<T: bytemuck::Pod>(&self) -> Vec<T> {
         let bytes = self.client.read_one_unchecked(self.handle.clone());
         bytemuck::cast_slice(&bytes).to_vec()
+    }
+
+    /// Overwrite the buffer in place — stream-ordered, non-blocking, no kernel.
+    pub fn write<T: bytemuck::NoUninit + Send + Sync>(&self, data: impl Into<Vec<T>>) {
+        self.client
+            .write(&self.handle, cubecl::bytes::Bytes::from_elems(data.into()));
     }
 
     pub async fn read_pair(&self) -> [u32; 2] {

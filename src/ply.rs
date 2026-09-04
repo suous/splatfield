@@ -1,3 +1,7 @@
+use crate::helpers::{
+    ATTR_PLANES, PLANE_OPACITY, PLANE_QW, PLANE_QX, PLANE_QY, PLANE_QZ, PLANE_SX, PLANE_SY,
+    PLANE_SZ, PLANE_X, PLANE_Y, PLANE_Z,
+};
 use crate::render::CpuSplats;
 use anyhow::{Context, Result, anyhow};
 use std::io::BufRead;
@@ -30,30 +34,20 @@ pub fn parse_ply(mut reader: impl BufRead) -> Result<CpuSplats> {
             .ok_or_else(|| anyhow!("Missing property: {name}"))
     };
 
-    // Required property order matches the destructured index names below.
-    let mut idx = [0usize; 14];
-    for (slot, name) in idx.iter_mut().zip([
-        "x", "y", "z", "scale_0", "scale_1", "scale_2", "opacity", "rot_0", "rot_1", "rot_2",
-        "rot_3", "f_dc_0", "f_dc_1", "f_dc_2",
-    ]) {
-        *slot = get_idx(name)?;
-    }
-    let [
-        idx_x,
-        idx_y,
-        idx_z,
-        idx_s0,
-        idx_s1,
-        idx_s2,
-        idx_op,
-        idx_r0,
-        idx_r1,
-        idx_r2,
-        idx_r3,
-        idx_dc0,
-        idx_dc1,
-        idx_dc2,
-    ] = idx;
+    let (idx_x, idx_y, idx_z) = (get_idx("x")?, get_idx("y")?, get_idx("z")?);
+    let (idx_s0, idx_s1, idx_s2) = (
+        get_idx("scale_0")?,
+        get_idx("scale_1")?,
+        get_idx("scale_2")?,
+    );
+    let idx_op = get_idx("opacity")?;
+    let (idx_r0, idx_r1, idx_r2, idx_r3) = (
+        get_idx("rot_0")?,
+        get_idx("rot_1")?,
+        get_idx("rot_2")?,
+        get_idx("rot_3")?,
+    );
+    let (idx_dc0, idx_dc1, idx_dc2) = (get_idx("f_dc_0")?, get_idx("f_dc_1")?, get_idx("f_dc_2")?);
 
     let mut rest_keys: Vec<(usize, usize)> = properties
         .iter()
@@ -69,32 +63,32 @@ pub fn parse_ply(mut reader: impl BufRead) -> Result<CpuSplats> {
 
     let stride = properties.len();
 
-    let mut buf = vec![0u8; vertex_count * stride * 4];
-    reader.read_exact(&mut buf).context("Failed read vertex")?;
+    let mut data = vec![0f32; vertex_count * stride];
+    reader
+        .read_exact(bytemuck::cast_slice_mut(&mut data))
+        .context("Failed read vertex")?;
     // Free the file bytes before the big allocations: wasm32 linear memory is
     // capped at 4 GiB, so every large buffer is released as early as possible.
     drop(reader);
 
-    let float_data: &[f32] = bytemuck::cast_slice(&buf);
     let n = rest_keys.len() / 3;
     let vc = vertex_count;
-    // Field-major output (see CpuSplats docs): plane k of splat i at [k*vc + i].
-    let mut attributes = vec![0f32; vc * 11];
+    let mut attributes = vec![0f32; vc * ATTR_PLANES];
     let mut shs = vec![0f32; vc * (rest_keys.len() + 3)];
 
-    for (i, d) in float_data.chunks(stride).take(vc).enumerate() {
+    for (i, d) in data.chunks(stride).enumerate() {
         let q = glam::Quat::from_xyzw(d[idx_r1], d[idx_r2], d[idx_r3], d[idx_r0]).normalize();
-        attributes[i] = d[idx_x];
-        attributes[vc + i] = d[idx_y];
-        attributes[2 * vc + i] = d[idx_z];
-        attributes[3 * vc + i] = q.w;
-        attributes[4 * vc + i] = q.x;
-        attributes[5 * vc + i] = q.y;
-        attributes[6 * vc + i] = q.z;
-        attributes[7 * vc + i] = d[idx_s0];
-        attributes[8 * vc + i] = d[idx_s1];
-        attributes[9 * vc + i] = d[idx_s2];
-        attributes[10 * vc + i] = d[idx_op];
+        attributes[PLANE_X * vc + i] = d[idx_x];
+        attributes[PLANE_Y * vc + i] = d[idx_y];
+        attributes[PLANE_Z * vc + i] = d[idx_z];
+        attributes[PLANE_QW * vc + i] = q.w;
+        attributes[PLANE_QX * vc + i] = q.x;
+        attributes[PLANE_QY * vc + i] = q.y;
+        attributes[PLANE_QZ * vc + i] = q.z;
+        attributes[PLANE_SX * vc + i] = d[idx_s0];
+        attributes[PLANE_SY * vc + i] = d[idx_s1];
+        attributes[PLANE_SZ * vc + i] = d[idx_s2];
+        attributes[PLANE_OPACITY * vc + i] = d[idx_op];
 
         shs[i] = d[idx_dc0];
         shs[vc + i] = d[idx_dc1];
@@ -106,7 +100,6 @@ pub fn parse_ply(mut reader: impl BufRead) -> Result<CpuSplats> {
         }
     }
 
-    drop(buf);
     Ok(CpuSplats {
         attributes,
         sh_coeffs: shs,
@@ -146,7 +139,7 @@ mod tests {
     fn test_parse_ply_layout() {
         let bytes = synthetic_ply(3, &["f_rest_0", "f_rest_2", "f_rest_1"]);
         let cpu = parse_ply(&bytes[..]).unwrap();
-        assert_eq!(cpu.attributes.len(), 3 * 11);
+        assert_eq!(cpu.attributes.len(), 3 * ATTR_PLANES);
         // 3 DC + 1 rest per channel (the fixture declares one rest prop per channel).
         assert_eq!(cpu.sh_coeffs.len(), 3 * 6);
 

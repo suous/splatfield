@@ -2,6 +2,7 @@ pub mod camera;
 mod helpers;
 pub mod ply;
 mod project;
+mod raster;
 pub mod render;
 mod scan;
 pub mod sog;

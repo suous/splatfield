@@ -22,6 +22,18 @@ const SCAN_BLOCK: u32 = SCAN_WG * SCAN_EPT;
 // from the parallel scan.
 const SERIAL_SCAN_CELLS: u32 = SCAN_BLOCK * 16;
 
+/// Exclusive-scan `len` cells of `a` in place, starting from `seed`.
+/// Single-threaded: callers gate it on `UNIT_POS == 0` + `sync_cube`.
+#[cube]
+pub(crate) fn serial_exclusive(a: &mut [u32], len: u32, seed: u32) {
+    let mut running = seed;
+    for t in 0..len {
+        let c = a[t as usize];
+        a[t as usize] = running;
+        running += c;
+    }
+}
+
 /// Per-block partial sums for both scan entry points, sized for a maximum
 /// element count so repeated scans allocate nothing.
 #[derive(Debug)]
@@ -77,11 +89,11 @@ fn gather_block_sums(
 }
 
 /// Single-workgroup exclusive scan of the first `num_blocks` cells of `buf`,
-/// in place. Even 4M elements need only 4096 cells — a serial chunk per
-/// thread is plenty. Also serves the radix sort, whose bin-major counters
+/// in place — a serial chunk per thread is plenty (even 4M elements need
+/// only 4096 cells). Also serves the radix sort, whose bin-major counters
 /// flatten to one addressable array (see count_kernel in sort.rs).
 #[cube(launch)]
-fn scan_block_sums(num_blocks: u32, block_sums: &mut [u32]) {
+fn scan_serial(num_blocks: u32, block_sums: &mut [u32]) {
     let mut partials = Shared::<[u32]>::new_slice(SCAN_WG as usize);
 
     let chunk = num_blocks.div_ceil(SCAN_WG);
@@ -96,12 +108,7 @@ fn scan_block_sums(num_blocks: u32, block_sums: &mut [u32]) {
     sync_cube();
 
     if UNIT_POS == 0 {
-        let mut running = 0u32;
-        for t in 0..SCAN_WG {
-            let c = partials[t as usize];
-            partials[t as usize] = running;
-            running += c;
-        }
+        serial_exclusive(&mut partials, SCAN_WG, 0u32);
     }
     sync_cube();
 
@@ -168,12 +175,7 @@ fn apply_block_offsets(n: u32, block_sums: &[u32], offsets: &mut [u32]) {
     // `block_sums` is already exclusively scanned; thread 0 extends the scan
     // to per-thread bases.
     if UNIT_POS == 0 {
-        let mut running = block_sums[wg as usize];
-        for t in 0..SCAN_WG {
-            let c = thread_sums[t as usize];
-            thread_sums[t as usize] = running;
-            running += c;
-        }
+        serial_exclusive(&mut thread_sums, SCAN_WG, block_sums[wg as usize]);
     }
     sync_cube();
 
@@ -199,7 +201,7 @@ pub(crate) fn exclusive_scan_buf(
     scratch: &ScanScratch,
 ) {
     if n <= SERIAL_SCAN_CELLS {
-        scan_block_sums::launch::<WgpuRuntime>(
+        scan_serial::launch::<WgpuRuntime>(
             client,
             CubeCount::new_single(),
             CubeDim::new_1d(SCAN_WG),
@@ -226,9 +228,9 @@ pub(crate) fn exclusive_scan_buf(
 /// `offsets` the per-rank emission base for the map kernel. `offsets` is
 /// scratch for the duration of the call: it transiently holds gathered counts.
 pub(crate) fn exclusive_scan_gather(
-    gids: GpuTensor,
-    counts: GpuTensor,
-    offsets: GpuTensor,
+    gids: &GpuTensor,
+    counts: &GpuTensor,
+    offsets: &GpuTensor,
     n: u32,
     scratch: &ScanScratch,
 ) {
@@ -254,10 +256,9 @@ pub(crate) fn exclusive_scan_gather(
         scratch.block_sums.as_buffer_arg(),
     );
 
-    // Below the threshold one serial workgroup scans the gathered counts in
-    // place — a third of the launches (see SERIAL_SCAN_CELLS).
+    // Serial path: one launch instead of three (see SERIAL_SCAN_CELLS).
     if n <= SERIAL_SCAN_CELLS {
-        scan_block_sums::launch::<WgpuRuntime>(
+        scan_serial::launch::<WgpuRuntime>(
             &client,
             CubeCount::new_single(),
             cube_dim,
@@ -266,7 +267,7 @@ pub(crate) fn exclusive_scan_gather(
         );
         return;
     }
-    scan_and_apply(&client, n, cube_count, cube_dim, scratch, &offsets);
+    scan_and_apply(&client, n, cube_count, cube_dim, scratch, offsets);
 }
 
 /// Shared hierarchical tail: exclusive-scan the per-block totals, then add
@@ -279,7 +280,7 @@ fn scan_and_apply(
     scratch: &ScanScratch,
     buf: &GpuTensor,
 ) {
-    scan_block_sums::launch::<WgpuRuntime>(
+    scan_serial::launch::<WgpuRuntime>(
         client,
         CubeCount::new_single(),
         cube_dim,
@@ -299,13 +300,11 @@ fn scan_and_apply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cubecl::wgpu::WgpuDevice;
     use rand::RngExt;
 
     #[test]
     fn test_scan_gather_matches_cpu() {
-        let _gpu = crate::tensor::GPU_TEST_LOCK.lock().unwrap();
-        let client = WgpuRuntime::client(&WgpuDevice::default());
+        let (_gpu, client) = crate::tensor::test_client();
         let mut rng = rand::rng();
         for n in [1usize, 5, 1024, 1025, 100_000] {
             let counts: Vec<u32> = (0..n).map(|_| rng.random_range(0..20)).collect();
@@ -319,7 +318,7 @@ mod tests {
             let counts_t = GpuTensor::from(&client, [n], &counts[..]);
             let offsets_t = GpuTensor::empty(&client, [n]);
             let scratch = ScanScratch::new(&client, n);
-            exclusive_scan_gather(gids_t, counts_t, offsets_t.clone(), n as u32, &scratch);
+            exclusive_scan_gather(&gids_t, &counts_t, &offsets_t, n as u32, &scratch);
 
             let offsets: Vec<u32> = offsets_t.read_vec();
             let mut running = 0u32;
@@ -335,12 +334,12 @@ mod tests {
 
     #[test]
     fn test_scan_zero() {
-        let client = WgpuRuntime::client(&WgpuDevice::default());
+        let (_gpu, client) = crate::tensor::test_client();
         let gids = GpuTensor::from(&client, [1], &[0u32][..]);
         let counts = GpuTensor::from(&client, [1], &[7u32][..]);
         let offsets = GpuTensor::from(&client, [1], &[0xDEAD_BEEFu32][..]);
         let scratch = ScanScratch::new(&client, 1);
-        exclusive_scan_gather(gids, counts, offsets.clone(), 0, &scratch);
+        exclusive_scan_gather(&gids, &counts, &offsets, 0, &scratch);
         let out: Vec<u32> = offsets.read_vec();
         assert_eq!(out, vec![0xDEAD_BEEF], "n=0 must not touch the output");
     }

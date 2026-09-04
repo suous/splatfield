@@ -1,4 +1,4 @@
-use egui::{CursorIcon, PointerButton, Response};
+use eframe::egui::{self, CursorIcon, PointerButton, Response};
 use glam::{Affine3A, Quat, UVec2, Vec2, Vec3};
 
 #[derive(Clone)]
@@ -43,7 +43,7 @@ impl Camera {
     pub fn frame_bounds(&mut self, (min, max): (Vec3, Vec3)) -> f32 {
         let d = (max - min).max_element() * 2.0;
         self.position = (min + max) * 0.5 - Vec3::Y * d;
-        self.rotation = Quat::from_rotation_x((-90f32).to_radians());
+        self.rotation = Quat::from_rotation_x(-core::f32::consts::FRAC_PI_2);
         d
     }
 }
@@ -68,7 +68,15 @@ impl Controller {
     }
 
     pub fn tick(&mut self, response: &Response, ui: &egui::Ui) {
-        let (touch, mods) = ui.input(|i| (i.multi_touch(), i.modifiers));
+        let (touch, mods, pointer_delta, scroll, translation) = ui.input(|i| {
+            (
+                i.multi_touch(),
+                i.modifiers,
+                i.pointer.delta(),
+                i.smooth_scroll_delta.y,
+                i.translation_delta(),
+            )
+        });
         let t = touch.is_some();
         let is_pan = !t
             && (response.dragged_by(PointerButton::Middle)
@@ -87,7 +95,7 @@ impl Controller {
         let drag = if response.drag_started() {
             Vec2::ZERO
         } else {
-            ui.input(|i| glam::vec2(i.pointer.delta().x, i.pointer.delta().y))
+            glam::vec2(pointer_delta.x, pointer_delta.y)
         };
         let pivot = self.camera.position + self.camera.rotation * Vec3::Z * self.focus_distance;
 
@@ -97,7 +105,6 @@ impl Controller {
             self.camera.rotation = (yaw * pitch * self.camera.rotation).normalize();
         }
 
-        let (scroll, td) = ui.input(|i| (i.smooth_scroll_delta.y, i.translation_delta()));
         let zoom = scroll * 0.001 + touch.map_or(0.0, |m| (m.zoom_delta - 1.0) * 2.0);
         self.focus_distance = (self.focus_distance * (1.0 - zoom)).clamp(0.1, 10000.0);
         self.camera.position = pivot - self.camera.rotation * Vec3::Z * self.focus_distance;
@@ -105,8 +112,8 @@ impl Controller {
         let m = self.focus_distance / response.rect.width().max(response.rect.height());
         let pan = if is_pan {
             drag
-        } else if td != egui::Vec2::ZERO && scroll == 0.0 {
-            glam::vec2(td.x, td.y)
+        } else if translation != egui::Vec2::ZERO && scroll == 0.0 {
+            glam::vec2(translation.x, translation.y)
         } else {
             Vec2::ZERO
         };

@@ -1,3 +1,4 @@
+use crate::helpers::{ATTR_PLANES, PLANE_OPACITY, PLANE_QW, PLANE_SX, PLANE_X, PLANE_Y, PLANE_Z};
 use crate::render::CpuSplats;
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -72,7 +73,7 @@ fn logit(y: f32) -> f32 {
 }
 
 fn unpack_quat(px: u8, py: u8, pz: u8, tag: u8) -> [f32; 4] {
-    let sqrt2 = std::f32::consts::SQRT_2;
+    let sqrt2 = core::f32::consts::SQRT_2;
     let a = (px as f32 / u8::MAX as f32 * 2.0 - 1.0) / sqrt2;
     let b = (py as f32 / u8::MAX as f32 * 2.0 - 1.0) / sqrt2;
     let c = (pz as f32 / u8::MAX as f32 * 2.0 - 1.0) / sqrt2;
@@ -97,7 +98,7 @@ pub fn parse_sog(reader: impl Read + Seek) -> Result<CpuSplats> {
     let meta: Meta = serde_json::from_reader(zip.by_name("meta.json")?)?;
 
     let n = meta.count;
-    let mut attributes = vec![0f32; n * 11];
+    let mut attributes = vec![0f32; n * ATTR_PLANES];
 
     let (lo, _) = decode_rgba(&mut zip, &meta.means.files[0], n)?;
     let (hi, _) = decode_rgba(&mut zip, &meta.means.files[1], n)?;
@@ -105,12 +106,11 @@ pub fn parse_sog(reader: impl Read + Seek) -> Result<CpuSplats> {
     let spans = glam::Vec3::from_array(meta.means.maxs) - mins;
 
     for ((i, lc), (_, hc)) in rgba_pixels(&lo).zip(rgba_pixels(&hi)).take(n) {
-        // Field-major output (see CpuSplats docs): plane k of splat i at [k*n + i].
-        attributes[i] =
+        attributes[PLANE_X * n + i] =
             inv_log(mins.x + spans.x * u16::from_le_bytes([lc[0], hc[0]]) as f32 / u16::MAX as f32);
-        attributes[n + i] =
+        attributes[PLANE_Y * n + i] =
             inv_log(mins.y + spans.y * u16::from_le_bytes([lc[1], hc[1]]) as f32 / u16::MAX as f32);
-        attributes[2 * n + i] =
+        attributes[PLANE_Z * n + i] =
             inv_log(mins.z + spans.z * u16::from_le_bytes([lc[2], hc[2]]) as f32 / u16::MAX as f32);
     }
 
@@ -118,7 +118,7 @@ pub fn parse_sog(reader: impl Read + Seek) -> Result<CpuSplats> {
     let scale_cb = &meta.scales.codebook;
     for (i, c) in rgba_pixels(&sl).take(n) {
         for k in 0..3 {
-            attributes[(7 + k) * n + i] = scale_cb[c[k] as usize];
+            attributes[(PLANE_SX + k) * n + i] = scale_cb[c[k] as usize];
         }
     }
 
@@ -130,7 +130,7 @@ pub fn parse_sog(reader: impl Read + Seek) -> Result<CpuSplats> {
             _ => [1.0, 0.0, 0.0, 0.0],
         };
         for k in 0..4 {
-            attributes[(3 + k) * n + i] = q[k];
+            attributes[(PLANE_QW + k) * n + i] = q[k];
         }
     }
 
@@ -143,7 +143,7 @@ pub fn parse_sog(reader: impl Read + Seek) -> Result<CpuSplats> {
         for k in 0..3 {
             sh_coeffs[k * n + i] = sh0_cb[c[k] as usize];
         }
-        attributes[10 * n + i] = logit(c[3] as f32 / u8::MAX as f32);
+        attributes[PLANE_OPACITY * n + i] = logit(c[3] as f32 / u8::MAX as f32);
     }
 
     if let Some(ref sh_n) = meta.sh_n {
@@ -172,8 +172,6 @@ pub fn parse_sog(reader: impl Read + Seek) -> Result<CpuSplats> {
         }
     }
 
-    // Release the archive (holds the full dropped-file bytes on wasm) before upload.
-    drop(zip);
     Ok(CpuSplats {
         attributes,
         sh_coeffs,
@@ -232,7 +230,10 @@ mod tests {
         // Measured fixtures: the base bear.sog is a bands=3 model (970_948 splats);
         // _sh1/_sh2 are bands=1/2 models sharing 944_830 splats — not bands 0/1/2
         // of one model, so geometry equality only holds within the _shN pair.
-        let ns: Vec<usize> = parsed.iter().map(|p| p.attributes.len() / 11).collect();
+        let ns: Vec<usize> = parsed
+            .iter()
+            .map(|p| p.attributes.len() / ATTR_PLANES)
+            .collect();
         assert!(ns.iter().all(|&n| n > 100_000));
         assert_eq!(ns[1], ns[2], "sh1/sh2 share geometry");
         let chs: Vec<usize> = parsed

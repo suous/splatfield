@@ -14,9 +14,7 @@ edition = "2024"
 cubecl = { version = "=0.11.0-pre.3", default-features = false, features = ["wgpu", "exclusive-memory-only"] }
 bytemuck = "1.25"
 glam = "0.33"
-egui = "0.36"
 anyhow = "1.0.104"
-log = "0.4"
 image = { version = "0.25", default-features = false, features = ["webp"] }
 zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 serde = { version = "1", features = ["derive"] }
@@ -25,8 +23,6 @@ serde_json = "1"
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 eframe = { version = "0.36", default-features = false, features = ["wgpu", "x11", "wayland"] }
 pollster = "1.0"
-# Only auto color detection; drop regex (log-filter) and humantime features.
-env_logger = { version = "0.11.11", default-features = false, features = ["auto-color"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # Pinning cubecl-common for the wasm target: since 0.11 the `bytes` module is
@@ -39,10 +35,14 @@ wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = ["HtmlCanvasElement", "Document", "Element", "Window"] }
 getrandom = { version = "0.4", features = ["wasm_js"] }
+# getrandom is unused directly: cubecl-environment -> rand needs the wasm_js
+# backend enabled by this leaf crate or the wasm build fails.
 
 [dev-dependencies]
 rand = "0.10"
 criterion = "0.8"
+# Only for examples (RUST_LOG-driven WGSL traces); auto-color only.
+env_logger = { version = "0.11.11", default-features = false, features = ["auto-color"] }
 
 [[bench]]
 name = "radix_sort"

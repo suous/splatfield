@@ -3,10 +3,43 @@
 //! References:
 //! - <https://github.com/graphdeco-inria/diff-gaussian-rasterization/blob/main/cuda_rasterizer/forward.cu>
 //! - <https://github.com/graphdeco-inria/diff-gaussian-rasterization/blob/main/cuda_rasterizer/rasterizer_impl.cu>
-use crate::helpers::{self, Mat3, Vec2F, Vec3F, Vec4F};
+use crate::helpers::{
+    self, Mat3, PLANE_OPACITY, PLANE_QW, PLANE_QX, PLANE_QY, PLANE_QZ, PLANE_SX, PLANE_SY,
+    PLANE_SZ, PLANE_X, PLANE_Y, PLANE_Z, PROJ_FLOATS, Vec2F, Vec3F, Vec4F,
+};
 use cubecl::prelude::*;
 
 const ALPHA_CUTOFF: f32 = 10.0 / u8::MAX as f32;
+
+// counters layout: [total intersection emissions, visible splats]
+
+// z ∈ (0.1, 1e4) keeps the top 4 mantissa bits of the f32 bit pattern constant;
+// dropping 8 low mantissa bits (relative granularity 2^-15) saves two radix
+// passes vs full keys. Ties within the band blend in arbitrary order — the
+// same treatment equal keys already get.
+pub(crate) const DEPTH_KEY_BITS: u32 = 24;
+
+/// Monotonic depth key for `z > 0` (float order == depth order).
+#[cube]
+fn depth_key(z: f32) -> u32 {
+    z.to_bits() >> (32 - DEPTH_KEY_BITS)
+}
+
+/// Per-frame camera state, passed as kernel scalars. `rot`/`trans` are the
+/// world-to-camera transform; `world_pos` is the camera position in world
+/// space (the SH evaluation direction).
+#[derive(CubeType, CubeLaunch, Clone, Copy)]
+#[expand(derive(Clone, Copy))]
+pub(crate) struct CameraView {
+    pub rot0: Vec3F,
+    pub rot1: Vec3F,
+    pub rot2: Vec3F,
+    pub trans: Vec3F,
+    pub focal: Vec2F,
+    pub world_pos: Vec3F,
+    pub img: Vec2F,
+    pub tile_bounds: Vec2F,
+}
 
 #[cube]
 fn dot3(a: Vec3F, b: Vec3F) -> f32 {
@@ -23,33 +56,15 @@ fn normalize(v: Vec3F) -> Vec3F {
     }
 }
 
+/// Camera-space position: the w2c rotation rows dotted with `pos`, plus the
+/// w2c translation.
 #[cube]
-fn to_camera_space(viewmat: &[f32], pos: Vec3F) -> (Vec3F, Mat3) {
-    let rot = Mat3 {
-        row0: Vec3F {
-            x: viewmat[0],
-            y: viewmat[1],
-            z: viewmat[2],
-        },
-        row1: Vec3F {
-            x: viewmat[4],
-            y: viewmat[5],
-            z: viewmat[6],
-        },
-        row2: Vec3F {
-            x: viewmat[8],
-            y: viewmat[9],
-            z: viewmat[10],
-        },
-    };
-
-    let cam = Vec3F {
-        x: dot3(rot.row0, pos) + viewmat[3],
-        y: dot3(rot.row1, pos) + viewmat[7],
-        z: dot3(rot.row2, pos) + viewmat[11],
-    };
-
-    (cam, rot)
+fn to_camera_space(view: &CameraView, pos: Vec3F) -> Vec3F {
+    Vec3F {
+        x: dot3(view.rot0, pos) + view.trans.x,
+        y: dot3(view.rot1, pos) + view.trans.y,
+        z: dot3(view.rot2, pos) + view.trans.z,
+    }
 }
 
 #[cube]
@@ -93,39 +108,36 @@ fn scale_components(v: Vec3F, s: Vec3F) -> Vec3F {
 }
 
 #[cube]
-fn compute_cov2d(
-    scale: Vec3F,
-    quat: Vec4F,
-    rot: &Mat3,
-    focal: Vec2F,
-    cam: Vec3F,
-    img: Vec2F,
-) -> Vec3F {
+fn compute_cov2d(scale: Vec3F, quat: Vec4F, view: &CameraView, cam: Vec3F) -> Vec3F {
+    let rot0 = view.rot0;
+    let rot1 = view.rot1;
+    let rot2 = view.rot2;
+
     let r = quat_to_rotation(quat);
     let m0 = scale_components(r.row0, scale);
     let m1 = scale_components(r.row1, scale);
     let m2 = scale_components(r.row2, scale);
 
     let inv_cam_z = cam.z.recip();
-    let lim_x = 1.3f32 * img.x / (2.0f32 * focal.x);
-    let lim_y = 1.3f32 * img.y / (2.0f32 * focal.y);
+    let lim_x = 1.3f32 * view.img.x / (2.0f32 * view.focal.x);
+    let lim_y = 1.3f32 * view.img.y / (2.0f32 * view.focal.y);
     let u = (cam.x * inv_cam_z).clamp(-lim_x, lim_x);
     let v = (cam.y * inv_cam_z).clamp(-lim_y, lim_y);
 
-    let fx_inv_z = focal.x * inv_cam_z;
+    let fx_inv_z = view.focal.x * inv_cam_z;
     let fu_inv_z = fx_inv_z * u;
     let t0 = Vec3F {
-        x: fx_inv_z * rot.row0.x - fu_inv_z * rot.row2.x,
-        y: fx_inv_z * rot.row0.y - fu_inv_z * rot.row2.y,
-        z: fx_inv_z * rot.row0.z - fu_inv_z * rot.row2.z,
+        x: fx_inv_z * rot0.x - fu_inv_z * rot2.x,
+        y: fx_inv_z * rot0.y - fu_inv_z * rot2.y,
+        z: fx_inv_z * rot0.z - fu_inv_z * rot2.z,
     };
 
-    let fy_inv_z = focal.y * inv_cam_z;
+    let fy_inv_z = view.focal.y * inv_cam_z;
     let fv_inv_z = fy_inv_z * v;
     let t1 = Vec3F {
-        x: fy_inv_z * rot.row1.x - fv_inv_z * rot.row2.x,
-        y: fy_inv_z * rot.row1.y - fv_inv_z * rot.row2.y,
-        z: fy_inv_z * rot.row1.z - fv_inv_z * rot.row2.z,
+        x: fy_inv_z * rot1.x - fv_inv_z * rot2.x,
+        y: fy_inv_z * rot1.y - fv_inv_z * rot2.y,
+        z: fy_inv_z * rot1.z - fv_inv_z * rot2.z,
     };
 
     let j0 = Vec3F {
@@ -159,14 +171,10 @@ fn compute_conic(a: f32, b: f32, c: f32) -> Vec3F {
 
 #[cube(launch)]
 pub(crate) fn project_splats(
-    viewmat: &[f32],
-    focal: Vec2F,
-    camera_pos: Vec3F,
+    view: CameraView,
     attributes: &[f32],
     sh_coeffs: &[f32],
-    sh_per_ch: u32,
-    tile_bounds: Vec2F,
-    img_size: Vec2F,
+    #[comptime] sh_per_ch: u32,
     depth_order: &mut [u32],
     depth_keys: &mut [u32],
     projected_splats: &mut [f32],
@@ -177,49 +185,45 @@ pub(crate) fn project_splats(
     if ABSOLUTE_POS_X >= depth_order.len() as u32 {
         terminate!();
     }
-    // Splat attributes are FIELD-MAJOR: 11 planes of n floats —
-    // [x][y][z][qw][qx][qy][qz][sx][sy][sz][opacity] — so a warp's loads
-    // coalesce (write-once, read-per-frame data).
+    // Attribute planes are field-major (helpers::PLANE_*): warp-coalesced.
     let n = depth_order.len();
     let i = ABSOLUTE_POS_X as usize;
     let mean = Vec3F {
-        x: attributes[i],
-        y: attributes[n + i],
-        z: attributes[2 * n + i],
+        x: attributes[PLANE_X * n + i],
+        y: attributes[PLANE_Y * n + i],
+        z: attributes[PLANE_Z * n + i],
     };
     let quat = Vec4F {
-        w: attributes[3 * n + i],
-        x: attributes[4 * n + i],
-        y: attributes[5 * n + i],
-        z: attributes[6 * n + i],
+        w: attributes[PLANE_QW * n + i],
+        x: attributes[PLANE_QX * n + i],
+        y: attributes[PLANE_QY * n + i],
+        z: attributes[PLANE_QZ * n + i],
     };
     let scale = Vec3F {
-        x: attributes[7 * n + i].exp(),
-        y: attributes[8 * n + i].exp(),
-        z: attributes[9 * n + i].exp(),
+        x: attributes[PLANE_SX * n + i].exp(),
+        y: attributes[PLANE_SY * n + i].exp(),
+        z: attributes[PLANE_SZ * n + i].exp(),
     };
-    let opacity = helpers::sigmoid(attributes[10 * n + i]);
+    let opacity = helpers::sigmoid(attributes[PLANE_OPACITY * n + i]);
     if opacity < ALPHA_CUTOFF {
         terminate!();
     }
 
-    let (cam, rot) = to_camera_space(viewmat, mean);
+    let cam = to_camera_space(&view, mean);
     if cam.z <= 0.1f32 {
         terminate!();
     }
-    let cov2d = compute_cov2d(scale, quat, &rot, focal, cam, img_size);
+    let cov2d = compute_cov2d(scale, quat, &view, cam);
     let conic = compute_conic(cov2d.x, cov2d.y, cov2d.z);
 
-    // Downstream state (depth_order payload, projected rows, tile_counts,
-    // tile_bbox) is all indexed by splat id.
     let vis_slot = counters[1].fetch_add(1u32);
     depth_order[vis_slot as usize] = ABSOLUTE_POS_X;
-    depth_keys[vis_slot as usize] = crate::render::depth_key(cam.z);
+    depth_keys[vis_slot as usize] = depth_key(cam.z);
 
     let dir = Vec3F {
-        x: mean.x - camera_pos.x,
-        y: mean.y - camera_pos.y,
-        z: mean.z - camera_pos.z,
+        x: mean.x - view.world_pos.x,
+        y: mean.y - view.world_pos.y,
+        z: mean.z - view.world_pos.z,
     };
     let (r, g, b) = helpers::sh_to_rgb(
         sh_per_ch,
@@ -231,10 +235,10 @@ pub(crate) fn project_splats(
 
     let inv_cam_z = cam.z.recip();
     let mean2d = Vec2F {
-        x: focal.x * cam.x * inv_cam_z + img_size.x * 0.5,
-        y: focal.y * cam.y * inv_cam_z + img_size.y * 0.5,
+        x: view.focal.x * cam.x * inv_cam_z + view.img.x * 0.5,
+        y: view.focal.y * cam.y * inv_cam_z + view.img.y * 0.5,
     };
-    let out_base = i * 9;
+    let out_base = i * PROJ_FLOATS;
     projected_splats[out_base] = mean2d.x;
     projected_splats[out_base + 1] = mean2d.y;
     projected_splats[out_base + 2] = conic.x;
@@ -250,12 +254,9 @@ pub(crate) fn project_splats(
         x: (2.0 * cutoff * cov2d.x).sqrt(),
         y: (2.0 * cutoff * cov2d.z).sqrt(),
     };
-    let bb = helpers::tile_bbox(mean2d, ext, tile_bounds);
-    // Count, don't emit: the map kernel re-emits from this exact bbox
-    // after the depth sort, at prefix-sum offsets, so intersections land
-    // in depth order and a single stable tile sort suffices. The bbox is
-    // stored (packed u16 coords) rather than recomputed so the emission
-    // count can never diverge from this count.
+    let bb = helpers::tile_bbox(mean2d, ext, view.tile_bounds);
+    // Count, don't emit: the map kernel re-emits from this exact packed bbox
+    // at prefix-sum offsets, so count and emission can never diverge.
     let num_tiles = (bb.max_x - bb.min_x) * (bb.max_y - bb.min_y);
     tile_counts[i] = num_tiles;
     counters[0].fetch_add(num_tiles);
@@ -270,14 +271,13 @@ mod tests {
     use crate::helpers::{Vec2FLaunch, Vec3FLaunch};
     use crate::tensor::GpuTensor;
     use cubecl::calculate_cube_count_elemwise;
-    use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
+    use cubecl::wgpu::WgpuRuntime;
 
     const SENTINEL: u32 = 0xDEAD_BEEF;
 
     #[test]
     fn test_project_counts_tiles_and_packs_bbox() {
-        let _gpu = crate::tensor::GPU_TEST_LOCK.lock().unwrap();
-        let client = WgpuRuntime::client(&WgpuDevice::default());
+        let (_gpu, client) = crate::tensor::test_client();
         // One splat at the image center, scale ~1, near-full opacity: with a
         // 64x64 image and 16x16 tiles its bbox covers all 16 tiles.
         let attributes: Vec<f32> = vec![0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 5.0];
@@ -290,21 +290,24 @@ mod tests {
         let counters = GpuTensor::from(&client, [2], &[0u32, 0][..]);
         let tile_counts = GpuTensor::from(&client, [1], &[SENTINEL][..]);
         let tile_bbox = GpuTensor::from(&client, [1, 2], &[SENTINEL; 2][..]);
-        let viewmat: Vec<f32> = glam::Mat4::IDENTITY.to_cols_array().to_vec();
-        let viewmat_t = GpuTensor::from(&client, [16], &viewmat[..]);
 
         project_splats::launch::<WgpuRuntime>(
             &client,
             calculate_cube_count_elemwise(&client, 1, CubeDim::new_1d(256)),
             CubeDim::new_1d(256),
-            viewmat_t.as_buffer_arg(),
-            Vec2FLaunch::new(32.0, 32.0),
-            Vec3FLaunch::new(0.0, 0.0, 0.0),
+            CameraViewLaunch::new(
+                Vec3FLaunch::new(1.0, 0.0, 0.0),
+                Vec3FLaunch::new(0.0, 1.0, 0.0),
+                Vec3FLaunch::new(0.0, 0.0, 1.0),
+                Vec3FLaunch::new(0.0, 0.0, 0.0),
+                Vec2FLaunch::new(32.0, 32.0),
+                Vec3FLaunch::new(0.0, 0.0, 0.0),
+                Vec2FLaunch::new(64.0, 64.0),
+                Vec2FLaunch::new(4.0, 4.0),
+            ),
             attrs_t.as_buffer_arg(),
             sh_t.as_buffer_arg(),
             1,
-            Vec2FLaunch::new(4.0, 4.0),
-            Vec2FLaunch::new(64.0, 64.0),
             depth_order.as_buffer_arg(),
             depth_keys.as_buffer_arg(),
             projected.as_buffer_arg(),

@@ -83,7 +83,6 @@ fn scatter_kernel(
     out: &mut [u32],
     out_values: &mut [u32],
 ) {
-    // CUBE_POS linearizes the workgroup id; see count_kernel.
     let wg = CUBE_POS as u32;
     if wg >= num_wgs {
         terminate!();
@@ -104,7 +103,7 @@ fn scatter_kernel(
     for e in 0..ELEMS_PER_THREAD {
         let idx = base + e;
         if idx < num_keys {
-            let bin = (src[idx as usize] >> shift) & 0xf;
+            let bin = (src[idx as usize] >> shift) & (SORT_BINS - 1u32);
             hist[(bin * SORT_WG + UNIT_POS) as usize] += 1u32;
         }
     }
@@ -151,7 +150,7 @@ fn scatter_kernel(
         if idx < num_keys {
             let key = src[idx as usize];
             let val = values[idx as usize];
-            let bin = (key >> shift) & 0xf;
+            let bin = (key >> shift) & (SORT_BINS - 1u32);
             let cell = (bin * SORT_WG + UNIT_POS) as usize;
             let pos = hist[cell];
             hist[cell] = pos + 1u32;
@@ -180,7 +179,7 @@ fn ballot_word(v: u32, bit: u32) -> u32 {
 /// tail lanes' placeholder digits never join a real digit group. ANDing one
 /// ballot per bit leaves exactly the lanes equal in all seven.
 #[cube]
-fn match_any9(v: u32) -> u32 {
+fn match_any7(v: u32) -> u32 {
     ballot_word(v, 0u32)
         & ballot_word(v, 1u32)
         & ballot_word(v, 2u32)
@@ -194,7 +193,7 @@ fn match_any9(v: u32) -> u32 {
 /// the scatter kernels turn into a slot via a group leader's fetch_add.
 #[cube]
 fn plane_rank(v: u32) -> (u32, u32) {
-    let peers = match_any9(v);
+    let peers = match_any7(v);
     let lane_mask = (1u32 << (UNIT_POS_PLANE % 32)) - 1u32;
     (peers, (peers & lane_mask).count_ones())
 }
@@ -207,7 +206,7 @@ fn plane_rank(v: u32) -> (u32, u32) {
 /// shared histograms; planes stride by the runtime PLANE_DIM, which the
 /// driver may dispatch wider than that minimum.
 #[cube(launch)]
-fn scatter8_kernel(
+fn scatter_plane_kernel(
     num_wgs: u32,
     shift: u32,
     num_keys: u32,
@@ -246,7 +245,7 @@ fn scatter8_kernel(
     let tile_base = BLOCK_PLANE * wg;
     let plane_base = tile_base + plane * plane_dim * EPT_PLANE;
 
-    // Load each thread's keys once — the scatter is the kernel's only key read.
+    // The kernel's only key read.
     let mut keys = Array::<u32>::new(EPT_PLANE as usize);
     #[unroll]
     for i in 0..EPT_PLANE {
@@ -285,14 +284,7 @@ fn scatter8_kernel(
     sync_cube();
 
     if UNIT_POS == 0 {
-        let mut running = 0u32;
-        let mut b2 = 0u32;
-        while b2 < BINS_PLANE {
-            let t = prefix[b2 as usize];
-            prefix[b2 as usize] = running;
-            running += t;
-            b2 += 1u32;
-        }
+        crate::scan::serial_exclusive(&mut prefix, BINS_PLANE, 0u32);
     }
     sync_cube();
 
@@ -311,10 +303,8 @@ fn scatter8_kernel(
     }
     sync_cube();
 
-    // Rank: group leaders reserve one slot run per digit; peers add their
-    // rank within the group. Validity rides along as a 9th match bit.
-    // Plane collectives stay outside divergent control flow; the guarded
-    // fetch_add is a plain shared atomic.
+    // Rank (see plane_rank): group leaders reserve one slot run per digit,
+    // peers add their rank within the group.
     let mut offs = Array::<u32>::new(EPT_PLANE as usize);
     #[unroll]
     for i in 0..EPT_PLANE {
@@ -358,9 +348,6 @@ fn scatter8_kernel(
         digs[i as usize] = d;
     }
     sync_cube();
-
-    // Same route for the values, reusing the staged buffer and the digits
-    // saved from the key write.
     #[unroll]
     for i in 0..EPT_PLANE {
         let idx = plane_base + i * plane_dim + lane;
@@ -384,7 +371,7 @@ pub(crate) fn bits_for(max_exclusive: u32) -> u32 {
     u32::BITS - max_exclusive.saturating_sub(1).leading_zeros()
 }
 
-/// Whether the 8-bit plane path can run on this device, and its comptime
+/// Whether the 6-bit plane path can run on this device, and its comptime
 /// worst-case plane count. The ballot ranking reads a single 32-bit word per
 /// lane, so planes beyond 32 lanes fall back; shared memory must fit the
 /// per-plane histograms, the bin prefixes, and the staging buffer.
@@ -423,9 +410,8 @@ fn plane_sort_path(client: &ComputeClient<WgpuRuntime>) -> Option<u32> {
 #[derive(Debug)]
 pub struct RadixScratch {
     count_buf: GpuTensor,
-    /// Public so callers can share one scratch between sorts and their own
-    /// scans (it is sized for `max_elems`-cell scans, not just the counters).
-    pub(crate) scan: ScanScratch,
+    /// Scratch for the per-pass counter scans.
+    scan: ScanScratch,
     dst_keys: GpuTensor,
     dst_vals: GpuTensor,
 }
@@ -439,9 +425,7 @@ impl RadixScratch {
         ) as usize;
         Self {
             count_buf: GpuTensor::empty(client, [cells]),
-            // Sized by max_elems (not the smaller counter cell count) so one
-            // instance can also serve outside scans of max_elems cells —
-            // render.rs reuses sort_depth's for the tile-count offsets scan.
+            // Loose bound: counter scans need far fewer cells than max_elems.
             scan: ScanScratch::new(client, max_elems),
             dst_keys: GpuTensor::empty(client, [max_elems]),
             dst_vals: GpuTensor::empty(client, [max_elems]),
@@ -450,8 +434,8 @@ impl RadixScratch {
 }
 
 fn radix_argsort_path(
-    keys: GpuTensor,
-    vals: GpuTensor,
+    keys: &GpuTensor,
+    vals: &GpuTensor,
     n: u32,
     bits: u32,
     planes: Option<u32>,
@@ -464,7 +448,7 @@ fn radix_argsort_path(
     );
     // The launched grid may exceed the hardware X limit and get spread over
     // Y/Z (CubeCountSelection), so kernels linearize the workgroup id.
-    let (block, bins, passes) = match planes {
+    let (block, bins, bits_per_pass) = match planes {
         Some(_) => (BLOCK_PLANE, BINS_PLANE, BITS_PLANE),
         None => (SORT_BLOCK, SORT_BINS, 4),
     };
@@ -476,10 +460,10 @@ fn radix_argsort_path(
     let mut dst_keys = scratch.dst_keys.clone();
     let mut dst_vals = scratch.dst_vals.clone();
 
-    let mut cur_keys = keys;
-    let mut cur_vals = vals;
+    let mut cur_keys = keys.clone();
+    let mut cur_vals = vals.clone();
 
-    for shift in (0..bits).step_by(passes as usize) {
+    for shift in (0..bits).step_by(bits_per_pass as usize) {
         count_kernel::launch::<WgpuRuntime>(
             &client,
             cube_count.clone(),
@@ -496,7 +480,7 @@ fn radix_argsort_path(
         exclusive_scan_buf(&client, count_buf, bins * num_wgs, &scratch.scan);
 
         match planes {
-            Some(num_planes) => scatter8_kernel::launch::<WgpuRuntime>(
+            Some(num_planes) => scatter_plane_kernel::launch::<WgpuRuntime>(
                 &client,
                 cube_count.clone(),
                 cube_dim,
@@ -532,18 +516,19 @@ fn radix_argsort_path(
 }
 
 /// Stable argsort of `keys[0..n]` carrying `vals`, restricted to the low
-/// `bits` of each key. Sorts with 8-bit digits and warp-aggregated ranking
+/// `bits` of each key. Sorts with 6-bit digits and warp-aggregated ranking
 /// when the device exposes plane ops, falling back to the 4-bit per-lane
-/// histogram path otherwise. See [`RadixScratch`] for buffer reuse rules.
+/// histogram path otherwise. The inputs are only read; the returned tensors
+/// may alias the scratch after an odd pass count (see [`RadixScratch`]).
 pub fn radix_argsort_with(
-    keys: GpuTensor,
-    vals: GpuTensor,
+    keys: &GpuTensor,
+    vals: &GpuTensor,
     n: u32,
     bits: u32,
     scratch: &RadixScratch,
 ) -> (GpuTensor, GpuTensor) {
     if n <= 1 || bits == 0 {
-        return (keys, vals);
+        return (keys.clone(), vals.clone());
     }
     // The plane path's per-element ranking costs ~25% more than the 4-bit
     // per-lane histogram, so it only pays when it drops enough passes.
@@ -555,11 +540,9 @@ pub fn radix_argsort_with(
 #[cfg(test)]
 mod radix_sort_tests {
     use super::*;
-    use cubecl::client::ComputeClient;
-    use cubecl::wgpu::{WgpuDevice, WgpuRuntime};
     use rand::RngExt;
 
-    /// Canary for the plane primitives the 8-bit path builds on: emulated
+    /// Canary for the plane primitives the 6-bit path builds on: emulated
     /// match-any, group-leader slot reservation, and leader broadcast.
     #[cube(launch)]
     fn probe_plane_kernel(
@@ -600,7 +583,7 @@ mod radix_sort_tests {
 
     #[test]
     fn test_plane_probe() {
-        let client = WgpuRuntime::client(&WgpuDevice::default());
+        let (_gpu, client) = crate::tensor::test_client();
         if !client
             .properties()
             .features
@@ -661,7 +644,7 @@ mod radix_sort_tests {
             let scratch = RadixScratch::new(client, keys_inp.len());
             let n = keys_inp.len() as u32;
             let (ret_keys, ret_values) =
-                radix_argsort_path(keys, values, n, bits, *planes, &scratch);
+                radix_argsort_path(&keys, &values, n, bits, *planes, &scratch);
             let ret_keys: Vec<u32> = ret_keys.read_vec();
             let ret_values: Vec<u32> = ret_values.read_vec();
 
@@ -670,14 +653,8 @@ mod radix_sort_tests {
 
             // Stability is asserted separately in test_sorting_stable; here
             // assert sorted order and key/value pairing only.
-            for i in 1..keys_inp.len() {
-                assert!(
-                    ret_keys[i - 1] <= ret_keys[i],
-                    "Keys not sorted at index {i}: {} > {}",
-                    ret_keys[i - 1],
-                    ret_keys[i]
-                );
-            }
+            let bad = ret_keys.windows(2).position(|w| w[0] > w[1]);
+            assert!(bad.is_none(), "keys not sorted at index {bad:?}");
 
             for i in 0..keys_inp.len() {
                 let sorted_key = ret_keys[i];
@@ -710,7 +687,7 @@ mod radix_sort_tests {
         // equal tile ids. Assert exact stable argsort, not just sortedness.
         // Both dispatch paths are exercised so the fallback stays correct on
         // plane-capable machines too.
-        let client = WgpuRuntime::client(&WgpuDevice::default());
+        let (_gpu, client) = crate::tensor::test_client();
         let paths = all_paths(&client);
         let mut rng = rand::rng();
         for n in [1000usize, 5000, 200_000] {
@@ -724,7 +701,7 @@ mod radix_sort_tests {
                 let values = GpuTensor::from(&client, [n], &values_inp[..]);
                 let scratch = RadixScratch::new(&client, n);
                 let (_, ret_values) =
-                    radix_argsort_path(keys, values, n as u32, 8, *planes, &scratch);
+                    radix_argsort_path(&keys, &values, n as u32, 8, *planes, &scratch);
                 let ret_values: Vec<u32> = ret_values.read_vec();
                 assert_eq!(ret_values, reference, "n={n}: sort must be stable");
             }
@@ -733,7 +710,7 @@ mod radix_sort_tests {
 
     #[test]
     fn test_sorting_partial_bits() {
-        let client = WgpuRuntime::client(&WgpuDevice::default());
+        let (_gpu, client) = crate::tensor::test_client();
         for max in [2u32, 64, 1000, 65536] {
             let bits = bits_for(max);
             let mut rng = rand::rng();
@@ -745,7 +722,7 @@ mod radix_sort_tests {
 
     #[test]
     fn test_sorting_big() {
-        let client = WgpuRuntime::client(&WgpuDevice::default());
+        let (_gpu, client) = crate::tensor::test_client();
         let mut rng = rand::rng();
         let mut keys_inp = Vec::new();
         for i in 0..10000u32 {
@@ -767,8 +744,7 @@ mod radix_sort_tests {
     fn test_sorting_large() {
         const NUM_ELEMENTS: usize = 500_000;
 
-        let _gpu = crate::tensor::GPU_TEST_LOCK.lock().unwrap();
-        let client = WgpuRuntime::client(&WgpuDevice::default());
+        let (_gpu, client) = crate::tensor::test_client();
         let mut rng = rand::rng();
 
         let keys_inp: Vec<u32> = (0..NUM_ELEMENTS)
@@ -780,7 +756,7 @@ mod radix_sort_tests {
         let values = GpuTensor::from(&client, [NUM_ELEMENTS], &values_inp[..]);
         let scratch = RadixScratch::new(&client, NUM_ELEMENTS);
         let (ret_keys, ret_values) =
-            radix_argsort_with(keys, values, NUM_ELEMENTS as u32, 32, &scratch);
+            radix_argsort_with(&keys, &values, NUM_ELEMENTS as u32, 32, &scratch);
 
         let ret_keys: Vec<u32> = ret_keys.read_vec();
         let ret_values: Vec<u32> = ret_values.read_vec();
@@ -788,14 +764,8 @@ mod radix_sort_tests {
         assert_eq!(ret_keys.len(), NUM_ELEMENTS);
         assert_eq!(ret_values.len(), NUM_ELEMENTS);
 
-        for i in 1..NUM_ELEMENTS {
-            assert!(
-                ret_keys[i - 1] <= ret_keys[i],
-                "Keys not sorted at index {i}: {} > {}",
-                ret_keys[i - 1],
-                ret_keys[i]
-            );
-        }
+        let bad = ret_keys.windows(2).position(|w| w[0] > w[1]);
+        assert!(bad.is_none(), "keys not sorted at index {bad:?}");
 
         let check_indices = [0, 1000, 10_000, 100_000, 249_999];
         for &idx in &check_indices {
@@ -810,7 +780,7 @@ mod radix_sort_tests {
 
     #[test]
     fn test_sort_subset_of_capacity() {
-        let client = WgpuRuntime::client(&WgpuDevice::default());
+        let (_gpu, client) = crate::tensor::test_client();
         let cap = 1_000_000usize;
         let n = 1_000usize;
         let keys_inp: Vec<u32> = (0..cap)
@@ -822,7 +792,7 @@ mod radix_sort_tests {
 
         // Scratch sized for the sorted prefix n, not the tensor capacity.
         let scratch = RadixScratch::new(&client, n);
-        let (sorted_keys, sorted_vals) = radix_argsort_with(keys, vals, n as u32, 32, &scratch);
+        let (sorted_keys, sorted_vals) = radix_argsort_with(&keys, &vals, n as u32, 32, &scratch);
         let out: Vec<u32> = sorted_keys.read_vec();
         // An even pass count ends on the original (capacity-sized) tensors;
         // an odd count ends on the n-sized ping-pong scratch. Either is a

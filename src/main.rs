@@ -13,9 +13,8 @@ use anyhow::Context;
 
 use cubecl::wgpu::{MemoryConfiguration, RuntimeOptions, WgpuRuntime, WgpuSetup, init_device};
 use cubecl::{Runtime, client::ComputeClient};
-use eframe::egui;
+use eframe::egui::{self, Color32, Rect};
 use eframe::wgpu;
-use egui::{Color32, Rect};
 use splatfield::{camera, ply, render, sog, texture};
 
 const UV_RECT: Rect = Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
@@ -24,7 +23,7 @@ const UV_RECT: Rect = Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0))
 /// loader callback and the UI thread coordinate through this alone.
 #[derive(Default)]
 struct Loaded {
-    splats: Option<render::Splats>,
+    splats: Option<Arc<render::Splats>>,
     reframe: bool,
 }
 
@@ -67,14 +66,15 @@ enum SplatFormat {
 }
 
 fn splat_format(file: &(impl egui::DroppedFile + ?Sized)) -> Option<SplatFormat> {
-    let ext = file
+    match file
         .path()
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .map(str::to_ascii_lowercase);
-    match ext.as_deref() {
-        Some("ply") => Some(SplatFormat::Ply),
-        Some("sog") => Some(SplatFormat::Sog),
+        .extension()?
+        .to_str()?
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "ply" => Some(SplatFormat::Ply),
+        "sog" => Some(SplatFormat::Sog),
         _ => None,
     }
 }
@@ -127,12 +127,12 @@ impl App {
         let on_loaded = move |result: anyhow::Result<render::Splats>| match result {
             Ok(data) => {
                 let mut slot = splats.lock().unwrap();
-                slot.splats = Some(data);
+                slot.splats = Some(Arc::new(data));
                 slot.reframe = true;
                 drop(slot);
                 ctx.request_repaint();
             }
-            Err(e) => log::error!("Failed to load splat: {e:?}"),
+            Err(e) => eprintln!("Failed to load splat: {e:?}"),
         };
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -157,6 +157,31 @@ impl App {
             });
         }
     }
+}
+
+/// Render `splats` into the shared scratch and present the bitmap to the
+/// backbuffer. The scratch borrow lives across the await — wasm's
+/// `rendering` flag guards re-entering while one render is in flight, and
+/// native `block_on` drives the future on the same thread.
+#[allow(clippy::await_holding_refcell_ref)] // render_with borrows scratch for its duration
+async fn render_frame(
+    client: &ComputeClient<WgpuRuntime>,
+    scratch: &Rc<RefCell<Option<render::RenderScratch>>>,
+    backbuffer: &Rc<RefCell<texture::GpuTexture>>,
+    splats: &render::Splats,
+    camera: &camera::Camera,
+    pixel: glam::UVec2,
+) {
+    let img = splats
+        .render_with(
+            scratch.borrow_mut().get_or_insert_with(|| {
+                render::RenderScratch::new(client, splats.attributes.shape[0], pixel)
+            }),
+            camera,
+            pixel,
+        )
+        .await;
+    backbuffer.borrow_mut().update_texture(&img, pixel);
 }
 
 impl eframe::App for App {
@@ -191,22 +216,16 @@ impl eframe::App for App {
         self.controller.camera.fit_fov(pixel);
 
         if pixel.x > 8 && pixel.y > 8 {
-            let total = splats.attributes.shape[0];
-
             #[cfg(not(target_arch = "wasm32"))]
-            {
-                let img = pollster::block_on(splats.render_with(
-                    self.scratch.borrow_mut().get_or_insert_with(|| {
-                        render::RenderScratch::new(&self.client, total, pixel)
-                    }),
-                    &self.controller.camera,
-                    pixel,
-                ));
-                self.backbuffer.borrow_mut().update_texture(&img, pixel);
-            }
+            pollster::block_on(render_frame(
+                &self.client,
+                &self.scratch,
+                &self.backbuffer,
+                &splats,
+                &self.controller.camera,
+                pixel,
+            ));
 
-            // `rendering` also guards the scratch borrow: an in-flight async
-            // render on wasm holds it across the await.
             #[cfg(target_arch = "wasm32")]
             if !self.rendering.get() {
                 self.rendering.set(true);
@@ -218,32 +237,20 @@ impl eframe::App for App {
                 let ctx = ui.ctx().clone();
 
                 wasm_bindgen_futures::spawn_local(async move {
-                    let img = splats
-                        .render_with(
-                            scratch.borrow_mut().get_or_insert_with(|| {
-                                render::RenderScratch::new(&client, total, pixel)
-                            }),
-                            &camera,
-                            pixel,
-                        )
-                        .await;
-                    backbuffer.borrow_mut().update_texture(&img, pixel);
+                    render_frame(&client, &scratch, &backbuffer, &splats, &camera, pixel).await;
                     rendering.set(false);
                     ctx.request_repaint();
                 });
             }
         }
 
-        if let Some(id) = self.backbuffer.borrow().texture_id() {
-            ui.painter().image(id, rect, UV_RECT, Color32::WHITE);
-        }
+        let id = self.backbuffer.borrow().texture_id();
+        ui.painter().image(id, rect, UV_RECT, Color32::WHITE);
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 fn main() -> anyhow::Result<()> {
-    env_logger::init();
-
     eframe::run_native(
         "SplatField",
         eframe::NativeOptions {

@@ -24,12 +24,11 @@ GPU-accelerated Gaussian Splatting renderer. egui GUI loads PLY files via drag-a
 GPU kernel passes per frame:
 
 1. **Project** — 3D→2D projection, covariance, SH color, per-splat tile counts + bbox
-2. **Depth sort** — radix sort by depth (`sort::radix_argsort`)
+2. **Depth sort** — radix sort by depth (`sort::radix_argsort_with`)
 3. **Scan** — prefix-sum tile counts in depth order (`scan::exclusive_scan_gather`)
 4. **Map** — emit intersections at scan offsets, pre-sorted by depth
 5. **Tile sort** — stable radix sort by tile; stability preserves depth order in-tile
-6. **Tile ranges** — build per-tile `[start, end)` ranges
-7. **Rasterize** — front-to-back alpha blend → RGBA8 bitmap
+6. **Rasterize** — front-to-back alpha blend → RGBA8 bitmap; per-tile ranges come from in-kernel binary search
 
 ### Data Layout
 
