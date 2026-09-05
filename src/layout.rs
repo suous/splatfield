@@ -1,3 +1,6 @@
+//! Crate-wide data-layout contract plus shared cube types: the field-major
+//! plane constants parsers and kernels both agree on, and glam-mirroring vecs
+//! that cross the kernel-launch boundary.
 use cubecl::prelude::*;
 use cubecl::wgpu::WgpuRuntime;
 

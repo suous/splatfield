@@ -1,4 +1,4 @@
-use crate::helpers::{ATTR_PLANES, PLANE_OPACITY, PLANE_QW, PLANE_SX, PLANE_X, PLANE_Y, PLANE_Z};
+use crate::layout::{ATTR_PLANES, PLANE_OPACITY, PLANE_QW, PLANE_SX, PLANE_X, PLANE_Y, PLANE_Z};
 use crate::render::CpuSplats;
 use anyhow::{Context, Result};
 use serde::Deserialize;

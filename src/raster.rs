@@ -1,6 +1,6 @@
 //! Raster-stage kernels: intersection emission and front-to-back tile blending.
 
-use crate::helpers::{self, PROJ_FLOATS};
+use crate::layout::{self, PROJ_FLOATS};
 use cubecl::prelude::*;
 
 /// Emit each visible splat's tile intersections at its prefix-sum offset.
@@ -65,7 +65,7 @@ pub(crate) fn lower_bound(ids: &[u32], n: u32, target: u32) -> u32 {
 }
 
 #[cube]
-fn gaussian_power(conic: helpers::Vec3F, dx: f32, dy: f32) -> f32 {
+fn gaussian_power(conic: layout::Vec3F, dx: f32, dy: f32) -> f32 {
     0.5f32 * (conic.x * dx * dx + conic.z * dy * dy) + conic.y * dx * dy
 }
 
@@ -109,7 +109,7 @@ pub(crate) fn rasterize_kernel(
     // break (and with it the next iteration's sync_cube) divergent. Browsers
     // refuse to compile the shader, so web builds specialize with early_exit
     // off and pay only per-thread `done` latching; native keeps the exit.
-    let mut stage = Shared::<[f32]>::new_slice(helpers::TILE_SIZE as usize * PROJ_FLOATS);
+    let mut stage = Shared::<[f32]>::new_slice(layout::TILE_SIZE as usize * PROJ_FLOATS);
     let done_count = Shared::<[Atomic<u32>]>::new_slice(1usize);
     if early_exit {
         if UNIT_POS == 0 {
@@ -129,9 +129,9 @@ pub(crate) fn rasterize_kernel(
     let pixel_x = px as f32 + 0.5f32;
     let pixel_y = py as f32 + 0.5f32;
 
-    let num_chunks = (range_end - range_start).div_ceil(helpers::TILE_SIZE);
+    let num_chunks = (range_end - range_start).div_ceil(layout::TILE_SIZE);
     for c in 0..num_chunks {
-        let chunk = range_start + c * helpers::TILE_SIZE;
+        let chunk = range_start + c * layout::TILE_SIZE;
         let idx = chunk + UNIT_POS;
         sync_cube();
         if idx < range_end {
@@ -144,17 +144,17 @@ pub(crate) fn rasterize_kernel(
         sync_cube();
 
         // Whole tile converged: every remaining chunk would be a no-op.
-        if early_exit && done_count[0usize].load() == helpers::TILE_SIZE {
+        if early_exit && done_count[0usize].load() == layout::TILE_SIZE {
             break;
         }
 
-        let n_in_chunk = (range_end - chunk).min(helpers::TILE_SIZE);
+        let n_in_chunk = (range_end - chunk).min(layout::TILE_SIZE);
         for j in 0..n_in_chunk {
             if !done {
                 let base = j as usize * PROJ_FLOATS;
                 let mean_x = stage[base];
                 let mean_y = stage[base + 1];
-                let conic = helpers::Vec3F {
+                let conic = layout::Vec3F {
                     x: stage[base + 2],
                     y: stage[base + 3],
                     z: stage[base + 4],

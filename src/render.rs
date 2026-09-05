@@ -1,5 +1,5 @@
 use crate::camera::Camera;
-use crate::helpers;
+use crate::layout;
 use crate::project::{CameraViewLaunch, DEPTH_KEY_BITS, project_splats};
 use crate::raster::{map_isects, rasterize_kernel};
 use crate::scan::{ScanScratch, exclusive_scan_gather};
@@ -17,7 +17,7 @@ const INTERSECTS_UPPER_BOUND: usize = 2 * 512 * 65535;
 const EARLY_EXIT: bool = !cfg!(target_arch = "wasm32");
 
 /// Host-side splat payload produced by the PLY/SOG parsers, uploaded once by
-/// `Splats::new`. Field-major layout: see the `PLANE_*` planes in `helpers`.
+/// `Splats::new`. Field-major layout: see the `PLANE_*` planes in `layout`.
 #[derive(Debug)]
 pub struct CpuSplats {
     pub attributes: Vec<f32>,
@@ -56,7 +56,7 @@ pub struct RenderScratch {
 
 impl RenderScratch {
     pub fn new(client: &ComputeClient<WgpuRuntime>, total: usize, img_size: glam::UVec2) -> Self {
-        let tile_bounds = img_size.map(|c| c.div_ceil(helpers::TILE_WIDTH));
+        let tile_bounds = img_size.map(|c| c.div_ceil(layout::TILE_WIDTH));
         let num_tiles = (tile_bounds.x * tile_bounds.y) as usize;
         let isect_capacity = (num_tiles.saturating_mul(total).min(1 << 22)).next_power_of_two();
         // 256-byte rows: wgpu buffer→texture copies align rows to
@@ -65,7 +65,7 @@ impl RenderScratch {
         Self {
             depth_order: GpuTensor::empty(client, [total]),
             depth_keys: GpuTensor::empty(client, [total]),
-            projected: GpuTensor::empty(client, [total, helpers::PROJ_FLOATS]),
+            projected: GpuTensor::empty(client, [total, layout::PROJ_FLOATS]),
             counters: GpuTensor::empty(client, [2]),
             tile_counts: GpuTensor::empty(client, [total]),
             tile_bbox: GpuTensor::empty(client, [total, 2]),
@@ -114,7 +114,7 @@ impl Splats {
         sh_coeffs: Vec<f32>,
         client: &ComputeClient<WgpuRuntime>,
     ) -> Self {
-        let n = attributes.len() / helpers::ATTR_PLANES;
+        let n = attributes.len() / layout::ATTR_PLANES;
         assert!(n > 0, "Splats::new: zero splats");
         let n_coeffs = sh_coeffs.len() / n;
 
@@ -122,16 +122,16 @@ impl Splats {
         let mut max = glam::Vec3::splat(f32::MIN);
         for i in 0..n {
             let p = glam::vec3(
-                attributes[helpers::PLANE_X * n + i],
-                attributes[helpers::PLANE_Y * n + i],
-                attributes[helpers::PLANE_Z * n + i],
+                attributes[layout::PLANE_X * n + i],
+                attributes[layout::PLANE_Y * n + i],
+                attributes[layout::PLANE_Z * n + i],
             );
             min = min.min(p);
             max = max.max(p);
         }
 
         Self {
-            attributes: GpuTensor::from(client, [n, helpers::ATTR_PLANES], attributes),
+            attributes: GpuTensor::from(client, [n, layout::ATTR_PLANES], attributes),
             sh_coeffs: GpuTensor::from(client, [n, n_coeffs / 3, 3], sh_coeffs),
             bounds: (min, max),
         }
@@ -155,10 +155,10 @@ impl Splats {
         }
         // Grow from last frame's raw emission, before anything is in flight.
         scratch.grow_isects(client, scratch.last_isects_raw);
-        let tile_bounds = img_size.map(|c| c.div_ceil(helpers::TILE_WIDTH));
+        let tile_bounds = img_size.map(|c| c.div_ceil(layout::TILE_WIDTH));
         let num_tiles = (tile_bounds.x * tile_bounds.y) as usize;
         let max_isects = scratch.tile_ids.shape[0] as u32;
-        let cube_dim = CubeDim::new_1d(helpers::TILE_SIZE);
+        let cube_dim = CubeDim::new_1d(layout::TILE_SIZE);
 
         let sh_per_ch = self.sh_coeffs.shape[1] as u32;
         // World-to-camera rotation rows + translation, passed as kernel scalars.
@@ -244,7 +244,7 @@ impl Splats {
         rasterize_kernel::launch::<WgpuRuntime>(
             client,
             CubeCount::new_2d(tile_bounds.x, tile_bounds.y),
-            CubeDim::new_2d(helpers::TILE_WIDTH, helpers::TILE_WIDTH),
+            CubeDim::new_2d(layout::TILE_WIDTH, layout::TILE_WIDTH),
             img_size.x,
             img_size.y,
             row_stride,
@@ -270,7 +270,7 @@ mod tests {
     /// Field-major attributes for `n` opaque splats at the origin XY, `z` per
     /// splat. [x | y | z | qw | qx | qy | qz | sx | sy | sz | opacity]
     fn stacked_attributes(n: usize, z: impl Fn(usize) -> f32) -> Vec<f32> {
-        let mut a = vec![0f32; n * helpers::ATTR_PLANES];
+        let mut a = vec![0f32; n * layout::ATTR_PLANES];
         for i in 0..n {
             a[2 * n + i] = z(i);
             a[3 * n + i] = 1.0; // qw
@@ -427,7 +427,7 @@ mod tests {
             probe_tile_range::launch::<WgpuRuntime>(
                 &client,
                 CubeCount::new_single(),
-                CubeDim::new_1d(helpers::TILE_SIZE),
+                CubeDim::new_1d(layout::TILE_SIZE),
                 ids_t.as_buffer_arg(),
                 ids.len() as u32,
                 tile,

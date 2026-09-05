@@ -42,5 +42,5 @@ GPU kernel passes per frame:
 ### GPU Compute
 
 Kernels use `cubecl` with `#[cube(launch)]` targeting `WgpuRuntime`.
-Custom types via `#[cube]`/`CubeLaunch` in `helpers`.
+Custom types via `#[cube]`/`CubeLaunch` in `layout`.
 Dispatch: `calculate_cube_count_elemwise` + `CubeDim::new_1d(TILE_SIZE)`.

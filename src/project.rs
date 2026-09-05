@@ -3,7 +3,7 @@
 //! References:
 //! - <https://github.com/graphdeco-inria/diff-gaussian-rasterization/blob/main/cuda_rasterizer/forward.cu>
 //! - <https://github.com/graphdeco-inria/diff-gaussian-rasterization/blob/main/cuda_rasterizer/rasterizer_impl.cu>
-use crate::helpers::{
+use crate::layout::{
     PLANE_OPACITY, PLANE_QW, PLANE_QX, PLANE_QY, PLANE_QZ, PLANE_SX, PLANE_SY, PLANE_SZ, PLANE_X,
     PLANE_Y, PLANE_Z, PROJ_FLOATS, TILE_WIDTH, Vec2F, Vec3F,
 };
@@ -229,7 +229,7 @@ pub(crate) fn project_splats(
     if ABSOLUTE_POS_X >= depth_order.len() as u32 {
         terminate!();
     }
-    // Attribute planes are field-major (helpers::PLANE_*): warp-coalesced.
+    // Attribute planes are field-major (layout::PLANE_*): warp-coalesced.
     let n = depth_order.len();
     let i = ABSOLUTE_POS_X as usize;
     let mean = Vec3F {
@@ -369,7 +369,7 @@ fn sh_to_rgb(chs: u32, dir: Vec3F, splat: u32, n: u32, shs: &[f32]) -> (f32, f32
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::helpers::{Vec2FLaunch, Vec3FLaunch};
+    use crate::layout::{Vec2FLaunch, Vec3FLaunch};
     use crate::tensor::GpuTensor;
     use cubecl::calculate_cube_count_elemwise;
     use cubecl::wgpu::WgpuRuntime;

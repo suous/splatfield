@@ -1,5 +1,5 @@
 pub mod camera;
-mod helpers;
+mod layout;
 pub mod ply;
 mod project;
 mod raster;

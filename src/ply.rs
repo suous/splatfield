@@ -1,4 +1,4 @@
-use crate::helpers::{
+use crate::layout::{
     ATTR_PLANES, PLANE_OPACITY, PLANE_QW, PLANE_QX, PLANE_QY, PLANE_QZ, PLANE_SX, PLANE_SY,
     PLANE_SZ, PLANE_X, PLANE_Y, PLANE_Z,
 };
