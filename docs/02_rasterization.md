@@ -31,8 +31,8 @@ available directly as builtins:
 | Tile ID | `CUBE_POS_Y * CUBE_COUNT_X + CUBE_POS_X` | Linear tile index |
 | **Global pixel** | `(ABSOLUTE_POS_X, ABSOLUTE_POS_Y)` | Pixel coordinates |
 
-Each tile has a precomputed range $[\text{start},\; \text{end})$ into the
-sorted intersection list, giving the Gaussians that overlap this tile.
+Each tile binary-searches the sorted intersection list for its own
+$[\text{start},\; \text{end})$ range, giving the Gaussians that overlap this tile.
 
 ### 1.1 Example
 

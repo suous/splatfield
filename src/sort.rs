@@ -11,6 +11,7 @@ use cubecl::wgpu::WgpuRuntime;
 
 const SORT_WG: u32 = 128;
 // 4-bit fallback path (no plane ops): 16 bins, per-lane private histograms.
+const BITS_FALLBACK: u32 = 4;
 const SORT_BINS: u32 = 16;
 const ELEMS_PER_THREAD: u32 = 8;
 const SORT_BLOCK: u32 = SORT_WG * ELEMS_PER_THREAD;
@@ -258,11 +259,13 @@ fn scatter_plane_kernel(
     }
 
     // Per-plane digit histogram, one aggregated fetch_add per match group.
+    // 63 = BINS_PLANE - 1: literals here, not the const — const expressions
+    // inside #[unroll] bodies break the cubecl expansion.
     #[unroll]
     for i in 0..EPT_PLANE {
         let idx = plane_base + i * plane_dim + lane;
         if idx < num_keys {
-            let d = (keys[i as usize] >> shift) & (BINS_PLANE - 1u32);
+            let d = (keys[i as usize] >> shift) & 63u32;
             hist[(plane * BINS_PLANE + d) as usize].fetch_add(1u32);
         }
     }
@@ -418,11 +421,9 @@ pub struct RadixScratch {
 
 impl RadixScratch {
     pub fn new(client: &ComputeClient<WgpuRuntime>, max_elems: usize) -> Self {
-        // Either path must fit; 64 bins over 2K-element blocks dominates.
-        let cells = u32::max(
-            (max_elems as u32).div_ceil(SORT_BLOCK) * SORT_BINS,
-            (max_elems as u32).div_ceil(BLOCK_PLANE) * BINS_PLANE,
-        ) as usize;
+        // The plane path's 64 bins over 2K-element blocks always need the
+        // most counter cells (4-bit: 16 bins over 1K blocks).
+        let cells = ((max_elems as u32).div_ceil(BLOCK_PLANE) * BINS_PLANE) as usize;
         Self {
             count_buf: GpuTensor::empty(client, [cells]),
             // Loose bound: counter scans need far fewer cells than max_elems.
@@ -450,7 +451,7 @@ fn radix_argsort_path(
     // Y/Z (CubeCountSelection), so kernels linearize the workgroup id.
     let (block, bins, bits_per_pass) = match planes {
         Some(_) => (BLOCK_PLANE, BINS_PLANE, BITS_PLANE),
-        None => (SORT_BLOCK, SORT_BINS, 4),
+        None => (SORT_BLOCK, SORT_BINS, BITS_FALLBACK),
     };
     let num_wgs = n.div_ceil(block);
     let cube_count = calculate_cube_count_elemwise(&client, n as usize, CubeDim::new_1d(block));

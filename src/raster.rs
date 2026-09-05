@@ -69,6 +69,11 @@ fn gaussian_power(conic: helpers::Vec3F, dx: f32, dy: f32) -> f32 {
     0.5f32 * (conic.x * dx * dx + conic.z * dy * dy) + conic.y * dx * dy
 }
 
+#[cube]
+fn quantize_u8(v: f32) -> u32 {
+    (v * 255.0).clamp(0.0, 255.0) as u32
+}
+
 #[cube(launch)]
 pub(crate) fn rasterize_kernel(
     img_size_x: u32,
@@ -181,10 +186,10 @@ pub(crate) fn rasterize_kernel(
     }
 
     if in_bounds {
-        let r = helpers::quantize_u8(pix_r);
-        let g = helpers::quantize_u8(pix_g);
-        let b = helpers::quantize_u8(pix_b);
-        let a = helpers::quantize_u8(1.0f32 - transmittance);
+        let r = quantize_u8(pix_r);
+        let g = quantize_u8(pix_g);
+        let b = quantize_u8(pix_b);
+        let a = quantize_u8(1.0f32 - transmittance);
         bitmap[(px + py * row_stride) as usize] = r | (g << 8u32) | (b << 16u32) | (a << 24u32);
     }
 }

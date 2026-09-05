@@ -32,12 +32,12 @@ Built to learn the details of [3D Gaussian Splatting](https://arxiv.org/abs/2308
 
 6 GPU kernel passes per frame:
 
-1. **Project** — 3D to 2D projection, covariance, SH color, tile intersections
+1. **Project** — 3D to 2D projection, covariance, SH color, per-splat tile counts
 2. **Depth sort** — radix sort by depth
-3. **Remap** — apply depth ordering to intersection IDs
-4. **Tile sort** — sort intersections by tile
-5. **Tile ranges** — build per-tile `[start, end)` ranges
-6. **Rasterize** — front-to-back alpha blend to RGBA8 bitmap
+3. **Scan** — prefix-sum tile counts in depth order
+4. **Remap** — emit intersections at scan offsets
+5. **Tile sort** — stable radix sort by tile
+6. **Rasterize** — front-to-back alpha blend; per-tile ranges come from in-kernel binary search
 
 ```bash
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -48,3 +48,12 @@ Built to learn the details of [3D Gaussian Splatting](https://arxiv.org/abs/2308
  Total                    10         1465         1274           23          168
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
+
+## Benchmarks
+
+```bash
+cargo bench
+```
+
+`radix_sort` runs anywhere. `render_frame` needs the bear fixture at
+`data/bear.3d71a266_sh2.sog` and silently reports no benchmarks without it.

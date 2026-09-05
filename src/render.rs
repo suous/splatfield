@@ -420,19 +420,7 @@ mod tests {
         let ids: Vec<u32> = vec![0, 0, 1, 2, 2, 2, 5, 5];
         let ids_t = GpuTensor::from(&client, [ids.len()], &ids[..]);
 
-        let lower_bound_host = |target: u32| {
-            let mut lo = 0usize;
-            let mut hi = ids.len();
-            while lo < hi {
-                let mid = (lo + hi) / 2;
-                if ids[mid] < target {
-                    lo = mid + 1;
-                } else {
-                    hi = mid;
-                }
-            }
-            lo as u32
-        };
+        let lower_bound_host = |target: u32| ids.partition_point(|&k| k < target) as u32;
 
         for tile in 0..8u32 {
             let range = GpuTensor::empty(&client, [2]);

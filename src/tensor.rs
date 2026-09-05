@@ -70,12 +70,12 @@ impl GpuTensor {
     }
 
     /// Overwrite the buffer in place — stream-ordered, non-blocking, no kernel.
-    pub fn write<T: bytemuck::NoUninit + Send + Sync>(&self, data: impl Into<Vec<T>>) {
+    pub(crate) fn write<T: bytemuck::NoUninit + Send + Sync>(&self, data: impl Into<Vec<T>>) {
         self.client
             .write(&self.handle, cubecl::bytes::Bytes::from_elems(data.into()));
     }
 
-    pub async fn read_pair(&self) -> [u32; 2] {
+    pub(crate) async fn read_pair(&self) -> [u32; 2] {
         let bytes = self.client.read_async(vec![self.handle.clone()]).await;
         bytemuck::cast_slice(&bytes.unwrap()[0]).try_into().unwrap()
     }

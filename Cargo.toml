@@ -30,7 +30,9 @@ pollster = "1.0"
 # feature is forced here; the exact pin keeps the pre-release version aligned
 # with cubecl on all targets.
 cubecl-common = { version = "=0.11.0-pre.3", features = ["serde"] }
-eframe = { version = "0.36", features = ["wgpu"] }
+# default-features off drops eframe's 1.4 MB of embedded fonts (native already
+# builds without them; UI text renders glyph-less on both).
+eframe = { version = "0.36", default-features = false, features = ["wgpu"] }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "0.3", features = ["HtmlCanvasElement", "Document", "Element", "Window"] }
@@ -53,9 +55,10 @@ name = "render_frame"
 harness = false
 
 [profile.release]
-lto = true
+lto = "thin"
 opt-level = 'z'
 codegen-units = 1
 panic = "abort"
-# Match the CI release artifact: strip symbol tables at link time.
+# Strip symbol tables at link time — the one owner for stripped release
+# artifacts, covering Windows too (where CI has no strip step).
 strip = true

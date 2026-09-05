@@ -78,15 +78,15 @@ fn unpack_quat(px: u8, py: u8, pz: u8, tag: u8) -> [f32; 4] {
     let b = (py as f32 / u8::MAX as f32 * 2.0 - 1.0) / sqrt2;
     let c = (pz as f32 / u8::MAX as f32 * 2.0 - 1.0) / sqrt2;
     let d = (1.0 - a * a - b * b - c * c).max(0.0).sqrt();
-    match tag.wrapping_sub(252) {
-        0 => [d, a, b, c],
-        1 => [a, d, b, c],
-        2 => [a, b, d, c],
-        _ => [a, b, c, d],
+    match tag {
+        252 => [d, a, b, c],
+        253 => [a, d, b, c],
+        254 => [a, b, d, c],
+        _ => [a, b, c, d], // 255: z is the omitted component
     }
 }
 
-/// Iterate an RGBA8 plane as `(pixel index, pixel)` for the first `n` pixels.
+/// Iterate an RGBA8 plane as `(pixel index, pixel)`.
 fn rgba_pixels(px: &[u8]) -> impl Iterator<Item = (usize, [u8; 4])> + '_ {
     px.chunks_exact(4)
         .enumerate()
@@ -98,6 +98,9 @@ pub fn parse_sog(reader: impl Read + Seek) -> Result<CpuSplats> {
     let meta: Meta = serde_json::from_reader(zip.by_name("meta.json")?)?;
 
     let n = meta.count;
+    if n == 0 {
+        anyhow::bail!("SOG contains no splats");
+    }
     let mut attributes = vec![0f32; n * ATTR_PLANES];
 
     let (lo, _) = decode_rgba(&mut zip, &meta.means.files[0], n)?;
@@ -127,7 +130,7 @@ pub fn parse_sog(reader: impl Read + Seek) -> Result<CpuSplats> {
         let tag = c[3];
         let q = match tag {
             252..=255 => unpack_quat(c[0], c[1], c[2], tag),
-            _ => [1.0, 0.0, 0.0, 0.0],
+            _ => anyhow::bail!("quats: invalid rotation tag {tag}"),
         };
         for k in 0..4 {
             attributes[(PLANE_QW + k) * n + i] = q[k];
@@ -147,8 +150,8 @@ pub fn parse_sog(reader: impl Read + Seek) -> Result<CpuSplats> {
     }
 
     if let Some(ref sh_n) = meta.sh_n {
-        let bands = sh_n.bands;
-        let sh_coeffs_per_ch = (bands + 1).pow(2) - 1;
+        // (bands+1)^2 channels incl. DC; the palette sheet holds the rest.
+        let sh_coeffs_per_ch = sh_per_ch - 1;
         // centroids is the SH palette, not per-splat data — don't gate it on n
         let (centroids, cw) = decode_rgba(&mut zip, &sh_n.files[0], 0)?;
         let (labels, _) = decode_rgba(&mut zip, &sh_n.files[1], n)?;

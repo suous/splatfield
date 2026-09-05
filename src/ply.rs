@@ -3,7 +3,7 @@ use crate::helpers::{
     PLANE_SZ, PLANE_X, PLANE_Y, PLANE_Z,
 };
 use crate::render::CpuSplats;
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result, anyhow, bail};
 use std::io::BufRead;
 
 pub fn parse_ply(mut reader: impl BufRead) -> Result<CpuSplats> {
@@ -15,10 +15,18 @@ pub fn parse_ply(mut reader: impl BufRead) -> Result<CpuSplats> {
         let tokens: Vec<&str> = line.split_whitespace().collect();
         match tokens.as_slice() {
             ["end_header", ..] => break,
-            ["element", "vertex", count] => {
-                vertex_count = count.parse().map_err(|_| anyhow!("Invalid vertex count"))?
+            ["format", fmt, ..] if *fmt != "binary_little_endian" => {
+                bail!("Unsupported PLY format: {fmt}")
             }
-            ["property", "float", name] => properties.push(name.to_string()),
+            ["element", "vertex", count] => {
+                vertex_count = count.parse().context("Invalid vertex count")?
+            }
+            ["property", ty, name] => {
+                if *ty != "float" {
+                    bail!("Unsupported property type {ty}: {name}")
+                }
+                properties.push(name.to_string());
+            }
             _ => {}
         }
     }
@@ -66,7 +74,7 @@ pub fn parse_ply(mut reader: impl BufRead) -> Result<CpuSplats> {
     let mut data = vec![0f32; vertex_count * stride];
     reader
         .read_exact(bytemuck::cast_slice_mut(&mut data))
-        .context("Failed read vertex")?;
+        .with_context(|| format!("failed to read {vertex_count}x{stride} float vertices"))?;
     // Free the file bytes before the big allocations: wasm32 linear memory is
     // capped at 4 GiB, so every large buffer is released as early as possible.
     drop(reader);
@@ -189,5 +197,27 @@ mod tests {
             .to_string()
             .into_bytes();
         assert!(parse_ply(&bytes[..]).is_err());
+    }
+
+    #[test]
+    fn test_parse_ply_rejects_other_formats() {
+        // A big-endian header would silently byte-swap every float below.
+        let bytes =
+            "ply\nformat binary_big_endian 1.0\nelement vertex 1\nproperty float x\nend_header\n"
+                .to_string()
+                .into_bytes();
+        let err = parse_ply(&bytes[..]).unwrap_err().to_string();
+        assert!(err.contains("Unsupported PLY format"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_ply_rejects_non_float_properties() {
+        // A non-float column would undercount the row stride and shift every
+        // following vertex's bytes.
+        let bytes = "ply\nformat binary_little_endian 1.0\nelement vertex 1\nproperty float x\nproperty uchar red\nend_header\n"
+            .to_string()
+            .into_bytes();
+        let err = parse_ply(&bytes[..]).unwrap_err().to_string();
+        assert!(err.contains("Unsupported property type"), "{err}");
     }
 }

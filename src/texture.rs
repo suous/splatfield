@@ -35,7 +35,7 @@ impl GpuTexture {
     }
 
     pub fn update_texture(&mut self, img: &GpuTensor, size: glam::UVec2) {
-        let _ = img.client.flush();
+        img.client.flush().expect("flush bitmap before copy");
 
         if self.texture.0.width() != size.x || self.texture.0.height() != size.y {
             self.recreate_texture(size);
@@ -77,7 +77,10 @@ impl GpuTexture {
     }
 
     fn copy_to_texture(&self, img: &GpuTensor, texture: &wgpu::Texture) {
-        let resource = img.client.get_resource(img.handle.clone()).unwrap();
+        let resource = img
+            .client
+            .get_resource(img.handle.clone())
+            .expect("bitmap buffer after flush");
 
         let mut encoder = self.device.create_command_encoder(&Default::default());
         encoder.copy_buffer_to_texture(
