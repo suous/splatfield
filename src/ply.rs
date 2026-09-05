@@ -67,7 +67,6 @@ pub fn parse_ply(mut reader: impl BufRead) -> Result<CpuSplats> {
         })
         .collect();
     rest_keys.sort_by_key(|&(_, n)| n);
-    let rest_keys: Vec<usize> = rest_keys.into_iter().map(|(idx, _)| idx).collect();
 
     let stride = properties.len();
 
@@ -80,31 +79,30 @@ pub fn parse_ply(mut reader: impl BufRead) -> Result<CpuSplats> {
     drop(reader);
 
     let n = rest_keys.len() / 3;
-    let vc = vertex_count;
-    let mut attributes = vec![0f32; vc * ATTR_PLANES];
-    let mut shs = vec![0f32; vc * (rest_keys.len() + 3)];
+    let mut attributes = vec![0f32; vertex_count * ATTR_PLANES];
+    let mut shs = vec![0f32; vertex_count * (rest_keys.len() + 3)];
 
     for (i, d) in data.chunks(stride).enumerate() {
         let q = glam::Quat::from_xyzw(d[idx_r1], d[idx_r2], d[idx_r3], d[idx_r0]).normalize();
-        attributes[PLANE_X * vc + i] = d[idx_x];
-        attributes[PLANE_Y * vc + i] = d[idx_y];
-        attributes[PLANE_Z * vc + i] = d[idx_z];
-        attributes[PLANE_QW * vc + i] = q.w;
-        attributes[PLANE_QX * vc + i] = q.x;
-        attributes[PLANE_QY * vc + i] = q.y;
-        attributes[PLANE_QZ * vc + i] = q.z;
-        attributes[PLANE_SX * vc + i] = d[idx_s0];
-        attributes[PLANE_SY * vc + i] = d[idx_s1];
-        attributes[PLANE_SZ * vc + i] = d[idx_s2];
-        attributes[PLANE_OPACITY * vc + i] = d[idx_op];
+        attributes[PLANE_X * vertex_count + i] = d[idx_x];
+        attributes[PLANE_Y * vertex_count + i] = d[idx_y];
+        attributes[PLANE_Z * vertex_count + i] = d[idx_z];
+        attributes[PLANE_QW * vertex_count + i] = q.w;
+        attributes[PLANE_QX * vertex_count + i] = q.x;
+        attributes[PLANE_QY * vertex_count + i] = q.y;
+        attributes[PLANE_QZ * vertex_count + i] = q.z;
+        attributes[PLANE_SX * vertex_count + i] = d[idx_s0];
+        attributes[PLANE_SY * vertex_count + i] = d[idx_s1];
+        attributes[PLANE_SZ * vertex_count + i] = d[idx_s2];
+        attributes[PLANE_OPACITY * vertex_count + i] = d[idx_op];
 
         shs[i] = d[idx_dc0];
-        shs[vc + i] = d[idx_dc1];
-        shs[2 * vc + i] = d[idx_dc2];
+        shs[vertex_count + i] = d[idx_dc1];
+        shs[2 * vertex_count + i] = d[idx_dc2];
         for j in 0..n {
-            shs[((j + 1) * 3) * vc + i] = d[rest_keys[j]];
-            shs[((j + 1) * 3 + 1) * vc + i] = d[rest_keys[n + j]];
-            shs[((j + 1) * 3 + 2) * vc + i] = d[rest_keys[2 * n + j]];
+            shs[((j + 1) * 3) * vertex_count + i] = d[rest_keys[j].0];
+            shs[((j + 1) * 3 + 1) * vertex_count + i] = d[rest_keys[n + j].0];
+            shs[((j + 1) * 3 + 2) * vertex_count + i] = d[rest_keys[2 * n + j].0];
         }
     }
 

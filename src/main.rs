@@ -47,22 +47,19 @@ struct App {
     rendering: Rc<Cell<bool>>,
 }
 
-fn device_descriptor(adapter: &wgpu::Adapter) -> wgpu::DeviceDescriptor<'static> {
-    wgpu::DeviceDescriptor {
-        required_features: adapter.features().difference(
-            wgpu::Features::MAPPABLE_PRIMARY_BUFFERS | wgpu::Features::all_experimental_mask(),
-        ),
-        required_limits: adapter.limits(),
-        memory_hints: wgpu::MemoryHints::MemoryUsage,
-        ..Default::default()
-    }
-}
-
 fn wgpu_config() -> eframe::egui_wgpu::WgpuConfiguration {
     eframe::egui_wgpu::WgpuConfiguration {
         wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(
             eframe::egui_wgpu::WgpuSetupCreateNew {
-                device_descriptor: Arc::new(device_descriptor),
+                device_descriptor: Arc::new(|adapter: &wgpu::Adapter| wgpu::DeviceDescriptor {
+                    required_features: adapter.features().difference(
+                        wgpu::Features::MAPPABLE_PRIMARY_BUFFERS
+                            | wgpu::Features::all_experimental_mask(),
+                    ),
+                    required_limits: adapter.limits(),
+                    memory_hints: wgpu::MemoryHints::MemoryUsage,
+                    ..Default::default()
+                }),
                 ..eframe::egui_wgpu::WgpuSetupCreateNew::without_display_handle()
             },
         ),
@@ -92,14 +89,7 @@ fn splat_format(file: &(impl egui::DroppedFile + ?Sized)) -> Option<SplatFormat>
 /// `eprintln!` is a no-op on wasm32, so errors surface through the JS console.
 #[cfg(target_arch = "wasm32")]
 fn report(msg: String) {
-    use wasm_bindgen::prelude::*;
-
-    #[wasm_bindgen]
-    unsafe extern "C" {
-        #[wasm_bindgen(js_namespace = console)]
-        fn error(s: &str);
-    }
-    error(&msg);
+    web_sys::console::error_1(&msg.as_str().into());
 }
 
 #[cfg(not(target_arch = "wasm32"))]

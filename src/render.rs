@@ -9,8 +9,13 @@ use cubecl::calculate_cube_count_elemwise;
 use cubecl::prelude::*;
 use cubecl::wgpu::WgpuRuntime;
 
-// Safety cap: 2 * max_tiles_per_dim * max_splats
+// Memory ceiling for the intersection buffers, not a derived bound: ~67M
+// entries ≈ 0.5 GiB for the id pair, plus the tile sort's ping-pong scratch.
+// grow_isects clamps capacity here; map_isects truncates emissions past it.
 const INTERSECTS_UPPER_BOUND: usize = 2 * 512 * 65535;
+// First-frame capacity cap, raised toward the ceiling only when a frame
+// actually emits more (see grow_isects).
+const INITIAL_ISECTS_CAP: usize = 1 << 22;
 
 // Web builds compile the rasterizer without the shared-memory early exit (see
 // rasterize_kernel); native keeps it.
@@ -20,8 +25,8 @@ const EARLY_EXIT: bool = !cfg!(target_arch = "wasm32");
 /// `Splats::new`. Field-major layout: see the `PLANE_*` planes in `layout`.
 #[derive(Debug)]
 pub struct CpuSplats {
-    pub attributes: Vec<f32>,
-    pub sh_coeffs: Vec<f32>,
+    pub(crate) attributes: Vec<f32>,
+    pub(crate) sh_coeffs: Vec<f32>,
 }
 
 impl CpuSplats {
@@ -58,7 +63,8 @@ impl RenderScratch {
     pub fn new(client: &ComputeClient<WgpuRuntime>, total: usize, img_size: glam::UVec2) -> Self {
         let tile_bounds = img_size.map(|c| c.div_ceil(layout::TILE_WIDTH));
         let num_tiles = (tile_bounds.x * tile_bounds.y) as usize;
-        let isect_capacity = (num_tiles.saturating_mul(total).min(1 << 22)).next_power_of_two();
+        let isect_capacity =
+            (num_tiles.saturating_mul(total).min(INITIAL_ISECTS_CAP)).next_power_of_two();
         // 256-byte rows: wgpu buffer→texture copies align rows to
         // COPY_BYTES_PER_ROW_ALIGNMENT; texture.rs copies with this stride.
         let row_stride = (img_size.x * 4).next_multiple_of(256) / 4;
@@ -162,18 +168,7 @@ impl Splats {
 
         let sh_per_ch = self.sh_coeffs.shape[1] as u32;
         // World-to-camera rotation rows + translation, passed as kernel scalars.
-        let w2c = camera.w2c();
-        let rot = w2c.matrix3.transpose();
-        let view = CameraViewLaunch::new(
-            rot.x_axis.into(),
-            rot.y_axis.into(),
-            rot.z_axis.into(),
-            w2c.translation.into(),
-            camera.focal(img_size).into(),
-            camera.position.into(),
-            img_size.as_vec2().into(),
-            tile_bounds.as_vec2().into(),
-        );
+        let view = CameraViewLaunch::for_camera(camera, img_size, tile_bounds);
 
         // Stream-ordered before the project launch; saves a kernel dispatch.
         scratch.counters.write([0u32, 0]);
@@ -260,6 +255,22 @@ impl Splats {
     }
 }
 
+/// Field-major attributes for `n` opaque splats stacked at the origin XY with
+/// per-splat `z` — the minimal fixture that drives every kernel path. Shared
+/// by the render tests and the dump_wgsl example.
+pub fn sample_opaque_attributes(n: usize, z: impl Fn(usize) -> f32) -> Vec<f32> {
+    let mut a = vec![0f32; n * layout::ATTR_PLANES];
+    for i in 0..n {
+        a[layout::PLANE_Z * n + i] = z(i);
+        a[layout::PLANE_QW * n + i] = 1.0;
+        a[layout::PLANE_SX * n + i] = -2.0;
+        a[layout::PLANE_SY * n + i] = -2.0;
+        a[layout::PLANE_SZ * n + i] = -2.0;
+        a[layout::PLANE_OPACITY * n + i] = 8.0;
+    }
+    a
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,25 +278,27 @@ mod tests {
     // Golden from current rasterizer; regenerate only with documented behavior change.
     const GOLDEN_CENTER: [i32; 3] = [127, 127, 127];
 
-    /// Field-major attributes for `n` opaque splats at the origin XY, `z` per
-    /// splat. [x | y | z | qw | qx | qy | qz | sx | sy | sz | opacity]
-    fn stacked_attributes(n: usize, z: impl Fn(usize) -> f32) -> Vec<f32> {
-        let mut a = vec![0f32; n * layout::ATTR_PLANES];
-        for i in 0..n {
-            a[2 * n + i] = z(i);
-            a[3 * n + i] = 1.0; // qw
-            a[7 * n + i] = -2.0; // sx
-            a[8 * n + i] = -2.0; // sy
-            a[9 * n + i] = -2.0; // sz
-            a[10 * n + i] = 8.0; // opacity
-        }
-        a
-    }
-
     /// Unpack a packed RGBA8 pixel (r | g<<8 | b<<16 | a<<24).
     fn rgba(px: u32) -> [i32; 4] {
         let [r, g, b, a] = px.to_le_bytes();
         [r as i32, g as i32, b as i32, a as i32]
+    }
+
+    /// Render `n` splats with `attributes` under `camera` into a 32×32 frame;
+    /// returns (center pixel, corner pixel).
+    fn render_corner_pixels(
+        client: &ComputeClient<WgpuRuntime>,
+        n: usize,
+        attributes: Vec<f32>,
+        camera: &Camera,
+    ) -> (u32, u32) {
+        let splats = Splats::new(attributes, vec![0.0; n * 3], client);
+        let mut scratch = RenderScratch::new(client, n, glam::uvec2(32, 32));
+        let bitmap =
+            pollster::block_on(splats.render_with(&mut scratch, camera, glam::uvec2(32, 32)));
+        let px: Vec<u32> = bitmap.read_vec();
+        let stride = bitmap.shape[1] as usize;
+        (px[16 * stride + 16], px[0])
     }
 
     #[test]
@@ -293,16 +306,13 @@ mod tests {
         let (_gpu, client) = crate::tensor::test_client();
         // Five opaque splats stacked in depth at the same XY, nearest at z = 1.0.
         let n = 5usize;
-        let attributes = stacked_attributes(n, |i| 1.0 + i as f32 * 0.5);
-        let splats = Splats::new(attributes, vec![0.0; n * 3], &client);
-        let camera = crate::camera::Camera::default();
-        let mut scratch = RenderScratch::new(&client, 5, glam::uvec2(32, 32));
-        let bitmap =
-            pollster::block_on(splats.render_with(&mut scratch, &camera, glam::uvec2(32, 32)));
-        let px: Vec<u32> = bitmap.read_vec();
-        let stride = bitmap.shape[1] as usize;
-        let [r, g, b, a] = rgba(px[16 * stride + 16]);
-        let corner = px[0];
+        let (center, corner) = render_corner_pixels(
+            &client,
+            n,
+            sample_opaque_attributes(n, |i| 1.0 + i as f32 * 0.5),
+            &Camera::default(),
+        );
+        let [r, g, b, a] = rgba(center);
         // quantize_u8 truncates; f32 residual transmittance leaves 255-1 LSB.
         assert!(
             a >= 254,
@@ -327,24 +337,19 @@ mod tests {
         // or a flipped/dropped translation sends it behind the camera
         // instead — the identity-camera test can't distinguish those.
         let n = 5usize;
-        let attributes = stacked_attributes(n, |_| 0.0);
-        let splats = Splats::new(attributes, vec![0.0; n * 3], &client);
-        let camera = crate::camera::Camera {
+        let camera = Camera {
             position: glam::Vec3::new(-2.0, 0.0, 0.0),
             rotation: glam::Quat::from_rotation_y(core::f32::consts::FRAC_PI_2),
             ..Camera::default()
         };
-        let mut scratch = RenderScratch::new(&client, n, glam::uvec2(32, 32));
-        let bitmap =
-            pollster::block_on(splats.render_with(&mut scratch, &camera, glam::uvec2(32, 32)));
-        let px: Vec<u32> = bitmap.read_vec();
-        let stride = bitmap.shape[1] as usize;
-        let [r, g, b, a] = rgba(px[16 * stride + 16]);
+        let (center, corner) =
+            render_corner_pixels(&client, n, sample_opaque_attributes(n, |_| 0.0), &camera);
+        let [r, g, b, a] = rgba(center);
         assert!(
             a >= 254,
             "yawed camera must still see the origin splat (a={a})"
         );
-        assert_eq!(px[0] & 0xFF00_0000, 0, "corner stays transparent");
+        assert_eq!(corner & 0xFF00_0000, 0, "corner stays transparent");
         for (got, want) in [r, g, b].iter().zip(GOLDEN_CENTER) {
             assert!((got - want).abs() <= 1, "center color {r},{g},{b}");
         }

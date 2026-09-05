@@ -6,7 +6,7 @@
 //! ```
 use cubecl::Runtime;
 use splatfield::camera::Camera;
-use splatfield::render::{RenderScratch, Splats};
+use splatfield::render::{RenderScratch, Splats, sample_opaque_attributes};
 
 fn main() {
     env_logger::init();
@@ -14,15 +14,7 @@ fn main() {
     println!("backend: {:?}", cubecl::Runtime::name(&client));
 
     let n = 5usize;
-    let mut attributes = vec![0f32; n * 11];
-    for i in 0..n {
-        attributes[2 * n + i] = 1.0 + i as f32 * 0.5;
-        attributes[3 * n + i] = 1.0;
-        attributes[7 * n + i] = -2.0;
-        attributes[8 * n + i] = -2.0;
-        attributes[9 * n + i] = -2.0;
-        attributes[10 * n + i] = 8.0;
-    }
+    let attributes = sample_opaque_attributes(n, |i| 1.0 + i as f32 * 0.5);
     let splats = Splats::new(attributes, vec![0.0; n * 3], &client);
     let camera = Camera::default();
     let mut scratch = RenderScratch::new(&client, n, glam::uvec2(32, 32));

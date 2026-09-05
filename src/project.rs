@@ -8,6 +8,7 @@ use crate::layout::{
     PLANE_Y, PLANE_Z, PROJ_FLOATS, TILE_WIDTH, Vec2F, Vec3F,
 };
 use cubecl::prelude::*;
+use cubecl::wgpu::WgpuRuntime;
 
 const ALPHA_CUTOFF: f32 = 10.0 / u8::MAX as f32;
 
@@ -18,14 +19,6 @@ struct Vec4F {
     pub x: f32,
     pub y: f32,
     pub z: f32,
-}
-
-#[derive(CubeType, Clone, Copy)]
-#[expand(derive(Clone, Copy))]
-struct Mat3 {
-    pub row0: Vec3F,
-    pub row1: Vec3F,
-    pub row2: Vec3F,
 }
 
 #[derive(CubeType, Clone, Copy)]
@@ -82,6 +75,28 @@ pub(crate) struct CameraView {
     pub tile_bounds: Vec2F,
 }
 
+impl CameraViewLaunch<WgpuRuntime> {
+    /// Kernel view of `camera` for an `img_size` frame of `tile_bounds` tiles.
+    pub(crate) fn for_camera(
+        camera: &crate::camera::Camera,
+        img_size: glam::UVec2,
+        tile_bounds: glam::UVec2,
+    ) -> Self {
+        let w2c = camera.w2c();
+        let rot = w2c.matrix3.transpose();
+        Self::new(
+            rot.x_axis.into(),
+            rot.y_axis.into(),
+            rot.z_axis.into(),
+            w2c.translation.into(),
+            camera.focal(img_size).into(),
+            camera.position.into(),
+            img_size.as_vec2().into(),
+            tile_bounds.as_vec2().into(),
+        )
+    }
+}
+
 #[cube]
 fn dot3(a: Vec3F, b: Vec3F) -> f32 {
     a.x * b.x + a.y * b.y + a.z * b.z
@@ -109,7 +124,7 @@ fn to_camera_space(view: &CameraView, pos: Vec3F) -> Vec3F {
 }
 
 #[cube]
-fn quat_to_rotation(q: Vec4F) -> Mat3 {
+fn quat_to_rotation(q: Vec4F) -> (Vec3F, Vec3F, Vec3F) {
     let x2 = q.x * q.x;
     let y2 = q.y * q.y;
     let z2 = q.z * q.z;
@@ -120,23 +135,23 @@ fn quat_to_rotation(q: Vec4F) -> Mat3 {
     let wy = q.w * q.y;
     let wz = q.w * q.z;
 
-    Mat3 {
-        row0: Vec3F {
+    (
+        Vec3F {
             x: 1.0f32 - 2.0f32 * (y2 + z2),
             y: 2.0f32 * (xy - wz),
             z: 2.0f32 * (xz + wy),
         },
-        row1: Vec3F {
+        Vec3F {
             x: 2.0f32 * (xy + wz),
             y: 1.0f32 - 2.0f32 * (x2 + z2),
             z: 2.0f32 * (yz - wx),
         },
-        row2: Vec3F {
+        Vec3F {
             x: 2.0f32 * (xz - wy),
             y: 2.0f32 * (yz + wx),
             z: 1.0f32 - 2.0f32 * (x2 + y2),
         },
-    }
+    )
 }
 
 #[cube]
@@ -165,10 +180,10 @@ fn compute_cov2d(scale: Vec3F, quat: Vec4F, view: &CameraView, cam: Vec3F) -> Ve
     let rot1 = view.rot1;
     let rot2 = view.rot2;
 
-    let r = quat_to_rotation(quat);
-    let m0 = scale_components(r.row0, scale);
-    let m1 = scale_components(r.row1, scale);
-    let m2 = scale_components(r.row2, scale);
+    let (r0, r1, r2) = quat_to_rotation(quat);
+    let m0 = scale_components(r0, scale);
+    let m1 = scale_components(r1, scale);
+    let m2 = scale_components(r2, scale);
 
     let inv_cam_z = cam.z.recip();
     let lim_x = 1.3f32 * view.img.x / (2.0f32 * view.focal.x);
@@ -369,7 +384,6 @@ fn sh_to_rgb(chs: u32, dir: Vec3F, splat: u32, n: u32, shs: &[f32]) -> (f32, f32
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::layout::{Vec2FLaunch, Vec3FLaunch};
     use crate::tensor::GpuTensor;
     use cubecl::calculate_cube_count_elemwise;
     use cubecl::wgpu::WgpuRuntime;
@@ -396,15 +410,10 @@ mod tests {
             &client,
             calculate_cube_count_elemwise(&client, 1, CubeDim::new_1d(256)),
             CubeDim::new_1d(256),
-            CameraViewLaunch::new(
-                Vec3FLaunch::new(1.0, 0.0, 0.0),
-                Vec3FLaunch::new(0.0, 1.0, 0.0),
-                Vec3FLaunch::new(0.0, 0.0, 1.0),
-                Vec3FLaunch::new(0.0, 0.0, 0.0),
-                Vec2FLaunch::new(32.0, 32.0),
-                Vec3FLaunch::new(0.0, 0.0, 0.0),
-                Vec2FLaunch::new(64.0, 64.0),
-                Vec2FLaunch::new(4.0, 4.0),
+            CameraViewLaunch::for_camera(
+                &crate::camera::Camera::default(),
+                glam::uvec2(64, 64),
+                glam::uvec2(4, 4),
             ),
             attrs_t.as_buffer_arg(),
             sh_t.as_buffer_arg(),

@@ -2,7 +2,6 @@
 //!
 //! References:
 //! - <https://github.com/ArthurBrussee/brush/blob/main/crates/brush-sort/src/lib.rs>
-//! - libcusort (onesweep-style warp ranking, see data/libcusort)
 use crate::scan::{ScanScratch, exclusive_scan_buf};
 use crate::tensor::GpuTensor;
 use cubecl::calculate_cube_count_elemwise;
@@ -10,9 +9,9 @@ use cubecl::prelude::*;
 use cubecl::wgpu::WgpuRuntime;
 
 const SORT_WG: u32 = 128;
-// 4-bit fallback path (no plane ops): 16 bins, per-lane private histograms.
-const BITS_FALLBACK: u32 = 4;
-const SORT_BINS: u32 = 16;
+// Fallback path (no plane ops): 4-bit digits, per-lane private histograms.
+const BITS_PER_PASS_FALLBACK: u32 = 4;
+const SORT_BINS: u32 = 1 << BITS_PER_PASS_FALLBACK;
 const ELEMS_PER_THREAD: u32 = 8;
 const SORT_BLOCK: u32 = SORT_WG * ELEMS_PER_THREAD;
 // scatter scan: SORT_WG lanes are scanned by SORT_BINS x SCAN_GROUPS threads
@@ -23,7 +22,7 @@ const SCAN_CHUNK: u32 = SORT_WG / SCAN_GROUPS;
 // stay wide enough (2048/64 = 32 elements, two cache lines) that the
 // scatter's global writes coalesce; ranking uses one match-any ballot group
 // per item instead of a per-lane histogram column.
-const BINS_PLANE: u32 = 64;
+pub(crate) const BINS_PLANE: u32 = 64;
 const BITS_PLANE: u32 = 6;
 const EPT_PLANE: u32 = 16;
 const BLOCK_PLANE: u32 = SORT_WG * EPT_PLANE;
@@ -274,6 +273,8 @@ fn scatter_plane_kernel(
     // Bin transform, one bin per thread. prefix[b] holds the tile count,
     // then the bin-exclusive tile offset, then global_base[b] - tile_excl[b];
     // hist[p][b] becomes the tile-local slot base of plane p for bin b.
+    // The tile total is re-derived from hist: counts was already
+    // exclusive-scanned in place, so it holds global offsets, not counts.
     let b = UNIT_POS;
     if b < BINS_PLANE {
         let mut total = 0u32;
@@ -410,7 +411,6 @@ fn plane_sort_path(client: &ComputeClient<WgpuRuntime>) -> Option<u32> {
 /// element count so repeated sorts allocate nothing. Two sorts whose output
 /// feeds the next sort's input must use *separate* scratch instances: after an
 /// odd pass count the returned tensors alias the scratch.
-#[derive(Debug)]
 pub struct RadixScratch {
     count_buf: GpuTensor,
     /// Scratch for the per-pass counter scans.
@@ -451,7 +451,7 @@ fn radix_argsort_path(
     // Y/Z (CubeCountSelection), so kernels linearize the workgroup id.
     let (block, bins, bits_per_pass) = match planes {
         Some(_) => (BLOCK_PLANE, BINS_PLANE, BITS_PLANE),
-        None => (SORT_BLOCK, SORT_BINS, BITS_FALLBACK),
+        None => (SORT_BLOCK, SORT_BINS, BITS_PER_PASS_FALLBACK),
     };
     let num_wgs = n.div_ceil(block);
     let cube_count = calculate_cube_count_elemwise(&client, n as usize, CubeDim::new_1d(block));
@@ -743,40 +743,13 @@ mod radix_sort_tests {
 
     #[test]
     fn test_sorting_large() {
-        const NUM_ELEMENTS: usize = 500_000;
-
         let (_gpu, client) = crate::tensor::test_client();
         let mut rng = rand::rng();
-
-        let keys_inp: Vec<u32> = (0..NUM_ELEMENTS)
+        let keys_inp: Vec<u32> = (0..500_000)
             .map(|_| rng.random_range(0..1_000_000))
             .collect();
-        let values_inp: Vec<u32> = (0..NUM_ELEMENTS).map(|i| i as u32).collect();
-
-        let keys = GpuTensor::from(&client, [NUM_ELEMENTS], &keys_inp[..]);
-        let values = GpuTensor::from(&client, [NUM_ELEMENTS], &values_inp[..]);
-        let scratch = RadixScratch::new(&client, NUM_ELEMENTS);
-        let (ret_keys, ret_values) =
-            radix_argsort_with(&keys, &values, NUM_ELEMENTS as u32, 32, &scratch);
-
-        let ret_keys: Vec<u32> = ret_keys.read_vec();
-        let ret_values: Vec<u32> = ret_values.read_vec();
-
-        assert_eq!(ret_keys.len(), NUM_ELEMENTS);
-        assert_eq!(ret_values.len(), NUM_ELEMENTS);
-
-        let bad = ret_keys.windows(2).position(|w| w[0] > w[1]);
-        assert!(bad.is_none(), "keys not sorted at index {bad:?}");
-
-        let check_indices = [0, 1000, 10_000, 100_000, 249_999];
-        for &idx in &check_indices {
-            let sorted_key = ret_keys[idx];
-            let original_idx = ret_values[idx] as usize;
-            assert_eq!(
-                keys_inp[original_idx], sorted_key,
-                "Value at index {idx} points to wrong original index"
-            );
-        }
+        let values_inp: Vec<u32> = (0..500_000).map(|i| i as u32).collect();
+        assert_argsort_bits(&client, &keys_inp, &values_inp, 32);
     }
 
     #[test]

@@ -29,14 +29,6 @@ pub struct GpuTensor {
     pub shape: Shape,
 }
 
-impl core::fmt::Debug for GpuTensor {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("GpuTensor")
-            .field("shape", &self.shape)
-            .finish()
-    }
-}
-
 impl GpuTensor {
     fn new(client: ComputeClient<WgpuRuntime>, shape: impl Into<Shape>, handle: Handle) -> Self {
         Self {

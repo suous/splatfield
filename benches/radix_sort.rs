@@ -25,17 +25,16 @@ fn make_data(n: usize, dist: &str) -> Vec<u32> {
     }
 }
 
-/// Keys (distribution `dist`), identity values, a sync flag, and scratch —
-/// the setup every sort bench shares.
+/// Keys (distribution `dist`), identity values, and scratch — the setup every
+/// sort bench shares.
 fn sort_fixture(
     client: &ComputeClient<WgpuRuntime>,
     n: usize,
     dist: &str,
-) -> (GpuTensor, GpuTensor, GpuTensor, RadixScratch) {
+) -> (GpuTensor, GpuTensor, RadixScratch) {
     let keys = GpuTensor::from(client, [n], make_data(n, dist));
     let vals = GpuTensor::from(client, [n], (0..n as u32).collect::<Vec<_>>());
-    let flag = GpuTensor::from(client, [2], &[0u32, 0][..]);
-    (keys, vals, flag, RadixScratch::new(client, n))
+    (keys, vals, RadixScratch::new(client, n))
 }
 
 fn bench_group<'a>(c: &'a mut Criterion, name: &str) -> BenchmarkGroup<'a, WallTime> {
@@ -51,12 +50,12 @@ fn bench_sort(
     id: BenchmarkId,
     keys: &GpuTensor,
     vals: &GpuTensor,
-    flag: &GpuTensor,
     scratch: &RadixScratch,
     bits: u32,
 ) {
     let n = keys.shape[0];
     group.throughput(Throughput::Elements(n as u64));
+    let flag = GpuTensor::from(&keys.client, [2], &[0u32, 0][..]);
     // Each iteration feeds the previous sort's output back in, so scratch
     // must alternate: after an odd pass count the output aliases the scratch
     // dst buffers, and with exclusive-memory-only bindings a buffer can't be
@@ -79,65 +78,47 @@ fn bench_sort(
     });
 }
 
-fn bench_size_sweep(c: &mut Criterion) {
+/// One criterion group over a shared client; each case is
+/// (benchmark id, element count, key distribution, key bits).
+fn bench_sweep(c: &mut Criterion, name: &str, cases: Vec<(BenchmarkId, usize, &'static str, u32)>) {
     let client = cubecl::wgpu::WgpuRuntime::client(&Default::default());
-    let mut group = bench_group(c, "radix_argsort/kernel");
-
-    for &n in SIZES {
-        let (keys, vals, flag, scratch) = sort_fixture(&client, n, "random");
-        bench_sort(
-            &mut group,
-            BenchmarkId::from_parameter(n),
-            &keys,
-            &vals,
-            &flag,
-            &scratch,
-            32,
-        );
+    let mut group = bench_group(c, name);
+    for (id, n, dist, bits) in &cases {
+        let (keys, vals, scratch) = sort_fixture(&client, *n, dist);
+        bench_sort(&mut group, id.clone(), &keys, &vals, &scratch, *bits);
     }
     group.finish();
+}
+
+fn bench_size_sweep(c: &mut Criterion) {
+    bench_sweep(
+        c,
+        "radix_argsort/kernel",
+        SIZES
+            .iter()
+            .map(|&n| (BenchmarkId::from_parameter(n), n, "random", 32))
+            .collect(),
+    );
 }
 
 fn bench_bits_sweep(c: &mut Criterion) {
-    let client = cubecl::wgpu::WgpuRuntime::client(&Default::default());
-    let mut group = bench_group(c, "radix_argsort/bits");
-
-    let n: usize = 1_000_000;
-    let (keys, vals, flag, scratch) = sort_fixture(&client, n, "random");
-
-    for &bits in &[4u32, 8, 12, 16, 20, 24, 28, 32] {
-        bench_sort(
-            &mut group,
-            BenchmarkId::from_parameter(bits),
-            &keys,
-            &vals,
-            &flag,
-            &scratch,
-            bits,
-        );
-    }
-    group.finish();
+    bench_sweep(
+        c,
+        "radix_argsort/bits",
+        [4u32, 8, 12, 16, 20, 24, 28, 32]
+            .map(|bits| (BenchmarkId::from_parameter(bits), 1_000_000, "random", bits))
+            .to_vec(),
+    );
 }
 
 fn bench_distribution(c: &mut Criterion) {
-    let client = cubecl::wgpu::WgpuRuntime::client(&Default::default());
-    let mut group = bench_group(c, "radix_argsort/distribution");
-
-    let n: usize = 1_000_000;
-
-    for &dist in &["random", "sequential", "reverse"] {
-        let (keys, vals, flag, scratch) = sort_fixture(&client, n, dist);
-        bench_sort(
-            &mut group,
-            BenchmarkId::from_parameter(dist),
-            &keys,
-            &vals,
-            &flag,
-            &scratch,
-            32,
-        );
-    }
-    group.finish();
+    bench_sweep(
+        c,
+        "radix_argsort/distribution",
+        ["random", "sequential", "reverse"]
+            .map(|d| (BenchmarkId::from_parameter(d), 1_000_000, d, 32))
+            .to_vec(),
+    );
 }
 
 fn bench_end_to_end(c: &mut Criterion) {

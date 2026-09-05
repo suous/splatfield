@@ -18,7 +18,8 @@ fn bench_frame(c: &mut Criterion) {
     group.measurement_time(Duration::from_secs(5));
 
     for &(w, h) in &[(1280u32, 720u32), (1920, 1080)] {
-        let camera = fixed_camera(&splats);
+        let mut camera = Camera::default();
+        camera.frame_bounds(splats.bounds);
         let mut scratch = RenderScratch::new(&client, n, glam::uvec2(w, h));
         group.throughput(Throughput::Elements((w * h) as u64));
         group.bench_function(format!("{w}x{h}"), |b| {
@@ -51,13 +52,6 @@ fn load_bear() -> Option<(Splats, usize)> {
         .upload(&client);
     let n = splats.attributes.shape[0];
     Some((splats, n))
-}
-
-/// Centered, pulled back along -Y, pitched -90° around X (`Camera::frame_bounds`), fov 0.8.
-fn fixed_camera(splats: &Splats) -> Camera {
-    let mut camera = Camera::default();
-    camera.frame_bounds(splats.bounds);
-    camera
 }
 
 criterion_group!(benches, bench_frame);
