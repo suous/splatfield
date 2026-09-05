@@ -13,7 +13,7 @@ use anyhow::Context;
 
 use cubecl::wgpu::{MemoryConfiguration, RuntimeOptions, WgpuRuntime, WgpuSetup, init_device};
 use cubecl::{Runtime, client::ComputeClient};
-use eframe::egui::{self, Color32, Rect};
+use eframe::egui::{self, Color32, Rect, TextureId};
 use eframe::wgpu;
 use splatfield::{camera, ply, render, sog, texture};
 
@@ -36,6 +36,10 @@ struct FrameGpu {
 
 struct App {
     gpu: Rc<RefCell<FrameGpu>>,
+    // Stable for the texture's lifetime — recreate_texture reuses the id — so
+    // the paint path never borrows `gpu`, which the wasm render task holds
+    // across its await.
+    tex_id: TextureId,
     controller: camera::Controller,
     client: ComputeClient<WgpuRuntime>,
     splats: Arc<Mutex<Loaded>>,
@@ -122,15 +126,18 @@ impl App {
             },
         );
 
+        let backbuffer = texture::GpuTexture::new(
+            render_state.renderer.clone(),
+            render_state.device.clone(),
+            render_state.queue.clone(),
+        );
+        let tex_id = backbuffer.texture_id();
         Self {
             gpu: Rc::new(RefCell::new(FrameGpu {
-                backbuffer: texture::GpuTexture::new(
-                    render_state.renderer.clone(),
-                    render_state.device.clone(),
-                    render_state.queue.clone(),
-                ),
+                backbuffer,
                 scratch: None,
             })),
+            tex_id,
             controller: camera::Controller::default(),
             client: WgpuRuntime::client(&device),
             splats: Arc::new(Mutex::new(Loaded::default())),
@@ -271,8 +278,8 @@ impl eframe::App for App {
             }
         }
 
-        let id = self.gpu.borrow().backbuffer.texture_id();
-        ui.painter().image(id, rect, UV_RECT, Color32::WHITE);
+        ui.painter()
+            .image(self.tex_id, rect, UV_RECT, Color32::WHITE);
     }
 }
 
