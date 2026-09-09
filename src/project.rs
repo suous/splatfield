@@ -244,7 +244,6 @@ pub(crate) fn project_splats(
     if ABSOLUTE_POS_X >= depth_order.len() as u32 {
         terminate!();
     }
-    // Attribute planes are field-major (layout::PLANE_*): warp-coalesced.
     let n = depth_order.len();
     let i = ABSOLUTE_POS_X as usize;
     let mean = Vec3F {
@@ -334,8 +333,6 @@ const SH_C2_3: f32 = 0.546_274_24_f32;
 #[rustfmt::skip]
 #[cube]
 fn sh_to_rgb(chs: u32, dir: Vec3F, splat: u32, n: u32, shs: &[f32]) -> (f32, f32, f32) {
-    // Field-major layout: coefficient k, channel c lives at shs[(k*3+c)*n + splat],
-    // so consecutive threads read consecutive addresses (coalesced).
     let s = splat as usize;
     let stride = n as usize;
     let mut r = SH_C0 * shs[s];

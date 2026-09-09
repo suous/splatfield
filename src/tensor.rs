@@ -30,19 +30,15 @@ pub struct GpuTensor {
 }
 
 impl GpuTensor {
-    fn new(client: ComputeClient<WgpuRuntime>, shape: impl Into<Shape>, handle: Handle) -> Self {
-        Self {
-            client,
-            handle,
-            shape: shape.into(),
-        }
-    }
-
     pub fn empty(client: &ComputeClient<WgpuRuntime>, shape: impl Into<Shape>) -> GpuTensor {
         let shape = shape.into();
         // All buffers hold 4-byte elements (f32/u32), so f32 sizing covers both.
-        let buffer = client.empty(shape.iter().product::<usize>() * size_of::<f32>());
-        Self::new(client.clone(), shape, buffer)
+        let handle = client.empty(shape.iter().product::<usize>() * size_of::<f32>());
+        Self {
+            client: client.clone(),
+            handle,
+            shape,
+        }
     }
 
     /// Upload to the GPU. An owned `Vec` is moved without copying; a slice is
@@ -52,8 +48,12 @@ impl GpuTensor {
         shape: impl Into<Shape>,
         data: impl Into<Vec<T>>,
     ) -> Self {
-        let buffer = client.create(cubecl::bytes::Bytes::from_elems(data.into()));
-        Self::new(client.clone(), shape, buffer)
+        let handle = client.create(cubecl::bytes::Bytes::from_elems(data.into()));
+        Self {
+            client: client.clone(),
+            handle,
+            shape: shape.into(),
+        }
     }
 
     pub fn read_vec<T: bytemuck::Pod>(&self) -> Vec<T> {

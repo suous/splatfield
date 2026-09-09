@@ -30,14 +30,13 @@ pub struct CpuSplats {
 }
 
 impl CpuSplats {
-    /// Upload to the GPU, keeping the parsers client-free.
     pub fn upload(self, client: &ComputeClient<WgpuRuntime>) -> Splats {
         Splats::new(self.attributes, self.sh_coeffs, client)
     }
 }
 
 /// Per-frame GPU buffers, reused across frames so steady-state rendering
-/// allocates nothing new. Rebuild when `matches` returns false.
+/// allocates nothing new. Rebuilt when the frame shape changes.
 pub struct RenderScratch {
     depth_order: GpuTensor,
     depth_keys: GpuTensor,
@@ -90,9 +89,18 @@ impl RenderScratch {
         self.depth_order.shape[0] == total && self.img_size == img_size
     }
 
-    /// Grow the isect buffers when last frame's raw emission exceeded their
-    /// capacity. Between frames, so a frame always runs on one buffer set.
-    fn grow_isects(&mut self, client: &ComputeClient<WgpuRuntime>, raw: u32) {
+    /// Rebuild if the frame shape changed, then grow the isect buffers from
+    /// last frame's emission. Returns the tile grid `(bounds, count)`.
+    fn prepare(
+        &mut self,
+        client: &ComputeClient<WgpuRuntime>,
+        total: usize,
+        img_size: glam::UVec2,
+    ) -> (glam::UVec2, usize) {
+        if !self.matches(total, img_size) {
+            *self = Self::new(client, total, img_size);
+        }
+        let raw = self.last_isects_raw;
         let new_cap = (raw as usize)
             .next_power_of_two()
             .min(INTERSECTS_UPPER_BOUND);
@@ -105,6 +113,8 @@ impl RenderScratch {
             self.gaussian_ids = GpuTensor::empty(client, [new_cap]);
             self.sort_tile = RadixScratch::new(client, new_cap);
         }
+        let bounds = img_size.map(|c| c.div_ceil(layout::TILE_WIDTH));
+        (bounds, (bounds.x * bounds.y) as usize)
     }
 }
 
@@ -156,18 +166,11 @@ impl Splats {
     ) -> GpuTensor {
         let client = &self.attributes.client;
         let total = self.attributes.shape[0];
-        if !scratch.matches(total, img_size) {
-            *scratch = RenderScratch::new(client, total, img_size);
-        }
-        // Grow from last frame's raw emission, before anything is in flight.
-        scratch.grow_isects(client, scratch.last_isects_raw);
-        let tile_bounds = img_size.map(|c| c.div_ceil(layout::TILE_WIDTH));
-        let num_tiles = (tile_bounds.x * tile_bounds.y) as usize;
+        let (tile_bounds, num_tiles) = scratch.prepare(client, total, img_size);
         let max_isects = scratch.tile_ids.shape[0] as u32;
         let cube_dim = CubeDim::new_1d(layout::TILE_SIZE);
 
         let sh_per_ch = self.sh_coeffs.shape[1] as u32;
-        // World-to-camera rotation rows + translation, passed as kernel scalars.
         let view = CameraViewLaunch::for_camera(camera, img_size, tile_bounds);
 
         // Stream-ordered before the project launch; saves a kernel dispatch.
@@ -302,56 +305,39 @@ mod tests {
     }
 
     #[test]
-    fn test_render_stacked_opaque_splats() {
+    fn test_render_golden_center() {
         let (_gpu, client) = crate::tensor::test_client();
-        // Five opaque splats stacked in depth at the same XY, nearest at z = 1.0.
         let n = 5usize;
-        let (center, corner) = render_corner_pixels(
-            &client,
-            n,
-            sample_opaque_attributes(n, |i| 1.0 + i as f32 * 0.5),
-            &Camera::default(),
-        );
-        let [r, g, b, a] = rgba(center);
-        // quantize_u8 truncates; f32 residual transmittance leaves 255-1 LSB.
-        assert!(
-            a >= 254,
-            "opaque stack must saturate alpha (truncating quantizer: {a})"
-        );
-        assert_eq!(
-            corner & 0xFF00_0000,
-            0,
-            "uncovered pixel must be transparent"
-        );
-        assert!((r - GOLDEN_CENTER[0]).abs() <= 1);
-        assert!((g - GOLDEN_CENTER[1]).abs() <= 1);
-        assert!((b - GOLDEN_CENTER[2]).abs() <= 1);
-    }
-
-    #[test]
-    fn test_render_rotated_translated_camera() {
-        let (_gpu, client) = crate::tensor::test_client();
-        // Five opaque splats stacked at the world origin, seen by a camera
-        // rotated 90° around Y and translated to (-2, 0, 0): it looks along
-        // +X, so the stack must land dead center. A transposed rotation row
-        // or a flipped/dropped translation sends it behind the camera
-        // instead — the identity-camera test can't distinguish those.
-        let n = 5usize;
-        let camera = Camera {
+        // Five opaque splats stacked in depth at the same XY, plus the same
+        // stack seen by a camera yawed 90° and translated to (-2, 0, 0): a
+        // transposed rotation row or a flipped/dropped translation sends the
+        // stack behind the camera, which the identity case cannot distinguish.
+        let yawed = Camera {
             position: glam::Vec3::new(-2.0, 0.0, 0.0),
             rotation: glam::Quat::from_rotation_y(core::f32::consts::FRAC_PI_2),
             ..Camera::default()
         };
-        let (center, corner) =
-            render_corner_pixels(&client, n, sample_opaque_attributes(n, |_| 0.0), &camera);
-        let [r, g, b, a] = rgba(center);
-        assert!(
-            a >= 254,
-            "yawed camera must still see the origin splat (a={a})"
-        );
-        assert_eq!(corner & 0xFF00_0000, 0, "corner stays transparent");
-        for (got, want) in [r, g, b].iter().zip(GOLDEN_CENTER) {
-            assert!((got - want).abs() <= 1, "center color {r},{g},{b}");
+        let cases = [
+            (
+                "stacked",
+                sample_opaque_attributes(n, |i| 1.0 + i as f32 * 0.5),
+                Camera::default(),
+            ),
+            ("yawed", sample_opaque_attributes(n, |_| 0.0), yawed),
+        ];
+        for (name, attributes, camera) in cases {
+            let (center, corner) = render_corner_pixels(&client, n, attributes, &camera);
+            let [r, g, b, a] = rgba(center);
+            // quantize_u8 truncates; f32 residual transmittance leaves 255-1 LSB.
+            assert!(a >= 254, "{name}: opaque stack must saturate alpha ({a})");
+            assert_eq!(
+                corner & 0xFF00_0000,
+                0,
+                "{name}: uncovered pixel must be transparent"
+            );
+            for (got, want) in [r, g, b].iter().zip(GOLDEN_CENTER) {
+                assert!((got - want).abs() <= 1, "{name}: center color {r},{g},{b}");
+            }
         }
     }
 

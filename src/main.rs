@@ -3,10 +3,7 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 #[cfg(target_arch = "wasm32")]
-use std::cell::Cell;
-
-#[cfg(target_arch = "wasm32")]
-use wasm_bindgen::JsCast;
+use web_sys::wasm_bindgen::JsCast;
 
 #[cfg(not(target_arch = "wasm32"))]
 use anyhow::Context;
@@ -34,17 +31,18 @@ struct FrameGpu {
     scratch: Option<render::RenderScratch>,
 }
 
+/// The render task moves the frame state out for the duration of a frame, so
+/// no borrow is held across its await; `None` means a render is in flight.
+type FrameSlot = Rc<RefCell<Option<FrameGpu>>>;
+
 struct App {
-    gpu: Rc<RefCell<FrameGpu>>,
+    gpu: FrameSlot,
     // Stable for the texture's lifetime — recreate_texture reuses the id — so
-    // the paint path never borrows `gpu`, which the wasm render task holds
-    // across its await.
+    // the paint path never borrows `gpu`.
     tex_id: TextureId,
     controller: camera::Controller,
     client: ComputeClient<WgpuRuntime>,
     splats: Arc<Mutex<Loaded>>,
-    #[cfg(target_arch = "wasm32")]
-    rendering: Rc<Cell<bool>>,
 }
 
 fn wgpu_config() -> eframe::egui_wgpu::WgpuConfiguration {
@@ -72,17 +70,14 @@ enum SplatFormat {
     Sog,
 }
 
-fn splat_format(file: &(impl egui::DroppedFile + ?Sized)) -> Option<SplatFormat> {
-    match file
-        .path()
-        .extension()?
-        .to_str()?
-        .to_ascii_lowercase()
-        .as_str()
-    {
-        "ply" => Some(SplatFormat::Ply),
-        "sog" => Some(SplatFormat::Sog),
-        _ => None,
+fn splat_format(path: &std::path::Path) -> Option<SplatFormat> {
+    let ext = path.extension()?.to_str()?;
+    if ext.eq_ignore_ascii_case("ply") {
+        Some(SplatFormat::Ply)
+    } else if ext.eq_ignore_ascii_case("sog") {
+        Some(SplatFormat::Sog)
+    } else {
+        None
     }
 }
 
@@ -123,16 +118,14 @@ impl App {
         );
         let tex_id = backbuffer.texture_id();
         Self {
-            gpu: Rc::new(RefCell::new(FrameGpu {
+            gpu: Rc::new(RefCell::new(Some(FrameGpu {
                 backbuffer,
                 scratch: None,
-            })),
+            }))),
             tex_id,
             controller: camera::Controller::default(),
             client: WgpuRuntime::client(&device),
             splats: Arc::new(Mutex::new(Loaded::default())),
-            #[cfg(target_arch = "wasm32")]
-            rendering: Rc::new(Cell::new(false)),
         }
     }
 
@@ -141,10 +134,11 @@ impl App {
         let splats = Arc::clone(&self.splats);
 
         let load = move |reader| -> anyhow::Result<render::Splats> {
-            match format {
-                SplatFormat::Sog => Ok(sog::parse_sog(reader)?.upload(&client)),
-                SplatFormat::Ply => Ok(ply::parse_ply(reader)?.upload(&client)),
-            }
+            let cpu = match format {
+                SplatFormat::Sog => sog::parse_sog(reader)?,
+                SplatFormat::Ply => ply::parse_ply(reader)?,
+            };
+            Ok(cpu.upload(&client))
         };
 
         let on_loaded = move |result: anyhow::Result<render::Splats>| match result {
@@ -155,7 +149,7 @@ impl App {
                 drop(slot);
                 ctx.request_repaint();
             }
-            Err(e) => report(format!("Failed to load splat: {e:?}")),
+            Err(e) => report(format!("Failed to load splat: {e:#}")),
         };
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -183,28 +177,30 @@ impl App {
 }
 
 /// Render `splats` into the shared scratch and present the bitmap to the
-/// backbuffer. The `FrameGpu` borrow lives across the await — wasm's
-/// `rendering` flag guards re-entering while one render is in flight, and
-/// native `block_on` drives the future on the same thread.
-#[allow(clippy::await_holding_refcell_ref)] // render_with borrows the scratch for its duration
+/// backbuffer. The frame state is moved out for the duration so no borrow is
+/// held across the await; native `block_on` and wasm's single in-flight task
+/// both drive it on one thread.
 async fn render_frame(
     client: &ComputeClient<WgpuRuntime>,
-    gpu: &Rc<RefCell<FrameGpu>>,
+    slot: &FrameSlot,
     splats: &render::Splats,
     camera: &camera::Camera,
     pixel: glam::UVec2,
 ) {
-    let mut gpu = gpu.borrow_mut();
+    let Some(mut frame) = slot.borrow_mut().take() else {
+        return;
+    };
     let img = splats
         .render_with(
-            gpu.scratch.get_or_insert_with(|| {
+            frame.scratch.get_or_insert_with(|| {
                 render::RenderScratch::new(client, splats.attributes.shape[0], pixel)
             }),
             camera,
             pixel,
         )
         .await;
-    gpu.backbuffer.update_texture(&img, pixel);
+    frame.backbuffer.update_texture(&img, pixel);
+    *slot.borrow_mut() = Some(frame);
 }
 
 impl eframe::App for App {
@@ -213,7 +209,7 @@ impl eframe::App for App {
             i.raw
                 .dropped_files
                 .iter()
-                .find_map(|f| splat_format(f.as_ref()).map(|format| (f.clone(), format)))
+                .find_map(|f| splat_format(f.path()).map(|format| (f.clone(), format)))
         });
         if let Some((file, format)) = dropped {
             self.load_dropped(file, format, ui.ctx().clone());
@@ -230,7 +226,7 @@ impl eframe::App for App {
             ui.centered_and_justified(|ui| ui.heading("Drag and drop a .ply or .sog file"));
             return;
         };
-        drop(slot); // release the lock before rendering the frame
+        drop(slot);
 
         let size = ui.available_size();
         let (rect, response) = ui.allocate_exact_size(size, egui::Sense::drag());
@@ -252,17 +248,16 @@ impl eframe::App for App {
             ));
 
             #[cfg(target_arch = "wasm32")]
-            if !self.rendering.get() {
-                self.rendering.set(true);
+            let idle = self.gpu.borrow().is_some();
+            #[cfg(target_arch = "wasm32")]
+            if idle {
                 let camera = self.controller.camera.clone();
                 let gpu = self.gpu.clone();
-                let rendering = self.rendering.clone();
                 let client = self.client.clone();
                 let ctx = ui.ctx().clone();
 
                 wasm_bindgen_futures::spawn_local(async move {
                     render_frame(&client, &gpu, &splats, &camera, pixel).await;
-                    rendering.set(false);
                     ctx.request_repaint();
                 });
             }
@@ -288,10 +283,11 @@ fn main() -> eframe::Result<()> {
 #[cfg(target_arch = "wasm32")]
 fn main() {
     wasm_bindgen_futures::spawn_local(async {
-        let canvas = web_sys::window()
+        let document = web_sys::window()
             .expect("no window")
             .document()
-            .expect("no document")
+            .expect("no document");
+        let canvas = document
             .get_element_by_id("the_canvas_id")
             .expect("missing #the_canvas_id")
             .dyn_into::<web_sys::HtmlCanvasElement>()
@@ -309,12 +305,7 @@ fn main() {
             .await
             .expect("failed to start");
 
-        if let Some(el) = web_sys::window()
-            .unwrap()
-            .document()
-            .unwrap()
-            .get_element_by_id("loading_text")
-        {
+        if let Some(el) = document.get_element_by_id("loading_text") {
             el.remove();
         }
     });

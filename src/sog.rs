@@ -1,4 +1,4 @@
-use crate::layout::{ATTR_PLANES, PLANE_OPACITY, PLANE_QW, PLANE_SX, PLANE_X, PLANE_Y, PLANE_Z};
+use crate::layout::{ATTR_PLANES, PLANE_OPACITY, PLANE_QW, PLANE_SX, PLANE_X};
 use crate::render::CpuSplats;
 use anyhow::{Context, Result};
 use serde::Deserialize;
@@ -31,7 +31,7 @@ struct Means {
 
 #[derive(Deserialize)]
 struct Files {
-    files: Vec<String>,
+    files: [String; 1],
 }
 
 #[derive(Deserialize)]
@@ -45,7 +45,7 @@ fn decode_rgba<R: Read + Seek>(
     zip: &mut ZipArchive<R>,
     name: &str,
     min_pixels: usize,
-) -> Result<(Vec<u8>, usize)> {
+) -> Result<image::RgbaImage> {
     let mut file = zip
         .by_name(name)
         .with_context(|| format!("missing {name}"))?;
@@ -60,7 +60,7 @@ fn decode_rgba<R: Read + Seek>(
     if w * h < min_pixels {
         anyhow::bail!("{name}: {w}x{h} < {min_pixels} pixels");
     }
-    Ok((rgba.into_raw(), w))
+    Ok(rgba)
 }
 
 fn inv_log(v: f32) -> f32 {
@@ -70,6 +70,11 @@ fn inv_log(v: f32) -> f32 {
 fn logit(y: f32) -> f32 {
     let e = y.clamp(1e-6, 1.0 - 1e-6);
     (e / (1.0 - e)).ln()
+}
+
+fn codebook<'a>(cb: &'a [f32], what: &str) -> Result<&'a [f32; 256]> {
+    cb.try_into()
+        .with_context(|| format!("{what} codebook: 256 floats expected, got {}", cb.len()))
 }
 
 fn unpack_quat(px: u8, py: u8, pz: u8, tag: u8) -> [f32; 4] {
@@ -94,8 +99,10 @@ fn rgba_pixels(px: &[u8]) -> impl Iterator<Item = (usize, [u8; 4])> + '_ {
 }
 
 pub fn parse_sog(reader: impl Read + Seek) -> Result<CpuSplats> {
-    let mut zip = ZipArchive::new(reader)?;
-    let meta: Meta = serde_json::from_reader(zip.by_name("meta.json")?)?;
+    let mut zip = ZipArchive::new(reader).context("not a SOG archive")?;
+    let meta: Meta =
+        serde_json::from_reader(zip.by_name("meta.json").context("missing meta.json")?)
+            .context("invalid meta.json")?;
 
     let n = meta.count;
     if n == 0 {
@@ -103,30 +110,31 @@ pub fn parse_sog(reader: impl Read + Seek) -> Result<CpuSplats> {
     }
     let mut attributes = vec![0f32; n * ATTR_PLANES];
 
-    let (lo, _) = decode_rgba(&mut zip, &meta.means.files[0], n)?;
-    let (hi, _) = decode_rgba(&mut zip, &meta.means.files[1], n)?;
+    let lo = decode_rgba(&mut zip, &meta.means.files[0], n)?;
+    let hi = decode_rgba(&mut zip, &meta.means.files[1], n)?;
     let mins = glam::Vec3::from_array(meta.means.mins);
     let spans = glam::Vec3::from_array(meta.means.maxs) - mins;
 
-    for ((i, lc), (_, hc)) in rgba_pixels(&lo).zip(rgba_pixels(&hi)).take(n) {
-        attributes[PLANE_X * n + i] =
-            inv_log(mins.x + spans.x * u16::from_le_bytes([lc[0], hc[0]]) as f32 / u16::MAX as f32);
-        attributes[PLANE_Y * n + i] =
-            inv_log(mins.y + spans.y * u16::from_le_bytes([lc[1], hc[1]]) as f32 / u16::MAX as f32);
-        attributes[PLANE_Z * n + i] =
-            inv_log(mins.z + spans.z * u16::from_le_bytes([lc[2], hc[2]]) as f32 / u16::MAX as f32);
+    for ((i, lc), (_, hc)) in rgba_pixels(lo.as_raw())
+        .zip(rgba_pixels(hi.as_raw()))
+        .take(n)
+    {
+        for k in 0..3 {
+            let t = u16::from_le_bytes([lc[k], hc[k]]) as f32 / u16::MAX as f32;
+            attributes[(PLANE_X + k) * n + i] = inv_log(mins[k] + spans[k] * t);
+        }
     }
 
-    let (sl, _) = decode_rgba(&mut zip, &meta.scales.files[0], n)?;
-    let scale_cb = &meta.scales.codebook;
-    for (i, c) in rgba_pixels(&sl).take(n) {
+    let sl = decode_rgba(&mut zip, &meta.scales.files[0], n)?;
+    let scale_cb = codebook(&meta.scales.codebook, "scales")?;
+    for (i, c) in rgba_pixels(sl.as_raw()).take(n) {
         for k in 0..3 {
             attributes[(PLANE_SX + k) * n + i] = scale_cb[c[k] as usize];
         }
     }
 
-    let (qr, _) = decode_rgba(&mut zip, &meta.quats.files[0], n)?;
-    for (i, c) in rgba_pixels(&qr).take(n) {
+    let qr = decode_rgba(&mut zip, &meta.quats.files[0], n)?;
+    for (i, c) in rgba_pixels(qr.as_raw()).take(n) {
         let tag = c[3];
         let q = match tag {
             252..=255 => unpack_quat(c[0], c[1], c[2], tag),
@@ -137,12 +145,20 @@ pub fn parse_sog(reader: impl Read + Seek) -> Result<CpuSplats> {
         }
     }
 
-    let (c0, _) = decode_rgba(&mut zip, &meta.sh0.files[0], n)?;
-    let sh_per_ch = meta.sh_n.as_ref().map_or(1, |s| (s.bands + 1).pow(2));
+    let sh_per_ch = match meta.sh_n.as_ref() {
+        None => 1,
+        Some(s) => match s.bands {
+            1 => 4,
+            2 => 9,
+            3 => 16,
+            b => anyhow::bail!("shN.bands {b} outside 1..=3"),
+        },
+    };
+    let c0 = decode_rgba(&mut zip, &meta.sh0.files[0], n)?;
     let mut sh_coeffs = vec![0f32; n * sh_per_ch * 3];
-    let sh0_cb = &meta.sh0.codebook;
+    let sh0_cb = codebook(&meta.sh0.codebook, "sh0")?;
 
-    for (i, c) in rgba_pixels(&c0).take(n) {
+    for (i, c) in rgba_pixels(c0.as_raw()).take(n) {
         for k in 0..3 {
             sh_coeffs[k * n + i] = sh0_cb[c[k] as usize];
         }
@@ -152,24 +168,26 @@ pub fn parse_sog(reader: impl Read + Seek) -> Result<CpuSplats> {
     if let Some(ref sh_n) = meta.sh_n {
         // (bands+1)^2 channels incl. DC; the palette sheet holds the rest.
         let sh_coeffs_per_ch = sh_per_ch - 1;
-        // centroids is the SH palette, not per-splat data — don't gate it on n
-        let (centroids, cw) = decode_rgba(&mut zip, &sh_n.files[0], 0)?;
-        let (labels, _) = decode_rgba(&mut zip, &sh_n.files[1], n)?;
-        let codebook = &sh_n.codebook;
+        // The centroid sheet is a palette, not per-splat data: any size is valid.
+        let centroids = decode_rgba(&mut zip, &sh_n.files[0], 1)?;
+        let labels = decode_rgba(&mut zip, &sh_n.files[1], n)?;
+        let shn_cb = codebook(&sh_n.codebook, "shN")?;
+        let cw = centroids.width() as usize;
+        let centroids = centroids.as_raw();
         // Rows hold whole palettes: total palettes is just pixels / coeffs.
         let palette_count = centroids.len() / 4 / sh_coeffs_per_ch;
 
-        for (i, c) in rgba_pixels(&labels).take(n) {
+        for (i, c) in rgba_pixels(labels.as_raw()).take(n) {
             let label = c[0] as usize | (c[1] as usize) << 8;
             if label >= palette_count {
-                continue;
+                anyhow::bail!("shN label {label} >= palette size {palette_count}");
             }
             let (base_x, base_y) = palette_offset(label, cw, sh_coeffs_per_ch);
 
             for j in 0..sh_coeffs_per_ch {
                 let p = (base_y * cw + base_x + j) * 4;
                 for k in 0..3 {
-                    sh_coeffs[((j + 1) * 3 + k) * n + i] = codebook[centroids[p + k] as usize];
+                    sh_coeffs[((j + 1) * 3 + k) * n + i] = shn_cb[centroids[p + k] as usize];
                 }
             }
         }

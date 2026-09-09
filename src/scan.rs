@@ -15,12 +15,11 @@ const SCAN_WG: u32 = 256;
 const SCAN_EPT: u32 = 4;
 const SCAN_BLOCK: u32 = SCAN_WG * SCAN_EPT;
 
-// Dispatch costs ~110us per launch, so the single-workgroup serial scan wins
-// while it stays one launch. At the radix sort's widest plane (sort::
-// BINS_PLANE bins) the counter array is n/32 cells; 64K of them (2M keys)
-// cost a few hundred sequential adds per thread — microseconds, far below
-// the hierarchical path's two extra launches.
-const SERIAL_SCAN_CELLS: u32 = SCAN_BLOCK * crate::sort::BINS_PLANE;
+// One launch beats the hierarchical path's three while the serial chunk stays
+// cheap: 64K cells is ~2M keys at the radix sort's widest plane (n/32 cells).
+// Above that the single workgroup loses — measured at ~12% of a frame with the
+// hierarchical path bypassed — so the threshold is real, not conservative.
+const SERIAL_SCAN_CELLS: u32 = 1 << 16;
 
 /// Exclusive-scan `len` cells of `a` in place, starting from `seed`.
 /// Single-threaded: callers gate it on `UNIT_POS == 0` + `sync_cube`.
@@ -188,7 +187,7 @@ fn apply_block_offsets(n: u32, block_sums: &[u32], offsets: &mut [u32]) {
 }
 
 /// Single-workgroup serial scan launch — one dispatch, the shape that makes
-/// the serial path win below `SERIAL_SCAN_CELLS` (see that const).
+/// the serial path win below `SERIAL_SCAN_CELLS`.
 fn launch_serial_scan(client: &ComputeClient<WgpuRuntime>, n: u32, buf: &GpuTensor) {
     scan_serial::launch::<WgpuRuntime>(
         client,

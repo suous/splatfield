@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use std::io::BufRead;
 
 pub fn parse_ply(mut reader: impl BufRead) -> Result<CpuSplats> {
-    let mut vertex_count = 0;
+    let mut vertex_count: usize = 0;
     let mut properties = Vec::new();
 
     for line in reader.by_ref().lines() {
@@ -70,7 +70,10 @@ pub fn parse_ply(mut reader: impl BufRead) -> Result<CpuSplats> {
 
     let stride = properties.len();
 
-    let mut data = vec![0f32; vertex_count * stride];
+    let floats = vertex_count
+        .checked_mul(stride)
+        .context("PLY vertex count overflows address space")?;
+    let mut data = vec![0f32; floats];
     reader
         .read_exact(bytemuck::cast_slice_mut(&mut data))
         .with_context(|| format!("failed to read {vertex_count}x{stride} float vertices"))?;

@@ -338,7 +338,7 @@ fn scatter_plane_kernel(
     }
     sync_cube();
 
-    let lim = (num_keys - tile_base).min(BLOCK_PLANE);
+    let lim = num_keys.saturating_sub(tile_base).min(BLOCK_PLANE);
     let mut digs = Array::<u32>::new(EPT_PLANE as usize);
     #[unroll]
     for i in 0..EPT_PLANE {
@@ -383,28 +383,23 @@ fn plane_sort_path(client: &ComputeClient<WgpuRuntime>) -> Option<u32> {
     // Browsers are excluded regardless of what the adapter reports: cubecl's
     // WGSL backend emits `subgroupBallot`/`subgroupShuffle` without the
     // `enable subgroups;` directive, which every conforming validator rejects.
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = client;
+    if cfg!(target_arch = "wasm32") {
         return None;
     }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        let props = client.properties();
-        if !props.features.plane.contains(cubecl::features::Plane::Ops) {
-            return None;
-        }
-        let hw = &props.hardware;
-        if hw.plane_size_min == 0 || hw.plane_size_max > 32 {
-            return None;
-        }
-        let num_planes = SORT_WG / hw.plane_size_min;
-        let shared = (num_planes * BINS_PLANE + BINS_PLANE + BLOCK_PLANE) * 4;
-        if shared as usize > hw.max_shared_memory_size {
-            return None;
-        }
-        Some(num_planes)
+    let props = client.properties();
+    if !props.features.plane.contains(cubecl::features::Plane::Ops) {
+        return None;
     }
+    let hw = &props.hardware;
+    if hw.plane_size_min == 0 || hw.plane_size_max > 32 {
+        return None;
+    }
+    let num_planes = SORT_WG / hw.plane_size_min;
+    let shared = (num_planes * BINS_PLANE + BINS_PLANE + BLOCK_PLANE) * 4;
+    if shared as usize > hw.max_shared_memory_size {
+        return None;
+    }
+    Some(num_planes)
 }
 
 /// Reusable ping-pong buffers for [`radix_argsort_with`], sized for a maximum
@@ -722,34 +717,28 @@ mod radix_sort_tests {
     }
 
     #[test]
-    fn test_sorting_big() {
+    fn test_sorting_32bit_keys() {
         let (_gpu, client) = crate::tensor::test_client();
         let mut rng = rand::rng();
-        let mut keys_inp = Vec::new();
+        let mut clustered = Vec::new();
         for i in 0..10000u32 {
             let start = rng.random_range(i..i + 150);
             let end = rng.random_range(start..start + 250);
 
             for j in start..end {
                 if rng.random::<f32>() < 0.5 {
-                    keys_inp.push(j);
+                    clustered.push(j);
                 }
             }
         }
-
-        let values_inp: Vec<u32> = (0..keys_inp.len()).map(|i| i as u32).collect();
-        assert_argsort_bits(&client, &keys_inp, &values_inp, 32);
-    }
-
-    #[test]
-    fn test_sorting_large() {
-        let (_gpu, client) = crate::tensor::test_client();
-        let mut rng = rand::rng();
-        let keys_inp: Vec<u32> = (0..500_000)
+        let spread: Vec<u32> = (0..500_000)
             .map(|_| rng.random_range(0..1_000_000))
             .collect();
-        let values_inp: Vec<u32> = (0..500_000).map(|i| i as u32).collect();
-        assert_argsort_bits(&client, &keys_inp, &values_inp, 32);
+
+        for keys_inp in [clustered, spread] {
+            let values_inp: Vec<u32> = (0..keys_inp.len() as u32).collect();
+            assert_argsort_bits(&client, &keys_inp, &values_inp, 32);
+        }
     }
 
     #[test]
