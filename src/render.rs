@@ -1,25 +1,21 @@
 use crate::camera::Camera;
 use crate::layout;
-use crate::project::{CameraViewLaunch, DEPTH_KEY_BITS, project_splats};
+use crate::project::{CameraViewLaunch, project_splats};
 use crate::raster::{map_isects, rasterize_kernel};
-use crate::scan::{ScanScratch, exclusive_scan_gather};
-use crate::sort::{RadixScratch, bits_for, radix_argsort_with};
-use crate::tensor::GpuTensor;
 use cubecl::calculate_cube_count_elemwise;
 use cubecl::prelude::*;
 use cubecl::wgpu::WgpuRuntime;
+use splat_sort::scan::{ScanScratch, exclusive_scan_gather};
+use splat_sort::sort::{RadixScratch, bits_for};
+use splat_sort::tensor::GpuTensor;
 
 // Memory ceiling for the intersection buffers, not a derived bound: ~67M
 // entries ≈ 0.5 GiB for the id pair, plus the tile sort's ping-pong scratch.
-// grow_isects clamps capacity here; map_isects truncates emissions past it.
+// prepare clamps capacity here; map_isects truncates emissions past it.
 const INTERSECTS_UPPER_BOUND: usize = 2 * 512 * 65535;
 // First-frame capacity cap, raised toward the ceiling only when a frame
-// actually emits more (see grow_isects).
+// actually emits more (see prepare).
 const INITIAL_ISECTS_CAP: usize = 1 << 22;
-
-// Web builds compile the rasterizer without the shared-memory early exit (see
-// rasterize_kernel); native keeps it.
-const EARLY_EXIT: bool = !cfg!(target_arch = "wasm32");
 
 /// Host-side splat payload produced by the PLY/SOG parsers, uploaded once by
 /// `Splats::new`. Field-major layout: see the `PLANE_*` planes in `layout`.
@@ -58,10 +54,15 @@ pub struct RenderScratch {
     last_isects_raw: u32,
 }
 
+/// Tile grid for `img_size`: `(bounds, count)`.
+fn tile_grid(img_size: glam::UVec2) -> (glam::UVec2, usize) {
+    let bounds = img_size.map(|c| c.div_ceil(layout::TILE_WIDTH));
+    (bounds, (bounds.x * bounds.y) as usize)
+}
+
 impl RenderScratch {
     pub fn new(client: &ComputeClient<WgpuRuntime>, total: usize, img_size: glam::UVec2) -> Self {
-        let tile_bounds = img_size.map(|c| c.div_ceil(layout::TILE_WIDTH));
-        let num_tiles = (tile_bounds.x * tile_bounds.y) as usize;
+        let (_, num_tiles) = tile_grid(img_size);
         let isect_capacity =
             (num_tiles.saturating_mul(total).min(INITIAL_ISECTS_CAP)).next_power_of_two();
         // 256-byte rows: wgpu buffer→texture copies align rows to
@@ -113,19 +114,18 @@ impl RenderScratch {
             self.gaussian_ids = GpuTensor::empty(client, [new_cap]);
             self.sort_tile = RadixScratch::new(client, new_cap);
         }
-        let bounds = img_size.map(|c| c.div_ceil(layout::TILE_WIDTH));
-        (bounds, (bounds.x * bounds.y) as usize)
+        tile_grid(img_size)
     }
 }
 
 pub struct Splats {
     pub attributes: GpuTensor,
-    pub sh_coeffs: GpuTensor,
+    sh_coeffs: GpuTensor,
     pub bounds: (glam::Vec3, glam::Vec3),
 }
 
 impl Splats {
-    pub fn new(
+    pub(crate) fn new(
         attributes: Vec<f32>,
         sh_coeffs: Vec<f32>,
         client: &ComputeClient<WgpuRuntime>,
@@ -158,7 +158,7 @@ impl Splats {
     ///
     /// A `scratch` that doesn't match the splat count or image size is rebuilt
     /// in place.
-    pub async fn render_with(
+    pub fn render_with(
         &self,
         scratch: &mut RenderScratch,
         camera: &Camera,
@@ -192,14 +192,14 @@ impl Splats {
             scratch.tile_bbox.as_buffer_arg(),
         );
 
-        let [num_isects_raw, num_visible] = scratch.counters.read_pair().await;
+        let [num_isects_raw, num_visible] = scratch.counters.read_vec::<u32>().try_into().unwrap();
         let num_isects = num_isects_raw.min(max_isects);
-        let (_sorted_keys, depth_order) = radix_argsort_with(
+        let (_sorted_keys, depth_order) = scratch.sort_depth.argsort(
             &scratch.depth_keys,
             &scratch.depth_order,
             num_visible,
-            DEPTH_KEY_BITS,
-            &scratch.sort_depth,
+            32,
+            false,
         );
 
         // Emission offsets in depth order; dead depth_keys doubles as the
@@ -230,12 +230,12 @@ impl Splats {
         // tile id yields tile-major, depth-minor order — no separate gid sort
         // or composite key needed.
         let tile_bits = bits_for(num_tiles as u32);
-        let (tile_ids, gaussian_ids) = radix_argsort_with(
+        let (tile_ids, gaussian_ids) = scratch.sort_tile.argsort(
             &scratch.tile_ids,
             &scratch.gaussian_ids,
             num_isects,
             tile_bits,
-            &scratch.sort_tile,
+            true,
         );
 
         let row_stride = scratch.bitmap.shape[1] as u32;
@@ -251,7 +251,6 @@ impl Splats {
             gaussian_ids.as_buffer_arg(),
             scratch.projected.as_buffer_arg(),
             scratch.bitmap.as_buffer_arg(),
-            EARLY_EXIT,
         );
         scratch.last_isects_raw = num_isects_raw;
         scratch.bitmap.clone()
@@ -259,8 +258,8 @@ impl Splats {
 }
 
 /// Field-major attributes for `n` opaque splats stacked at the origin XY with
-/// per-splat `z` — the minimal fixture that drives every kernel path. Shared
-/// by the render tests and the dump_wgsl example.
+/// per-splat `z` — the minimal fixture that drives every kernel path.
+#[cfg(test)]
 pub fn sample_opaque_attributes(n: usize, z: impl Fn(usize) -> f32) -> Vec<f32> {
     let mut a = vec![0f32; n * layout::ATTR_PLANES];
     for i in 0..n {
@@ -297,8 +296,7 @@ mod tests {
     ) -> (u32, u32) {
         let splats = Splats::new(attributes, vec![0.0; n * 3], client);
         let mut scratch = RenderScratch::new(client, n, glam::uvec2(32, 32));
-        let bitmap =
-            pollster::block_on(splats.render_with(&mut scratch, camera, glam::uvec2(32, 32)));
+        let bitmap = splats.render_with(&mut scratch, camera, glam::uvec2(32, 32));
         let px: Vec<u32> = bitmap.read_vec();
         let stride = bitmap.shape[1] as usize;
         (px[16 * stride + 16], px[0])
@@ -306,7 +304,7 @@ mod tests {
 
     #[test]
     fn test_render_golden_center() {
-        let (_gpu, client) = crate::tensor::test_client();
+        let (_gpu, client) = crate::gpu_testing::test_client();
         let n = 5usize;
         // Five opaque splats stacked in depth at the same XY, plus the same
         // stack seen by a camera yawed 90° and translated to (-2, 0, 0): a
@@ -343,7 +341,7 @@ mod tests {
 
     #[test]
     fn test_render_reuses_scratch() {
-        let (_gpu, client) = crate::tensor::test_client();
+        let (_gpu, client) = crate::gpu_testing::test_client();
         let attributes: Vec<f32> = (0..50 * 11)
             .map(|i| (i as f32 * 0.13).sin() * 0.5)
             .collect();
@@ -354,16 +352,18 @@ mod tests {
             ..Camera::default()
         };
         let mut scratch = RenderScratch::new(&client, 50, glam::uvec2(64, 64));
-        let b = pollster::block_on(splats.render_with(&mut scratch, &camera, glam::uvec2(64, 64)))
+        let b = splats
+            .render_with(&mut scratch, &camera, glam::uvec2(64, 64))
             .read_vec::<u32>();
-        let c = pollster::block_on(splats.render_with(&mut scratch, &camera, glam::uvec2(64, 64)))
+        let c = splats
+            .render_with(&mut scratch, &camera, glam::uvec2(64, 64))
             .read_vec::<u32>();
         assert_eq!(b, c);
     }
 
     #[test]
     fn test_scratch_stops_allocating_after_first_frame() {
-        let (_gpu, client) = crate::tensor::test_client();
+        let (_gpu, client) = crate::gpu_testing::test_client();
         let attributes: Vec<f32> = (0..100 * 11)
             .map(|i| (i as f32 * 0.07).sin() * 0.4)
             .collect();
@@ -373,7 +373,7 @@ mod tests {
             ..Camera::default()
         };
         let mut scratch = RenderScratch::new(&client, 100, glam::uvec2(64, 64));
-        pollster::block_on(splats.render_with(&mut scratch, &camera, glam::uvec2(64, 64)));
+        splats.render_with(&mut scratch, &camera, glam::uvec2(64, 64));
         // The runtime caches one client per device, so other tests' deferred
         // frees and pool reclaim land inside the measurement window and can
         // spike a single reading. Fail only on sustained growth — systematic
@@ -381,7 +381,7 @@ mod tests {
         let mut prev = client.memory_usage().unwrap().bytes_in_use;
         let mut steady = false;
         for _ in 0..5 {
-            pollster::block_on(splats.render_with(&mut scratch, &camera, glam::uvec2(64, 64)));
+            splats.render_with(&mut scratch, &camera, glam::uvec2(64, 64));
             let cur = client.memory_usage().unwrap().bytes_in_use;
             if cur <= prev + 65_536 {
                 steady = true;
@@ -390,6 +390,37 @@ mod tests {
             prev = cur;
         }
         assert!(steady, "steady-state frames keep allocating memory");
+    }
+
+    /// 200 splats at one exact depth are the tie stress case —
+    /// every depth key is equal, so the racy atomic compaction order and the
+    /// radix sort's tie handling are fully exercised. The splats are
+    /// attribute-identical, so blend order among ties cannot change the
+    /// result: repeated renders — through the same scratch and through a
+    /// fresh one — must be bit-identical.
+    #[test]
+    fn test_render_ties_deterministic() {
+        let (_gpu, client) = crate::gpu_testing::test_client();
+        let n = 200usize;
+        let splats = Splats::new(
+            sample_opaque_attributes(n, |_| 1.0),
+            vec![0.0; n * 3],
+            &client,
+        );
+        let camera = crate::camera::Camera::default();
+        let mut scratch = RenderScratch::new(&client, n, glam::uvec2(64, 64));
+        let a = splats
+            .render_with(&mut scratch, &camera, glam::uvec2(64, 64))
+            .read_vec::<u32>();
+        let b = splats
+            .render_with(&mut scratch, &camera, glam::uvec2(64, 64))
+            .read_vec::<u32>();
+        let mut fresh = RenderScratch::new(&client, n, glam::uvec2(64, 64));
+        let c = splats
+            .render_with(&mut fresh, &camera, glam::uvec2(64, 64))
+            .read_vec::<u32>();
+        assert_eq!(a, b, "same-scratch re-render must be bit-identical");
+        assert_eq!(a, c, "fresh-scratch render must be bit-identical");
     }
 
     /// Test-only probe of the rasterizer's per-tile range lookup, sharing
@@ -404,7 +435,7 @@ mod tests {
 
     #[test]
     fn test_tile_ranges_binary_search_matches_cpu() {
-        let (_gpu, client) = crate::tensor::test_client();
+        let (_gpu, client) = crate::gpu_testing::test_client();
         // Sorted tile ids: tiles 0, 1, 2, 5 have intersections; 3, 4, 6, 7
         // are empty. Every tile's rasterizer range must match a CPU
         // lower-bound pair over the same ids.

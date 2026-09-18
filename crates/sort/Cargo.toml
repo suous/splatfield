@@ -1,0 +1,17 @@
+[package]
+name = "splat-sort"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cubecl.workspace = true
+bytemuck.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+criterion.workspace = true
+
+# criterion 0.6+ ships its own harness; the libtest harness runs zero benches.
+[[bench]]
+name = "radix_sort"
+harness = false

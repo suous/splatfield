@@ -1,16 +1,10 @@
-use std::cell::RefCell;
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-#[cfg(target_arch = "wasm32")]
-use web_sys::wasm_bindgen::JsCast;
-
-#[cfg(not(target_arch = "wasm32"))]
 use anyhow::Context;
 
-use cubecl::wgpu::{MemoryConfiguration, RuntimeOptions, WgpuRuntime, WgpuSetup, init_device};
+use cubecl::wgpu::{RuntimeOptions, WgpuRuntime, WgpuSetup, init_device};
 use cubecl::{Runtime, client::ComputeClient};
-use eframe::egui::{self, Color32, Rect, TextureId};
+use eframe::egui::{self, Color32, Rect};
 use eframe::wgpu;
 use splatfield::{camera, ply, render, sog, texture};
 
@@ -24,25 +18,22 @@ struct Loaded {
     reframe: bool,
 }
 
-/// GPU frame state shared with the render task: the presentation texture and
-/// the per-frame scratch (built on first use, reused every frame after).
+/// GPU frame state: the presentation texture and the per-frame scratch
+/// (built on first use, reused every frame after).
 struct FrameGpu {
     backbuffer: texture::GpuTexture,
     scratch: Option<render::RenderScratch>,
 }
 
-/// The render task moves the frame state out for the duration of a frame, so
-/// no borrow is held across its await; `None` means a render is in flight.
-type FrameSlot = Rc<RefCell<Option<FrameGpu>>>;
-
 struct App {
-    gpu: FrameSlot,
-    // Stable for the texture's lifetime — recreate_texture reuses the id — so
-    // the paint path never borrows `gpu`.
-    tex_id: TextureId,
+    gpu: FrameGpu,
     controller: camera::Controller,
     client: ComputeClient<WgpuRuntime>,
     splats: Arc<Mutex<Loaded>>,
+    // What the backbuffer currently shows: the frame size and the model it
+    // was rendered from (the camera is implied — it only moves through
+    // Controller::tick, which reports moves).
+    rendered: Option<(glam::UVec2, Arc<render::Splats>)>,
 }
 
 fn wgpu_config() -> eframe::egui_wgpu::WgpuConfiguration {
@@ -71,25 +62,11 @@ enum SplatFormat {
 }
 
 fn splat_format(path: &std::path::Path) -> Option<SplatFormat> {
-    let ext = path.extension()?.to_str()?;
-    if ext.eq_ignore_ascii_case("ply") {
-        Some(SplatFormat::Ply)
-    } else if ext.eq_ignore_ascii_case("sog") {
-        Some(SplatFormat::Sog)
-    } else {
-        None
+    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
+        "ply" => Some(SplatFormat::Ply),
+        "sog" => Some(SplatFormat::Sog),
+        _ => None,
     }
-}
-
-/// `eprintln!` is a no-op on wasm32, so errors surface through the JS console.
-#[cfg(target_arch = "wasm32")]
-fn report(msg: String) {
-    web_sys::console::error_1(&msg.as_str().into());
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-fn report(msg: String) {
-    eprintln!("{msg}");
 }
 
 impl App {
@@ -97,9 +74,7 @@ impl App {
         let render_state = cc.wgpu_render_state.as_ref().expect("Must use wgpu");
         let device = init_device(
             WgpuSetup {
-                instance: wgpu::Instance::new(
-                    wgpu::InstanceDescriptor::new_without_display_handle(),
-                ),
+                instance: render_state.instance.clone(),
                 adapter: render_state.adapter.clone(),
                 device: render_state.device.clone(),
                 queue: render_state.queue.clone(),
@@ -107,7 +82,7 @@ impl App {
             },
             RuntimeOptions {
                 tasks_max: 64,
-                memory_config: MemoryConfiguration::ExclusivePages,
+                ..Default::default()
             },
         );
 
@@ -116,16 +91,15 @@ impl App {
             render_state.device.clone(),
             render_state.queue.clone(),
         );
-        let tex_id = backbuffer.texture_id();
         Self {
-            gpu: Rc::new(RefCell::new(Some(FrameGpu {
+            gpu: FrameGpu {
                 backbuffer,
                 scratch: None,
-            }))),
-            tex_id,
+            },
             controller: camera::Controller::default(),
             client: WgpuRuntime::client(&device),
             splats: Arc::new(Mutex::new(Loaded::default())),
+            rendered: None,
         }
     }
 
@@ -149,58 +123,37 @@ impl App {
                 drop(slot);
                 ctx.request_repaint();
             }
-            Err(e) => report(format!("Failed to load splat: {e:#}")),
+            Err(e) => eprintln!("Failed to load splat: {e:#}"),
         };
 
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let path = file.path().to_owned();
-            std::thread::spawn(move || {
-                on_loaded(
-                    std::fs::File::open(&path)
-                        .with_context(|| format!("Failed to open {path:?}"))
-                        .and_then(|f| load(std::io::BufReader::new(f))),
-                );
-            });
-        }
-
-        #[cfg(target_arch = "wasm32")]
-        {
-            wasm_bindgen_futures::spawn_local(async move {
-                match file.bytes_async().await {
-                    Ok(bytes) => on_loaded(load(std::io::Cursor::new(bytes))),
-                    Err(e) => on_loaded(Err(anyhow::anyhow!("Failed to read dropped file: {e}"))),
-                }
-            });
-        }
+        let path = file.path().to_owned();
+        std::thread::spawn(move || {
+            on_loaded(
+                std::fs::File::open(&path)
+                    .with_context(|| format!("Failed to open {path:?}"))
+                    .and_then(|f| load(std::io::BufReader::new(f))),
+            );
+        });
     }
 }
 
-/// Render `splats` into the shared scratch and present the bitmap to the
-/// backbuffer. The frame state is moved out for the duration so no borrow is
-/// held across the await; native `block_on` and wasm's single in-flight task
-/// both drive it on one thread.
-async fn render_frame(
+/// Render `splats` into the frame's scratch and present the bitmap to the
+/// backbuffer; the pipeline syncs on the counters readback, on the UI thread.
+fn render_frame(
     client: &ComputeClient<WgpuRuntime>,
-    slot: &FrameSlot,
+    frame: &mut FrameGpu,
     splats: &render::Splats,
     camera: &camera::Camera,
     pixel: glam::UVec2,
 ) {
-    let Some(mut frame) = slot.borrow_mut().take() else {
-        return;
-    };
-    let img = splats
-        .render_with(
-            frame.scratch.get_or_insert_with(|| {
-                render::RenderScratch::new(client, splats.attributes.shape[0], pixel)
-            }),
-            camera,
-            pixel,
-        )
-        .await;
+    let img = splats.render_with(
+        frame.scratch.get_or_insert_with(|| {
+            render::RenderScratch::new(client, splats.attributes.shape[0], pixel)
+        }),
+        camera,
+        pixel,
+    );
     frame.backbuffer.update_texture(&img, pixel);
-    *slot.borrow_mut() = Some(frame);
 }
 
 impl eframe::App for App {
@@ -216,10 +169,10 @@ impl eframe::App for App {
         }
 
         let mut slot = self.splats.lock().unwrap();
-        if slot.reframe {
-            if let Some(s) = &slot.splats {
-                self.controller.frame_bounds(s.bounds);
-            }
+        if slot.reframe
+            && let Some(s) = &slot.splats
+        {
+            self.controller.frame_bounds(s.bounds);
             slot.reframe = false;
         }
         let Some(splats) = slot.splats.clone() else {
@@ -235,40 +188,38 @@ impl eframe::App for App {
         // Below ~8px the aspect is 0/0: fit_fov would poison the camera with
         // NaN for every later frame, so skip input + render entirely.
         if pixel.x > 8 && pixel.y > 8 {
-            self.controller.tick(&response, ui);
+            let moved = self.controller.tick(&response, ui);
             self.controller.camera.fit_fov(pixel);
 
-            #[cfg(not(target_arch = "wasm32"))]
-            pollster::block_on(render_frame(
-                &self.client,
-                &self.gpu,
-                &splats,
-                &self.controller.camera,
-                pixel,
-            ));
-
-            #[cfg(target_arch = "wasm32")]
-            let idle = self.gpu.borrow().is_some();
-            #[cfg(target_arch = "wasm32")]
-            if idle {
-                let camera = self.controller.camera.clone();
-                let gpu = self.gpu.clone();
-                let client = self.client.clone();
-                let ctx = ui.ctx().clone();
-
-                wasm_bindgen_futures::spawn_local(async move {
-                    render_frame(&client, &gpu, &splats, &camera, pixel).await;
-                    ctx.request_repaint();
+            // A camera-neutral event (e.g. a bare click) would re-run the
+            // whole ~30-launch pipeline only to repaint an identical bitmap —
+            // skip it. Any load brings a fresh Arc, so pointer inequality
+            // covers reframes too.
+            let stale = moved
+                || self.rendered.as_ref().is_none_or(|(last_px, last_splats)| {
+                    *last_px != pixel || !Arc::ptr_eq(last_splats, &splats)
                 });
+            if stale {
+                render_frame(
+                    &self.client,
+                    &mut self.gpu,
+                    &splats,
+                    &self.controller.camera,
+                    pixel,
+                );
+                self.rendered = Some((pixel, Arc::clone(&splats)));
             }
         }
 
-        ui.painter()
-            .image(self.tex_id, rect, UV_RECT, Color32::WHITE);
+        ui.painter().image(
+            self.gpu.backbuffer.texture_id(),
+            rect,
+            UV_RECT,
+            Color32::WHITE,
+        );
     }
 }
 
-#[cfg(not(target_arch = "wasm32"))]
 fn main() -> eframe::Result<()> {
     eframe::run_native(
         "SplatField",
@@ -278,35 +229,4 @@ fn main() -> eframe::Result<()> {
         },
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
     )
-}
-
-#[cfg(target_arch = "wasm32")]
-fn main() {
-    wasm_bindgen_futures::spawn_local(async {
-        let document = web_sys::window()
-            .expect("no window")
-            .document()
-            .expect("no document");
-        let canvas = document
-            .get_element_by_id("the_canvas_id")
-            .expect("missing #the_canvas_id")
-            .dyn_into::<web_sys::HtmlCanvasElement>()
-            .expect("#the_canvas_id is not a canvas");
-
-        eframe::WebRunner::new()
-            .start(
-                canvas,
-                eframe::WebOptions {
-                    wgpu_options: wgpu_config(),
-                    ..Default::default()
-                },
-                Box::new(|cc| Ok(Box::new(App::new(cc)))),
-            )
-            .await
-            .expect("failed to start");
-
-        if let Some(el) = document.get_element_by_id("loading_text") {
-            el.remove();
-        }
-    });
 }

@@ -1,7 +1,7 @@
 use eframe::egui::{self, CursorIcon, PointerButton, Response};
 use glam::{Affine3A, Quat, UVec2, Vec2, Vec3};
 
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug)]
 pub struct Camera {
     pub fov: Vec2,
     pub position: Vec3,
@@ -11,7 +11,7 @@ pub struct Camera {
 impl Default for Camera {
     fn default() -> Self {
         Self {
-            fov: Vec2::splat(0.8),
+            fov: Self::BASE_FOV,
             position: Vec3::ZERO,
             rotation: Quat::IDENTITY,
         }
@@ -19,15 +19,20 @@ impl Default for Camera {
 }
 
 impl Camera {
+    /// Reference fov every `fit_fov` derives from. The fit must never evolve
+    /// the previous frame's `fov`: both branches only grow one axis, so
+    /// in-place fitting ratchets the fov wider on every aspect reversal.
+    const BASE_FOV: Vec2 = Vec2::splat(0.8);
+
     pub fn fit_fov(&mut self, pixel_size: UVec2) {
-        let tan = (self.fov * 0.5).map(f32::tan);
+        let tan = (Self::BASE_FOV * 0.5).map(f32::tan);
         let aspect = pixel_size.x as f32 / pixel_size.y as f32;
 
-        if aspect > tan.x / tan.y {
-            self.fov.x = 2.0 * (aspect * tan.y).atan();
+        self.fov = if aspect > tan.x / tan.y {
+            Vec2::new(2.0 * (aspect * tan.y).atan(), Self::BASE_FOV.y)
         } else {
-            self.fov.y = 2.0 * (tan.x / aspect).atan();
-        }
+            Vec2::new(Self::BASE_FOV.x, 2.0 * (tan.x / aspect).atan())
+        };
     }
 
     pub fn focal(&self, img_size: UVec2) -> Vec2 {
@@ -67,7 +72,9 @@ impl Controller {
         self.focus_distance = self.camera.frame_bounds(bounds);
     }
 
-    pub fn tick(&mut self, response: &Response, ui: &egui::Ui) {
+    /// Apply one frame of input. Returns whether the camera actually moved —
+    /// the caller skips re-rendering otherwise.
+    pub fn tick(&mut self, response: &Response, ui: &egui::Ui) -> bool {
         let (touch, mods, pointer_delta, scroll, translation) = ui.input(|i| {
             (
                 i.multi_touch(),
@@ -121,5 +128,33 @@ impl Controller {
             self.camera.position -= (self.camera.rotation * Vec3::X) * pan.x * m;
             self.camera.position += (self.camera.rotation * Vec3::NEG_Y) * pan.y * m;
         }
+
+        is_orbit || zoom != 0.0 || pan != Vec2::ZERO
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Aspect round trips must not drift the fov: deriving from the previous
+    /// frame's value ratcheted both axes wider per reversal, shrinking and
+    /// radially warping the model with each resize until restart.
+    #[test]
+    fn test_fit_fov_is_history_free() {
+        let mut camera = Camera::default();
+        camera.fit_fov(glam::uvec2(1000, 1000));
+        let square = camera.fov;
+
+        for _ in 0..10 {
+            camera.fit_fov(glam::uvec2(1600, 1000));
+            camera.fit_fov(glam::uvec2(1000, 1000));
+        }
+        assert_eq!(camera.fov, square, "aspect round trips must not drift fov");
+
+        // A fit keeps the projection isotropic: fx == fy.
+        camera.fit_fov(glam::uvec2(1600, 1000));
+        let focal = camera.focal(glam::uvec2(1600, 1000));
+        assert!((focal.x - focal.y).abs() < 1e-3);
     }
 }

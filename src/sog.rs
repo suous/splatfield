@@ -91,11 +91,9 @@ fn unpack_quat(px: u8, py: u8, pz: u8, tag: u8) -> [f32; 4] {
     }
 }
 
-/// Iterate an RGBA8 plane as `(pixel index, pixel)`.
-fn rgba_pixels(px: &[u8]) -> impl Iterator<Item = (usize, [u8; 4])> + '_ {
-    px.chunks_exact(4)
-        .enumerate()
-        .map(|(i, c)| (i, c.try_into().unwrap()))
+/// The RGBA8 pixels of a plane.
+fn rgba_pixels(px: &[u8]) -> &[[u8; 4]] {
+    px.as_chunks::<4>().0
 }
 
 pub fn parse_sog(reader: impl Read + Seek) -> Result<CpuSplats> {
@@ -115,9 +113,11 @@ pub fn parse_sog(reader: impl Read + Seek) -> Result<CpuSplats> {
     let mins = glam::Vec3::from_array(meta.means.mins);
     let spans = glam::Vec3::from_array(meta.means.maxs) - mins;
 
-    for ((i, lc), (_, hc)) in rgba_pixels(lo.as_raw())
+    for (i, (lc, hc)) in rgba_pixels(lo.as_raw())
+        .iter()
         .zip(rgba_pixels(hi.as_raw()))
         .take(n)
+        .enumerate()
     {
         for k in 0..3 {
             let t = u16::from_le_bytes([lc[k], hc[k]]) as f32 / u16::MAX as f32;
@@ -127,14 +127,14 @@ pub fn parse_sog(reader: impl Read + Seek) -> Result<CpuSplats> {
 
     let sl = decode_rgba(&mut zip, &meta.scales.files[0], n)?;
     let scale_cb = codebook(&meta.scales.codebook, "scales")?;
-    for (i, c) in rgba_pixels(sl.as_raw()).take(n) {
+    for (i, c) in rgba_pixels(sl.as_raw()).iter().enumerate().take(n) {
         for k in 0..3 {
             attributes[(PLANE_SX + k) * n + i] = scale_cb[c[k] as usize];
         }
     }
 
     let qr = decode_rgba(&mut zip, &meta.quats.files[0], n)?;
-    for (i, c) in rgba_pixels(qr.as_raw()).take(n) {
+    for (i, c) in rgba_pixels(qr.as_raw()).iter().enumerate().take(n) {
         let tag = c[3];
         let q = match tag {
             252..=255 => unpack_quat(c[0], c[1], c[2], tag),
@@ -158,7 +158,7 @@ pub fn parse_sog(reader: impl Read + Seek) -> Result<CpuSplats> {
     let mut sh_coeffs = vec![0f32; n * sh_per_ch * 3];
     let sh0_cb = codebook(&meta.sh0.codebook, "sh0")?;
 
-    for (i, c) in rgba_pixels(c0.as_raw()).take(n) {
+    for (i, c) in rgba_pixels(c0.as_raw()).iter().enumerate().take(n) {
         for k in 0..3 {
             sh_coeffs[k * n + i] = sh0_cb[c[k] as usize];
         }
@@ -177,7 +177,7 @@ pub fn parse_sog(reader: impl Read + Seek) -> Result<CpuSplats> {
         // Rows hold whole palettes: total palettes is just pixels / coeffs.
         let palette_count = centroids.len() / 4 / sh_coeffs_per_ch;
 
-        for (i, c) in rgba_pixels(labels.as_raw()).take(n) {
+        for (i, c) in rgba_pixels(labels.as_raw()).iter().enumerate().take(n) {
             let label = c[0] as usize | (c[1] as usize) << 8;
             if label >= palette_count {
                 anyhow::bail!("shN label {label} >= palette size {palette_count}");

@@ -7,11 +7,12 @@ use std::hint::black_box;
 use std::time::{Duration, Instant};
 
 fn bench_frame(c: &mut Criterion) {
-    let Some((splats, n)) = load_bear() else {
+    let Some(splats) = load_bear() else {
         eprintln!("skipping: data/bear.3d71a266_sh2.sog not found");
         return;
     };
     let client = splats.attributes.client.clone();
+    let n = splats.attributes.shape[0];
     let mut group = c.benchmark_group("render/frame");
     group.sample_size(30);
     group.warm_up_time(Duration::from_secs(3));
@@ -28,11 +29,7 @@ fn bench_frame(c: &mut Criterion) {
                 for _ in 0..iters {
                     // render_with syncs internally via the counters readback,
                     // so no extra per-iteration sync is needed.
-                    black_box(pollster::block_on(splats.render_with(
-                        &mut scratch,
-                        &camera,
-                        glam::uvec2(w, h),
-                    )));
+                    black_box(splats.render_with(&mut scratch, &camera, glam::uvec2(w, h)));
                 }
                 start.elapsed()
             })
@@ -41,17 +38,17 @@ fn bench_frame(c: &mut Criterion) {
     group.finish();
 }
 
-fn load_bear() -> Option<(Splats, usize)> {
+fn load_bear() -> Option<Splats> {
     let path = std::path::Path::new("data/bear.3d71a266_sh2.sog");
     if !path.exists() {
         return None;
     }
     let client = cubecl::wgpu::WgpuRuntime::client(&Default::default());
-    let splats = sog::parse_sog(std::fs::File::open(path).ok()?)
-        .ok()?
-        .upload(&client);
-    let n = splats.attributes.shape[0];
-    Some((splats, n))
+    Some(
+        sog::parse_sog(std::fs::File::open(path).ok()?)
+            .ok()?
+            .upload(&client),
+    )
 }
 
 criterion_group!(benches, bench_frame);

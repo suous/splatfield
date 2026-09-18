@@ -1,45 +1,40 @@
-[package]
-name = "splatfield"
+[workspace]
+members = ["crates/sort"]
+
+[workspace.package]
 version = "0.1.4"
 edition = "2024"
 
-[dependencies]
-# default-features off: cubecl's `stdlib` runtime kernel templates (matmul etc.)
-# are unused — only custom #[cube] kernels are launched here.
-# exclusive-memory-only stops the allocator slicing multiple tensors into one
-# buffer, which lets cubecl bind read-only args as `storage, read`. Without it
-# every buffer is bound read_write, and the WGSL uniformity analysis (which
-# browsers enforce) rejects any barrier loop bounded by a loaded value — e.g.
-# the rasterizer's per-tile intersection ranges.
+[workspace.dependencies]
+# default-features off skips cubecl's unused stdlib helpers (views, quant,
+# FastDivmod). exclusive-memory-only lets read-only args bind as
+# `storage, read` instead of read_write; without it the WGSL uniformity
+# analysis rejects barrier loops bounded by a loaded value — e.g. the
+# rasterizer's per-tile intersection ranges.
 cubecl = { version = "=0.11.0-pre.3", default-features = false, features = ["wgpu", "exclusive-memory-only"] }
 bytemuck = "1.25"
+rand = "0.10"
+criterion = "0.8"
+
+[package]
+name = "splatfield"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+cubecl.workspace = true
+bytemuck.workspace = true
 glam = "0.33"
 anyhow = "1.0.104"
 image = { version = "0.25", default-features = false, features = ["webp"] }
 zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "x11", "wayland"] }
-pollster = "1.0"
-
-[target.'cfg(target_arch = "wasm32")'.dependencies]
-# default_fonts stays on: without it egui has no glyphs at all, and the
-# drag-and-drop hint — the app's only UI text — renders as blank space.
-eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu"] }
-wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["HtmlCanvasElement", "Document", "Element", "Window", "console"] }
+splat-sort = { path = "crates/sort" }
 
 [dev-dependencies]
-rand = "0.10"
-criterion = "0.8"
-# Only for examples (RUST_LOG-driven WGSL traces); auto-color only.
-env_logger = { version = "0.11.11", default-features = false, features = ["auto-color"] }
-
-[[bench]]
-name = "radix_sort"
-harness = false
+criterion.workspace = true
 
 [[bench]]
 name = "render_frame"
@@ -50,6 +45,5 @@ lto = "thin"
 opt-level = 'z'
 codegen-units = 1
 panic = "abort"
-# Strip symbol tables at link time — the one owner for stripped release
-# artifacts, covering Windows too (where CI has no strip step).
 strip = true
+
