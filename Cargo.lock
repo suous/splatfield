@@ -3610,7 +3610,7 @@ dependencies = [
 
 [[package]]
 name = "splat-sort"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "bytemuck",
  "criterion",
@@ -3620,7 +3620,7 @@ dependencies = [
 
 [[package]]
 name = "splatfield"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "bytemuck",
