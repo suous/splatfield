@@ -42,7 +42,7 @@ impl GpuTensor {
     }
 
     /// Upload to the GPU. An owned `Vec` is moved without copying; a slice is
-    /// copied once — on wasm32 each large copy risks the 4 GiB linear-memory ceiling.
+    /// copied once.
     pub fn from<T: bytemuck::NoUninit + Send + Sync>(
         client: &ComputeClient<WgpuRuntime>,
         shape: impl Into<Shape>,
@@ -62,12 +62,15 @@ impl GpuTensor {
     }
 
     /// Overwrite the buffer in place — stream-ordered, non-blocking, no kernel.
-    pub(crate) fn write<T: bytemuck::NoUninit + Send + Sync>(&self, data: impl Into<Vec<T>>) {
+    pub fn write<T: bytemuck::NoUninit + Send + Sync>(&self, data: impl Into<Vec<T>>) {
         self.client
             .write(&self.handle, cubecl::bytes::Bytes::from_elems(data.into()));
     }
 
-    pub(crate) async fn read_pair(&self) -> [u32; 2] {
+    /// Read two counters as a pair. Async on every target: cubecl's blocking
+    /// reads poll once and panic on wasm, so native callers await this through
+    /// `cubecl::future::block_on` instead.
+    pub async fn read_pair(&self) -> [u32; 2] {
         let bytes = self.client.read_async(vec![self.handle.clone()]).await;
         bytemuck::cast_slice(&bytes.unwrap()[0]).try_into().unwrap()
     }

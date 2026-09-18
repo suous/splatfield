@@ -84,7 +84,6 @@ pub(crate) fn rasterize_kernel(
     gaussian_ids_by_tile: &[u32],
     projected: &[f32],
     bitmap: &mut [u32],
-    #[comptime] early_exit: bool,
 ) {
     let px = ABSOLUTE_POS_X;
     let py = ABSOLUTE_POS_Y;
@@ -97,27 +96,25 @@ pub(crate) fn rasterize_kernel(
     let range_start = lower_bound(tile_ids, num_isects, tile_id);
     let range_end = lower_bound(tile_ids, num_isects, tile_id + 1u32);
 
-    // Stage one workgroup-sized chunk of isects in shared memory: each isect's
-    // 36-byte row is fetched from global memory once per tile instead of once
-    // per pixel. All threads run the chunk loop uniformly so sync_cube never
-    // diverges; converged threads just stop accumulating.
+    // Stage one workgroup-sized chunk of isects in shared memory: each 36-byte
+    // row is fetched from global memory once per tile instead of once per
+    // pixel, and every thread runs the chunk loop uniformly.
     //
     // The whole-tile early exit skips the remaining chunks once every pixel is
-    // saturated. It counts finishers in a shared atomic and `break`s the chunk
-    // loop on the count — which the WGSL uniformity analysis rejects, because
-    // it treats every load from workgroup memory as non-uniform, making the
-    // break (and with it the next iteration's sync_cube) divergent. Browsers
-    // refuse to compile the shader, so web builds specialize with early_exit
-    // off and pay only per-thread `done` latching; native keeps the exit.
+    // saturated. The count read is `workgroup_uniform_load_atomic` because its
+    // barrier doubles as the staging fence, and only a uniform load keeps the
+    // `break` convergent: a plain load would put the next iteration's
+    // sync_cube in non-uniform control flow, which WGSL validators reject.
     let mut stage = Shared::<[f32]>::new_slice(layout::TILE_SIZE as usize * PROJ_FLOATS);
     let done_count = Shared::<[Atomic<u32>]>::new_slice(1usize);
-    if early_exit {
-        if UNIT_POS == 0 {
-            done_count[0usize].store(0u32);
-        }
-        if !in_bounds {
-            done_count[0usize].fetch_add(1u32);
-        }
+    if UNIT_POS == 0 {
+        done_count[0usize].store(0u32);
+    }
+    // The init store must be visible before finishers fetch_add: shared
+    // atomics are ordered across threads only by a barrier.
+    sync_cube();
+    if !in_bounds {
+        done_count[0usize].fetch_add(1u32);
     }
 
     let mut transmittance = 1.0f32;
@@ -141,10 +138,10 @@ pub(crate) fn rasterize_kernel(
                 stage[dst + k] = projected[src + k];
             }
         }
-        sync_cube();
-
-        // Whole tile converged: every remaining chunk would be a no-op.
-        if early_exit && done_count[0usize].load() == layout::TILE_SIZE {
+        // Whole tile converged: every remaining chunk would be a no-op. The
+        // uniform load's barrier doubles as the staging-write fence for the
+        // reads below, so this replaces the second sync_cube.
+        if workgroup_uniform_load_atomic(&done_count[0usize]) == layout::TILE_SIZE {
             break;
         }
 
@@ -176,9 +173,7 @@ pub(crate) fn rasterize_kernel(
                     // Remaining weight < 1 LSB of the final 8-bit channels.
                     if transmittance < 1.0f32 / 255.0f32 {
                         done = true;
-                        if early_exit {
-                            done_count[0usize].fetch_add(1u32);
-                        }
+                        done_count[0usize].fetch_add(1u32);
                     }
                 }
             }

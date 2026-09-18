@@ -1,7 +1,6 @@
 use std::sync::Arc;
 
-use crate::tensor::GpuTensor;
-// Use eframe's re-export so wgpu types always match the render state's device/queue.
+use splat_sort::tensor::GpuTensor;
 use eframe::egui::{TextureId, epaint::mutex::RwLock};
 use eframe::egui_wgpu::Renderer;
 use eframe::wgpu;
@@ -10,7 +9,8 @@ pub struct GpuTexture {
     device: wgpu::Device,
     queue: wgpu::Queue,
     renderer: Arc<RwLock<Renderer>>,
-    texture: (wgpu::Texture, TextureId),
+    texture: wgpu::Texture,
+    id: TextureId,
 }
 
 impl GpuTexture {
@@ -26,23 +26,23 @@ impl GpuTexture {
             device,
             queue,
             renderer,
-            texture: (texture, id),
+            texture,
+            id,
         }
     }
 
     pub fn texture_id(&self) -> TextureId {
-        self.texture.1
+        self.id
     }
 
     pub fn update_texture(&mut self, img: &GpuTensor, size: glam::UVec2) {
         img.client.flush().expect("flush bitmap before copy");
 
-        if self.texture.0.width() != size.x || self.texture.0.height() != size.y {
+        if self.texture.width() != size.x || self.texture.height() != size.y {
             self.recreate_texture(size);
         }
 
-        let (texture, _) = &self.texture;
-        self.copy_to_texture(img, texture);
+        self.copy_to_texture(img);
     }
 
     fn create_texture(device: &wgpu::Device, size: glam::UVec2) -> wgpu::Texture {
@@ -64,19 +64,17 @@ impl GpuTexture {
 
     fn recreate_texture(&mut self, size: glam::UVec2) {
         // Reuse the registered TextureId so egui's texture set doesn't grow.
-        let texture = Self::create_texture(&self.device, size);
-        let view = texture.create_view(&Default::default());
-        let (_, id) = self.texture;
+        self.texture = Self::create_texture(&self.device, size);
+        let view = self.texture.create_view(&Default::default());
         self.renderer.write().update_egui_texture_from_wgpu_texture(
             &self.device,
             &view,
             wgpu::FilterMode::Linear,
-            id,
+            self.id,
         );
-        self.texture = (texture, id);
     }
 
-    fn copy_to_texture(&self, img: &GpuTensor, texture: &wgpu::Texture) {
+    fn copy_to_texture(&self, img: &GpuTensor) {
         let resource = img
             .client
             .get_resource(img.handle.clone())
@@ -92,8 +90,8 @@ impl GpuTexture {
                     rows_per_image: None,
                 },
             },
-            texture.as_image_copy(),
-            texture.size(),
+            self.texture.as_image_copy(),
+            self.texture.size(),
         );
 
         self.queue.submit([encoder.finish()]);

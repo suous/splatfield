@@ -47,16 +47,14 @@ fn tile_bbox(mean: Vec2F, ext: Vec2F, bounds: Vec2F) -> TileBBox {
 
 // counters layout: [total intersection emissions, visible splats]
 
-// z ∈ (0.1, 1e4) keeps the top 4 mantissa bits of the f32 bit pattern constant;
-// sign + exponent + 9 mantissa bits (relative granularity 2^-9) sort depth in
-// 3 plane passes instead of 4. Ties within the band blend in arbitrary order
-// — the same treatment equal keys already get.
-pub(crate) const DEPTH_KEY_BITS: u32 = 18;
-
-/// Monotonic depth key for `z > 0` (float order == depth order).
+/// Full float-precision depth key: camera-space z is always positive here, so
+/// the raw bit pattern sorts depth monotonically, and keys tie only on exact
+/// float equality. Truncated keys once tied whole surface patches, and the
+/// racy atomic compaction order re-rolled the blend order of ties on every
+/// launch — visible as heavy flicker on camera-neutral repaints.
 #[cube]
 fn depth_key(z: f32) -> u32 {
-    z.to_bits() >> (32 - DEPTH_KEY_BITS)
+    z.to_bits()
 }
 
 /// Per-frame camera state, passed as kernel scalars. `rot`/`trans` are the
@@ -175,7 +173,13 @@ fn mat_vec(v: Vec3F, m0: Vec3F, m1: Vec3F, m2: Vec3F) -> Vec3F {
 }
 
 #[cube]
-fn compute_cov2d(scale: Vec3F, quat: Vec4F, view: &CameraView, cam: Vec3F) -> Vec3F {
+fn compute_cov2d(
+    scale: Vec3F,
+    quat: Vec4F,
+    view: &CameraView,
+    cam: Vec3F,
+    inv_cam_z: f32,
+) -> Vec3F {
     let rot0 = view.rot0;
     let rot1 = view.rot1;
     let rot2 = view.rot2;
@@ -185,7 +189,6 @@ fn compute_cov2d(scale: Vec3F, quat: Vec4F, view: &CameraView, cam: Vec3F) -> Ve
     let m1 = scale_components(r1, scale);
     let m2 = scale_components(r2, scale);
 
-    let inv_cam_z = cam.z.recip();
     let lim_x = 1.3f32 * view.img.x / (2.0f32 * view.focal.x);
     let lim_y = 1.3f32 * view.img.y / (2.0f32 * view.focal.y);
     let u = (cam.x * inv_cam_z).clamp(-lim_x, lim_x);
@@ -271,7 +274,8 @@ pub(crate) fn project_splats(
     if cam.z <= 0.1f32 {
         terminate!();
     }
-    let cov2d = compute_cov2d(scale, quat, &view, cam);
+    let inv_cam_z = cam.z.recip();
+    let cov2d = compute_cov2d(scale, quat, &view, cam, inv_cam_z);
     let conic = compute_conic(cov2d.x, cov2d.y, cov2d.z);
 
     let vis_slot = counters[1].fetch_add(1u32);
@@ -291,7 +295,6 @@ pub(crate) fn project_splats(
         sh_coeffs,
     );
 
-    let inv_cam_z = cam.z.recip();
     let mean2d = Vec2F {
         x: view.focal.x * cam.x * inv_cam_z + view.img.x * 0.5,
         y: view.focal.y * cam.y * inv_cam_z + view.img.y * 0.5,
@@ -381,15 +384,15 @@ fn sh_to_rgb(chs: u32, dir: Vec3F, splat: u32, n: u32, shs: &[f32]) -> (f32, f32
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tensor::GpuTensor;
     use cubecl::calculate_cube_count_elemwise;
     use cubecl::wgpu::WgpuRuntime;
+    use splat_sort::tensor::GpuTensor;
 
     const SENTINEL: u32 = 0xDEAD_BEEF;
 
     #[test]
     fn test_project_counts_tiles_and_packs_bbox() {
-        let (_gpu, client) = crate::tensor::test_client();
+        let (_gpu, client) = crate::gpu_testing::test_client();
         // One splat at the image center, scale ~1, near-full opacity: with a
         // 64x64 image and 16x16 tiles its bbox covers all 16 tiles.
         let attributes: Vec<f32> = vec![0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 5.0];

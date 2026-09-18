@@ -6,8 +6,8 @@ use cubecl::Runtime;
 use cubecl::client::ComputeClient;
 use cubecl::wgpu::WgpuRuntime;
 use rand::RngExt;
-use splatfield::sort::{RadixScratch, radix_argsort_with};
-use splatfield::tensor::GpuTensor;
+use splat_sort::sort::RadixScratch;
+use splat_sort::tensor::GpuTensor;
 use std::hint::black_box;
 use std::time::Duration;
 
@@ -68,7 +68,7 @@ fn bench_sort(
             let start = std::time::Instant::now();
             for i in 0..iters {
                 let s = if i % 2 == 0 { scratch } else { &scratch_b };
-                let (nk, nv) = radix_argsort_with(black_box(&k), black_box(&v), n as u32, bits, s);
+                let (nk, nv) = s.argsort(black_box(&k), black_box(&v), n as u32, bits, true);
                 k = nk;
                 v = nv;
             }
@@ -136,7 +136,7 @@ fn bench_end_to_end(c: &mut Criterion) {
                 let k = GpuTensor::from(&client, [n], &keys_data[..]);
                 let v = GpuTensor::from(&client, [n], &vals_data[..]);
                 let (sorted_k, sorted_v) =
-                    radix_argsort_with(black_box(&k), black_box(&v), n as u32, 32, &scratch);
+                    scratch.argsort(black_box(&k), black_box(&v), n as u32, 32, true);
                 sorted_k.read_vec::<u32>();
                 sorted_v.read_vec::<u32>();
             });
