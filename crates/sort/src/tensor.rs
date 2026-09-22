@@ -17,7 +17,11 @@ pub fn test_client() -> (
     ComputeClient<WgpuRuntime>,
 ) {
     (
-        GPU_TEST_LOCK.lock().unwrap(),
+        // Poison-tolerant: one failing GPU test must not cascade
+        // PoisonErrors through every other test's client setup.
+        GPU_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
         WgpuRuntime::client(&cubecl::wgpu::WgpuDevice::default()),
     )
 }

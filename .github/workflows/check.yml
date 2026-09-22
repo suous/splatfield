@@ -18,15 +18,29 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
   cancel-in-progress: true
 jobs:
-  check:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (pin from jonhoo/rust-ci-conf)
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: clippy, rustfmt
-      - name: Software Vulkan for the GPU tests (lavapipe via Mesa)
-        run: sudo apt-get update && sudo apt-get install -y mesa-vulkan-drivers
+      - name: cargo fmt --check
+        run: cargo fmt --check
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: cargo doc
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+  test:
+    # The sort kernel requires subgroup (plane) ops, which lavapipe (the
+    # software Vulkan on ubuntu runners) lacks; Apple Silicon/Metal has
+    # them. See crates/sort plane_sort_path.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (pin from jonhoo/rust-ci-conf)
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
       - name: Fetch test fixtures (release-hosted; gitignored)
         run: |
           base=https://github.com/suous/splatfield/releases/download/fixtures-v1
@@ -40,7 +54,9 @@ jobs:
         id: models
         uses: actions/cache@v6
         with:
-          path: ~/.cache/splatfield/models
+          # gsam's models_dir() follows the platform cache convention,
+          # which is ~/Library/Caches (not ~/.cache) on macOS.
+          path: ~/Library/Caches/splatfield/models
           key: models-v1
       - name: Download models-v1 on cache miss
         if: steps.models.outputs.cache-hit != 'true'
@@ -48,16 +64,8 @@ jobs:
           curl -fsSL --retry 3 -o /tmp/splatfield-models.zip \
             https://github.com/suous/splatfield/releases/download/models-v1/splatfield-models.zip
           echo "259ed2a989fc368b839cb32c1b43c758fa1207e4849123e603f83baedb35f740  /tmp/splatfield-models.zip" | sha256sum -c
-          mkdir -p /tmp/models-stage ~/.cache/splatfield/models
+          mkdir -p /tmp/models-stage ~/Library/Caches/splatfield/models
           unzip -q /tmp/splatfield-models.zip -d /tmp/models-stage
-          mv /tmp/models-stage/models ~/.cache/splatfield/models/models-v1
-      - name: cargo fmt --check
-        run: cargo fmt --check
-      - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
+          mv /tmp/models-stage/models ~/Library/Caches/splatfield/models/models-v1
       - name: cargo test
-        run: cargo test --workspace --locked
-      - name: cargo doc
-        run: cargo doc --no-deps
-        env:
-          RUSTDOCFLAGS: -D warnings
+        run: cargo test --workspace --locked --no-fail-fast
