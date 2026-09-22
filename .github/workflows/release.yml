@@ -3,48 +3,27 @@ name: Release
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch:
-    inputs:
-      only_target:
-        description: "Build only this matrix target (e.g. x86_64-unknown-linux-gnu); empty = all"
-        default: ""
-      release_tag:
-        description: "Existing tag whose release gets the rebuilt assets (e.g. v0.2.0-rc.1); empty = do not publish"
-        default: ""
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Emit the build matrix: all targets, or just the one named by a
-  # dispatch's only_target input.
-  plan:
-    runs-on: ubuntu-latest
-    outputs:
-      matrix: ${{ steps.set.outputs.matrix }}
-    steps:
-      - id: set
-        env:
-          ONLY_TARGET: ${{ github.event_name == 'workflow_dispatch' && inputs.only_target || '' }}
-        run: |
-          case "$ONLY_TARGET" in
-            "") matrix='[{"os":"windows-latest","target":"x86_64-pc-windows-msvc"},{"os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu"},{"os":"macos-latest","target":"aarch64-apple-darwin"}]' ;;
-            x86_64-pc-windows-msvc) matrix='[{"os":"windows-latest","target":"x86_64-pc-windows-msvc"}]' ;;
-            x86_64-unknown-linux-gnu) matrix='[{"os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu"}]' ;;
-            aarch64-apple-darwin) matrix='[{"os":"macos-latest","target":"aarch64-apple-darwin"}]' ;;
-            *) echo "unknown only_target: $ONLY_TARGET" >&2; exit 1 ;;
-          esac
-          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
-
   build:
-    needs: plan
     strategy:
       matrix:
-        include: ${{ fromJson(needs.plan.outputs.matrix) }}
-    # ubuntu-22.04 is pinned, not ubuntu-latest: 24.04+ (glibc >= 2.38,
-    # gcc 13 C23 mode) bakes __isoc23_* / GLIBC_2.38+ requirements into
-    # the binary, locking out Ubuntu 22.04 / Debian 12 users. 22.04 keeps
-    # the floor at glibc 2.35. Also shields from ubuntu-latest migrations.
+        include:
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          # NOTE: ubuntu-latest (24.04+, glibc >= 2.38) because the prebuilt
+          # ONNX Runtime static lib (ort download-binaries) references
+          # __isoc23_strtol/strtoll/strtoull (2.38) and pidfd_* (2.39); linking
+          # on 22.04 fails. The Linux binary therefore requires glibc >= 2.39
+          # (Ubuntu 24.04+). Revisit with a shim or vendored ORT build.
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (pin from jonhoo/rust-ci-conf)
@@ -58,7 +37,7 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Install Linux dependencies
-        if: runner.os == 'Linux'
+        if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
           sudo apt-get install -y libxcb-xfixes0-dev libxcb1-dev libxkbcommon-dev libx11-dev libwayland-dev
@@ -84,8 +63,6 @@ jobs:
 
   release:
     needs: build
-    # tag push (publish new release) or dispatch with an explicit target release
-    if: ${{ startsWith(github.ref, 'refs/tags/') || inputs.release_tag != '' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -97,15 +74,7 @@ jobs:
 
       - run: ls -la artifacts/
 
-      # dispatch path: clobber same-named assets on an existing release
-      - name: Upload to existing release
-        if: ${{ inputs.release_tag != '' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: gh release upload "${{ inputs.release_tag }}" artifacts/* --clobber
-
       - uses: softprops/action-gh-release@v3
-        if: ${{ startsWith(github.ref, 'refs/tags/') }}
         with:
           files: artifacts/*
           generate_release_notes: true

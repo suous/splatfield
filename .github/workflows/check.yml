@@ -8,11 +8,13 @@ on:
       - '**.md'
       - 'assets/**'
       - 'docs/**'
+      - '.github/workflows/release.yml'
   pull_request:
     paths-ignore:
       - '**.md'
       - 'assets/**'
       - 'docs/**'
+      - '.github/workflows/release.yml'
   workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
