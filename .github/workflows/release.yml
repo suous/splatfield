@@ -21,7 +21,7 @@ jobs:
 
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (pin from jonhoo/rust-ci-conf)
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -51,7 +51,7 @@ jobs:
           cd target/${{ matrix.target }}/release
           tar czf ../../../splatfield-${{ matrix.target }}.tar.gz splatfield
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: splatfield-${{ matrix.target }}
           path: splatfield-${{ matrix.target }}.*
