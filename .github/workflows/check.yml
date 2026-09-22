@@ -63,7 +63,10 @@ jobs:
         run: |
           curl -fsSL --retry 3 -o /tmp/splatfield-models.zip \
             https://github.com/suous/splatfield/releases/download/models-v1/splatfield-models.zip
-          echo "259ed2a989fc368b839cb32c1b43c758fa1207e4849123e603f83baedb35f740  /tmp/splatfield-models.zip" | sha256sum -c
+          # file arg, not stdin: the macOS sha256sum shim reads check
+          # lists only from files
+          echo "259ed2a989fc368b839cb32c1b43c758fa1207e4849123e603f83baedb35f740  /tmp/splatfield-models.zip" > /tmp/models.sha256
+          sha256sum -c /tmp/models.sha256
           mkdir -p /tmp/models-stage ~/Library/Caches/splatfield/models
           unzip -q /tmp/splatfield-models.zip -d /tmp/models-stage
           mv /tmp/models-stage/models ~/Library/Caches/splatfield/models/models-v1
