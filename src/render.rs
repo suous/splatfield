@@ -19,16 +19,96 @@ const INITIAL_ISECTS_CAP: usize = 1 << 22;
 
 /// Host-side splat payload produced by the PLY/SOG parsers, uploaded once by
 /// `Splats::new`. Field-major layout: see the `PLANE_*` planes in `layout`.
-#[derive(Debug)]
+/// The app retains it as the pristine master copy that box-select deletion
+/// gathers from — the GPU upload consumes the parser's buffers.
+#[derive(Clone, Debug)]
 pub struct CpuSplats {
-    pub(crate) attributes: Vec<f32>,
-    pub(crate) sh_coeffs: Vec<f32>,
+    pub attributes: Vec<f32>,
+    pub sh_coeffs: Vec<f32>,
 }
 
 impl CpuSplats {
     pub fn upload(self, client: &ComputeClient<WgpuRuntime>) -> Splats {
         Splats::new(self.attributes, self.sh_coeffs, client)
     }
+
+    /// Splat count (`ATTR_PLANES` floats per splat, field-major).
+    pub(crate) fn count(&self) -> usize {
+        self.attributes.len() / layout::ATTR_PLANES
+    }
+
+    /// The splats kept by `keep` (in `keep`'s order), gathered plane-wise —
+    /// both buffers are field-major (plane p of splat i at p·n + i), so
+    /// deletion is the same gather over each plane.
+    pub fn gather(&self, keep: &[usize]) -> CpuSplats {
+        let n = self.count();
+        CpuSplats {
+            attributes: gather_planes(&self.attributes, layout::ATTR_PLANES, n, keep),
+            sh_coeffs: gather_planes(&self.sh_coeffs, self.sh_coeffs.len() / n, n, keep),
+        }
+    }
+
+    /// The display keep-list: non-removed master indices, ascending. The
+    /// GPU scene shows exactly these masters, and a splat's display index
+    /// is its position here (materialized by [`Self::gather`]).
+    pub fn kept(&self, removed: &[usize]) -> Vec<usize> {
+        let n = self.count();
+        (0..n)
+            .filter(|i| removed.binary_search(i).is_err())
+            .collect()
+    }
+
+    /// Display indices of the kept splats whose projected center falls
+    /// inside the viewport-pixel rect (`min`/`max`, inclusive), from
+    /// `camera` at `pixel` resolution — the same world→pixel map the
+    /// rendered view shows, so what's inside the drawn box is what's
+    /// selected. Indices are display numbering — positions in
+    /// [`Self::kept`] — the numbering the GPU buffers use.
+    pub fn select_in_rect(
+        &self,
+        camera: &Camera,
+        pixel: glam::UVec2,
+        min: glam::Vec2,
+        max: glam::Vec2,
+        removed: &[usize],
+    ) -> Vec<usize> {
+        let n = self.count();
+        let mut selected = Vec::new();
+        let mut d = 0usize;
+        for i in 0..n {
+            if removed.binary_search(&i).is_err() {
+                let inside = crate::camera::guide_point(
+                    camera,
+                    splat_position(&self.attributes, n, i),
+                    pixel,
+                )
+                .is_some_and(|uv| {
+                    // guide_point yields pixel-index space; the drag rect is
+                    // continuous, where pixel i spans [i, i+1).
+                    let q = uv * pixel.as_vec2() + 0.5;
+                    q.x >= min.x && q.x <= max.x && q.y >= min.y && q.y <= max.y
+                });
+                if inside {
+                    selected.push(d);
+                }
+                d += 1;
+            }
+        }
+        selected
+    }
+}
+
+/// Gather `keep` out of a field-major buffer with `planes` strided planes
+/// of `n` splats each.
+fn gather_planes(src: &[f32], planes: usize, n: usize, keep: &[usize]) -> Vec<f32> {
+    let m = keep.len();
+    let mut out = vec![0f32; planes * m];
+    for (j, &i) in keep.iter().enumerate() {
+        for p in 0..planes {
+            out[p * m + j] = src[p * n + i];
+        }
+    }
+    out
 }
 
 /// Per-frame GPU buffers, reused across frames so steady-state rendering
@@ -36,21 +116,21 @@ impl CpuSplats {
 pub struct RenderScratch {
     depth_order: GpuTensor,
     depth_keys: GpuTensor,
-    projected: GpuTensor,
+    pub(crate) projected: GpuTensor,
     counters: GpuTensor,
     tile_counts: GpuTensor,
     tile_bbox: GpuTensor,
     tile_ids: GpuTensor,
     gaussian_ids: GpuTensor,
-    bitmap: GpuTensor,
+    pub(crate) bitmap: GpuTensor,
     // Ping-pong scratch for the two sorts. The tile sort must not share the
     // depth sort's: an odd pass count returns buffers aliasing the scratch.
     sort_depth: RadixScratch,
     sort_tile: RadixScratch,
     scan: ScanScratch,
     img_size: glam::UVec2,
-    // Last frame's raw intersection emission, stashed for the next frame's
-    // capacity check — growth only ever happens between frames.
+    // The previous prepare's raw intersection emission, stashed for the
+    // next capacity check — growth only ever happens between frames.
     last_isects_raw: u32,
 }
 
@@ -86,10 +166,6 @@ impl RenderScratch {
         }
     }
 
-    fn matches(&self, total: usize, img_size: glam::UVec2) -> bool {
-        self.depth_order.shape[0] == total && self.img_size == img_size
-    }
-
     /// Rebuild if the frame shape changed, then grow the isect buffers from
     /// last frame's emission. Returns the tile grid `(bounds, count)`.
     fn prepare(
@@ -98,10 +174,13 @@ impl RenderScratch {
         total: usize,
         img_size: glam::UVec2,
     ) -> (glam::UVec2, usize) {
-        if !self.matches(total, img_size) {
+        // Read the growth hint before a rebuild resets it: the first frame
+        // at a new shape must still grow to the previous shape's emission,
+        // else map_isects silently truncates it.
+        let raw = self.last_isects_raw;
+        if self.depth_order.shape[0] != total || self.img_size != img_size {
             *self = Self::new(client, total, img_size);
         }
-        let raw = self.last_isects_raw;
         let new_cap = (raw as usize)
             .next_power_of_two()
             .min(INTERSECTS_UPPER_BOUND);
@@ -120,8 +199,43 @@ impl RenderScratch {
 
 pub struct Splats {
     pub attributes: GpuTensor,
-    sh_coeffs: GpuTensor,
+    pub sh_coeffs: GpuTensor,
     pub bounds: (glam::Vec3, glam::Vec3),
+    /// Host copy of the xyz planes. Positions are immutable after upload
+    /// (no kernel takes `&mut` to `attributes`; edits re-upload), so
+    /// per-round localization reads RAM instead of pulling the planes
+    /// back over PCIe.
+    pub(crate) positions: Vec<f32>,
+}
+
+/// Splat `i`'s world position from the field-major attribute planes.
+pub(crate) fn splat_position(attr: &[f32], n: usize, i: usize) -> glam::Vec3 {
+    glam::vec3(
+        attr[layout::PLANE_X * n + i],
+        attr[layout::PLANE_Y * n + i],
+        attr[layout::PLANE_Z * n + i],
+    )
+}
+
+/// Which buffers one finalize dispatch fills — the rasterize_kernel comptime
+/// `(rgb, evidence)` mode pair. ε variants carry the fixed-point scale and
+/// the live accumulator tensors; every mode-dead buffer slot aliases the
+/// `tile_ids` input (buffer arg 0): comptime-dead args are not always dropped
+/// from the launch signature, and cubecl binds an alias without a second
+/// wgpu binding (see `raster::rasterize_kernel`).
+pub(crate) enum Finalize<'a> {
+    /// Blend the projected SH colors into `scratch.bitmap`.
+    Rgb,
+    /// Accumulate total rendering responsibility into `resp`.
+    Total { scale: f32, resp: &'a GpuTensor },
+    /// Split the weights by the packed `mask` into `fg`/`bg` pseudo-counts.
+    Evidence {
+        scale: f32,
+        mask: &'a GpuTensor,
+        words_per_row: u32,
+        fg: &'a GpuTensor,
+        bg: &'a GpuTensor,
+    },
 }
 
 impl Splats {
@@ -133,37 +247,36 @@ impl Splats {
         let n = attributes.len() / layout::ATTR_PLANES;
         assert!(n > 0, "Splats::new: zero splats");
         let n_coeffs = sh_coeffs.len() / n;
+        // xyz are the first three planes.
+        let positions = attributes[..3 * n].to_vec();
 
         let mut min = glam::Vec3::splat(f32::MAX);
         let mut max = glam::Vec3::splat(f32::MIN);
         for i in 0..n {
-            let p = glam::vec3(
-                attributes[layout::PLANE_X * n + i],
-                attributes[layout::PLANE_Y * n + i],
-                attributes[layout::PLANE_Z * n + i],
-            );
+            let p = splat_position(&positions, n, i);
             min = min.min(p);
             max = max.max(p);
         }
 
         Self {
+            // The shape names splat-major rows, but the bytes are plane-major
+            // (layout.rs); shapes here are consumed only as counts.
             attributes: GpuTensor::from(client, [n, layout::ATTR_PLANES], attributes),
             sh_coeffs: GpuTensor::from(client, [n, n_coeffs / 3, 3], sh_coeffs),
             bounds: (min, max),
+            positions,
         }
     }
 
-    /// Render one frame into `scratch`'s buffers; the returned bitmap aliases
-    /// `scratch.bitmap` and is valid until the next `render_with` on it.
-    ///
-    /// A `scratch` that doesn't match the splat count or image size is rebuilt
-    /// in place.
-    pub fn render_with(
+    /// Shared front half of the render paths: project, depth-sort, emit and
+    /// tile-sort the intersections. Returns everything a per-pixel finalize
+    /// kernel (RGB blending, responsibility accumulation, ...) needs.
+    pub(crate) fn prepare_isects(
         &self,
         scratch: &mut RenderScratch,
         camera: &Camera,
         img_size: glam::UVec2,
-    ) -> GpuTensor {
+    ) -> TileIsects {
         let client = &self.attributes.client;
         let total = self.attributes.shape[0];
         let (tile_bounds, num_tiles) = scratch.prepare(client, total, img_size);
@@ -238,32 +351,139 @@ impl Splats {
             true,
         );
 
-        let row_stride = scratch.bitmap.shape[1] as u32;
+        // Stash the emission count for the next capacity check — growth only
+        // ever happens between frames.
+        scratch.last_isects_raw = num_isects_raw;
+        TileIsects {
+            tile_ids,
+            gaussian_ids,
+            num_isects,
+            tile_bounds,
+            row_stride: scratch.bitmap.shape[1] as u32,
+        }
+    }
+
+    /// Render one frame into `scratch`'s buffers; the returned bitmap aliases
+    /// `scratch.bitmap` and is valid until the next `render_with` on it.
+    ///
+    /// A `scratch` that doesn't match the splat count or image size is rebuilt
+    /// in place.
+    pub fn render_with(
+        &self,
+        scratch: &mut RenderScratch,
+        camera: &Camera,
+        img_size: glam::UVec2,
+    ) -> GpuTensor {
+        let isects = self.prepare_isects(scratch, camera, img_size);
+        self.finalize(scratch, &isects, img_size, Finalize::Rgb);
+        scratch.bitmap.clone()
+    }
+
+    /// The one `rasterize_kernel` finalize dispatch shared by the RGB and ε
+    /// paths: `mode` resolves the kernel's ten mode-dependent slots, the
+    /// remaining six arguments are the shared tile-pipeline plumbing. The
+    /// RGB mode blends into `scratch.bitmap`, which callers clone to hand
+    /// the bitmap out (it aliases the scratch).
+    pub(crate) fn finalize(
+        &self,
+        scratch: &RenderScratch,
+        isects: &TileIsects,
+        img_size: glam::UVec2,
+        mode: Finalize<'_>,
+    ) {
+        let dead = || BufferArg::alias(0, isects.num_isects as usize);
+        let (rgb, evidence, scale, row_stride, mask, words, bitmap, resp, fg, bg) = match mode {
+            Finalize::Rgb => (
+                true,
+                false,
+                0.0,
+                isects.row_stride,
+                dead(),
+                0,
+                scratch.bitmap.as_buffer_arg(),
+                dead(),
+                dead(),
+                dead(),
+            ),
+            Finalize::Total { scale, resp } => (
+                false,
+                false,
+                scale,
+                0,
+                dead(),
+                0,
+                dead(),
+                resp.as_buffer_arg(),
+                dead(),
+                dead(),
+            ),
+            Finalize::Evidence {
+                scale,
+                mask,
+                words_per_row,
+                fg,
+                bg,
+            } => (
+                false,
+                true,
+                scale,
+                0,
+                mask.as_buffer_arg(),
+                words_per_row,
+                dead(),
+                dead(),
+                fg.as_buffer_arg(),
+                bg.as_buffer_arg(),
+            ),
+        };
         rasterize_kernel::launch::<WgpuRuntime>(
-            client,
-            CubeCount::new_2d(tile_bounds.x, tile_bounds.y),
+            &self.attributes.client,
+            CubeCount::new_2d(isects.tile_bounds.x, isects.tile_bounds.y),
             CubeDim::new_2d(layout::TILE_WIDTH, layout::TILE_WIDTH),
             img_size.x,
             img_size.y,
             row_stride,
-            num_isects,
-            tile_ids.as_buffer_arg(),
-            gaussian_ids.as_buffer_arg(),
+            isects.num_isects,
+            scale,
+            isects.tile_ids.as_buffer_arg(),
+            isects.gaussian_ids.as_buffer_arg(),
             scratch.projected.as_buffer_arg(),
-            scratch.bitmap.as_buffer_arg(),
+            rgb,
+            evidence,
+            mask,
+            words,
+            bitmap,
+            resp,
+            fg,
+            bg,
         );
-        scratch.last_isects_raw = num_isects_raw;
-        scratch.bitmap.clone()
     }
 }
 
-/// Field-major attributes for `n` opaque splats stacked at the origin XY with
-/// per-splat `z` — the minimal fixture that drives every kernel path.
+/// Sorted per-tile intersection lists plus the frame geometry the finalize
+/// kernels traverse them with.
+pub(crate) struct TileIsects {
+    pub(crate) tile_ids: GpuTensor,
+    pub(crate) gaussian_ids: GpuTensor,
+    pub(crate) num_isects: u32,
+    pub(crate) tile_bounds: glam::UVec2,
+    pub(crate) row_stride: u32,
+}
+
+/// Field-major attributes for `n` opaque splats — `position(i)` places splat
+/// i; every other plane is inert-but-valid (identity rotation, tiny scale,
+/// high opacity) so tests vary geometry only. Test-only: shared by the
+/// render and seg tests.
 #[cfg(test)]
-pub fn sample_opaque_attributes(n: usize, z: impl Fn(usize) -> f32) -> Vec<f32> {
+pub fn sample_opaque_attributes(
+    n: usize,
+    mut position: impl FnMut(usize) -> glam::Vec3,
+) -> Vec<f32> {
     let mut a = vec![0f32; n * layout::ATTR_PLANES];
-    for i in 0..n {
-        a[layout::PLANE_Z * n + i] = z(i);
+    for (i, p) in (0..n).map(|i| (i, position(i))) {
+        a[layout::PLANE_X * n + i] = p.x;
+        a[layout::PLANE_Y * n + i] = p.y;
+        a[layout::PLANE_Z * n + i] = p.z;
         a[layout::PLANE_QW * n + i] = 1.0;
         a[layout::PLANE_SX * n + i] = -2.0;
         a[layout::PLANE_SY * n + i] = -2.0;
@@ -273,12 +493,158 @@ pub fn sample_opaque_attributes(n: usize, z: impl Fn(usize) -> f32) -> Vec<f32> 
     a
 }
 
+/// Opaque-DC test fixture: [`sample_opaque_attributes`] + zero SH — tests
+/// vary geometry only.
+#[cfg(test)]
+pub(crate) fn opaque_splats(client: &ComputeClient<WgpuRuntime>, attributes: Vec<f32>) -> Splats {
+    let n = attributes.len() / layout::ATTR_PLANES;
+    Splats::new(attributes, vec![0.0; n * 3], client)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     // Golden from current rasterizer; regenerate only with documented behavior change.
     const GOLDEN_CENTER: [i32; 3] = [127, 127, 127];
+
+    /// A 3-splat CPU scene: splat i at (i as f32, 0, 5) — left/center/right
+    /// in the default camera's 32×32 frame.
+    fn three_splat_cpu() -> CpuSplats {
+        CpuSplats {
+            attributes: sample_opaque_attributes(3, |i| glam::vec3(i as f32 - 1.0, 0.0, 5.0)),
+            sh_coeffs: vec![0.0; 3 * 3],
+        }
+    }
+
+    /// gather is a pure plane-wise selection: identity for all indices, and
+    /// for a subset every plane keeps only the kept columns in order.
+    #[test]
+    fn test_gather_selects_planes() {
+        let mut cpu = three_splat_cpu();
+        // Stamp distinct values so plane order mismatches would show.
+        for (k, v) in cpu.attributes.iter_mut().enumerate() {
+            *v = k as f32;
+        }
+        assert_eq!(cpu.count(), 3);
+
+        let all = cpu.gather(&(0..3).collect::<Vec<_>>());
+        assert_eq!(all.attributes, cpu.attributes);
+        assert_eq!(all.sh_coeffs, cpu.sh_coeffs);
+
+        let some = cpu.gather(vec![2, 0].as_slice());
+        let n = 3;
+        for k in 0..layout::ATTR_PLANES {
+            for (j, &i) in [2usize, 0].iter().enumerate() {
+                assert_eq!(
+                    some.attributes[k * 2 + j],
+                    cpu.attributes[k * n + i],
+                    "plane {k}"
+                );
+            }
+        }
+        // 3 DC planes mirrored in sh_coeffs.
+        assert_eq!(some.sh_coeffs.len(), 3 * 2);
+    }
+
+    /// select_in_rect mirrors the rendered view: the rect keeps splats whose
+    /// projected centers land inside it, drops off-frame and behind-camera
+    /// ones, and returns ascending indices.
+    #[test]
+    fn test_select_in_rect_projects_like_the_view() {
+        let cpu = three_splat_cpu();
+        let cam = Camera::default();
+        let px = glam::uvec2(32, 32);
+        // Center column of the frame: only the middle splat (x = 0).
+        let sel = cpu.select_in_rect(&cam, px, glam::vec2(12.0, 0.0), glam::vec2(20.0, 32.0), &[]);
+        assert_eq!(sel, vec![1]);
+
+        // Full frame: every splat in front of the camera.
+        let sel = cpu.select_in_rect(&cam, px, glam::Vec2::ZERO, glam::vec2(32.0, 32.0), &[]);
+        assert_eq!(sel, vec![0, 1, 2]);
+
+        // Nothing behind the camera is ever selected, wherever the rect is.
+        let mut behind = three_splat_cpu();
+        let n = 3;
+        behind.attributes[layout::PLANE_Z * n] = -5.0;
+        let sel = behind.select_in_rect(&cam, px, glam::Vec2::ZERO, glam::vec2(32.0, 32.0), &[]);
+        assert_eq!(sel, vec![1, 2]);
+    }
+
+    /// Selection is reported in display numbering (master minus the removed
+    /// set) even though the projection runs over master positions — the
+    /// numbering the GPU buffers and the delete mapping use. This is the
+    /// select-after-delete contract: master 0 is gone, so the middle splat
+    /// (master 1) is display 0.
+    #[test]
+    fn test_select_in_rect_reports_display_numbering() {
+        let cpu = three_splat_cpu();
+        let cam = Camera::default();
+        let px = glam::uvec2(32, 32);
+        let sel = cpu.select_in_rect(
+            &cam,
+            px,
+            glam::vec2(12.0, 0.0),
+            glam::vec2(20.0, 32.0),
+            &[0],
+        );
+        assert_eq!(sel, vec![0]);
+        let sel = cpu.select_in_rect(&cam, px, glam::Vec2::ZERO, glam::vec2(32.0, 32.0), &[0]);
+        assert_eq!(sel, vec![0, 1]);
+    }
+
+    /// The delete fold the app performs — map the display selection through
+    /// the keep-list into master numbering, merge into the removed-set —
+    /// traced on a 5-splat master with master 2 already removed: selecting
+    /// display [0, 2, 3] (masters 0, 3, 4) leaves only master 1. The tail
+    /// display index maps to the last master.
+    #[test]
+    fn test_delete_fold_through_kept() {
+        let cpu = CpuSplats {
+            attributes: sample_opaque_attributes(5, |_| glam::Vec3::ZERO),
+            sh_coeffs: vec![0.0; 5 * 3],
+        };
+        let removed = vec![2usize];
+        let sel = [0usize, 2, 3]; // as select_in_rect would report
+
+        let kept = cpu.kept(&removed);
+        assert_eq!(kept, vec![0, 1, 3, 4]);
+        assert_eq!(kept[3], 4, "the last display splat is the last master");
+
+        let mut removed = removed;
+        removed.extend(sel.iter().map(|&d| kept[d]));
+        removed.sort_unstable();
+        assert_eq!(removed, vec![0, 2, 3, 4]);
+        assert_eq!(cpu.kept(&removed), vec![1]);
+    }
+
+    /// The delete→undo cycle through the GPU path, exactly as the app does
+    /// it: deletion re-gathers the master minus the removed-set and changes
+    /// the frame; undo restores the removed-set and the frame returns
+    /// bit-for-bit (the master is the source of truth, uploads are
+    /// deterministic).
+    #[test]
+    fn test_delete_then_undo_restores_render_bitwise() {
+        let (_gpu, client) = crate::gpu_testing::test_client();
+        let cpu = three_splat_cpu();
+        let cam = Camera::default();
+        let px = glam::uvec2(32, 32);
+        let render = |keep: &[usize]| {
+            let splats = cpu.gather(keep).upload(&client);
+            let mut scratch = RenderScratch::new(&client, splats.attributes.shape[0], px);
+            splats.render_with(&mut scratch, &cam, px).read_vec::<u32>()
+        };
+        let all: Vec<usize> = (0..cpu.count()).collect();
+        let before = render(&all);
+
+        // Delete the left splat: the left of the frame empties.
+        let after_delete = render(&[1, 2]);
+        assert_ne!(after_delete, before, "deletion must change the frame");
+
+        // Undo restores the removed-set: the keep-list is whole again and
+        // the frame matches bit-for-bit.
+        assert_eq!(render(&all), before);
+    }
 
     /// Unpack a packed RGBA8 pixel (r | g<<8 | b<<16 | a<<24).
     fn rgba(px: u32) -> [i32; 4] {
@@ -294,7 +660,7 @@ mod tests {
         attributes: Vec<f32>,
         camera: &Camera,
     ) -> (u32, u32) {
-        let splats = Splats::new(attributes, vec![0.0; n * 3], client);
+        let splats = opaque_splats(client, attributes);
         let mut scratch = RenderScratch::new(client, n, glam::uvec2(32, 32));
         let bitmap = splats.render_with(&mut scratch, camera, glam::uvec2(32, 32));
         let px: Vec<u32> = bitmap.read_vec();
@@ -318,10 +684,14 @@ mod tests {
         let cases = [
             (
                 "stacked",
-                sample_opaque_attributes(n, |i| 1.0 + i as f32 * 0.5),
+                sample_opaque_attributes(n, |i| glam::vec3(0.0, 0.0, 1.0 + i as f32 * 0.5)),
                 Camera::default(),
             ),
-            ("yawed", sample_opaque_attributes(n, |_| 0.0), yawed),
+            (
+                "yawed",
+                sample_opaque_attributes(n, |_| glam::Vec3::ZERO),
+                yawed,
+            ),
         ];
         for (name, attributes, camera) in cases {
             let (center, corner) = render_corner_pixels(&client, n, attributes, &camera);
@@ -367,7 +737,7 @@ mod tests {
         let attributes: Vec<f32> = (0..100 * 11)
             .map(|i| (i as f32 * 0.07).sin() * 0.4)
             .collect();
-        let splats = Splats::new(attributes, vec![0.0; 100 * 3], &client);
+        let splats = opaque_splats(&client, attributes);
         let camera = crate::camera::Camera {
             position: glam::Vec3::new(0.0, -1.2, 0.0),
             ..Camera::default()
@@ -392,6 +762,25 @@ mod tests {
         assert!(steady, "steady-state frames keep allocating memory");
     }
 
+    /// A shape rebuild must not discard the growth hint: the first prepare
+    /// at the new shape still grows the isect buffers toward the previous
+    /// emission, else that frame's map_isects silently truncates.
+    #[test]
+    fn test_shape_change_keeps_isects_capacity_hint() {
+        let (_gpu, client) = crate::gpu_testing::test_client();
+        let mut scratch = RenderScratch::new(&client, 1, glam::uvec2(64, 64));
+        // A scene that outgrew the initial capacity at the old shape.
+        scratch.last_isects_raw = INITIAL_ISECTS_CAP as u32 + 1;
+
+        scratch.prepare(&client, 1, glam::uvec2(32, 32));
+
+        assert!(
+            scratch.tile_ids.shape[0] > INITIAL_ISECTS_CAP,
+            "rebuild must keep the growth hint: capacity {}",
+            scratch.tile_ids.shape[0]
+        );
+    }
+
     /// 200 splats at one exact depth are the tie stress case —
     /// every depth key is equal, so the racy atomic compaction order and the
     /// radix sort's tie handling are fully exercised. The splats are
@@ -402,10 +791,9 @@ mod tests {
     fn test_render_ties_deterministic() {
         let (_gpu, client) = crate::gpu_testing::test_client();
         let n = 200usize;
-        let splats = Splats::new(
-            sample_opaque_attributes(n, |_| 1.0),
-            vec![0.0; n * 3],
+        let splats = opaque_splats(
             &client,
+            sample_opaque_attributes(n, |_| glam::vec3(0.0, 0.0, 1.0)),
         );
         let camera = crate::camera::Camera::default();
         let mut scratch = RenderScratch::new(&client, n, glam::uvec2(64, 64));

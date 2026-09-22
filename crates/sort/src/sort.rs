@@ -383,7 +383,7 @@ impl RadixScratch {
 #[cfg(test)]
 mod radix_sort_tests {
     use super::*;
-    use rand::RngExt;
+    use rand::{RngExt, SeedableRng};
 
     fn assert_argsort_bits(
         client: &ComputeClient<WgpuRuntime>,
@@ -436,7 +436,7 @@ mod radix_sort_tests {
         // in depth order and the tile sort must preserve that order among
         // equal tile ids. Assert exact stable argsort, not just sortedness.
         let (_gpu, client) = crate::tensor::test_client();
-        let mut rng = rand::rng();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5EED_0001);
         for n in [1000usize, 5000, 200_000] {
             let keys_inp: Vec<u32> = (0..n).map(|_| rng.random_range(0..37)).collect();
             let values_inp: Vec<u32> = (0..n as u32).collect();
@@ -458,7 +458,7 @@ mod radix_sort_tests {
     fn test_sort_values_only() {
         let (_gpu, client) = crate::tensor::test_client();
         let n = 5000usize;
-        let mut rng = rand::rng();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5EED_0002);
         let keys_inp: Vec<u32> = (0..n).map(|_| rng.random()).collect();
         let values_inp: Vec<u32> = (0..n as u32).collect();
         let mut reference: Vec<u32> = (0..n as u32).collect();
@@ -477,7 +477,7 @@ mod radix_sort_tests {
         let (_gpu, client) = crate::tensor::test_client();
         for max in [2u32, 64, 1000, 65536] {
             let bits = bits_for(max);
-            let mut rng = rand::rng();
+            let mut rng = rand::rngs::StdRng::seed_from_u64(0x5EED_0003);
             let keys_inp: Vec<u32> = (0..5000).map(|_| rng.random_range(0..max)).collect();
             let values_inp: Vec<u32> = (0..5000).map(|i| i as u32).collect();
             assert_argsort_bits(&client, &keys_inp, &values_inp, bits);
@@ -487,7 +487,7 @@ mod radix_sort_tests {
     #[test]
     fn test_sorting_32bit_keys() {
         let (_gpu, client) = crate::tensor::test_client();
-        let mut rng = rand::rng();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5EED_0004);
         let mut clustered = Vec::new();
         for i in 0..10000u32 {
             let start = rng.random_range(i..i + 150);

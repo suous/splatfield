@@ -65,7 +65,7 @@ pub(crate) fn lower_bound(ids: &[u32], n: u32, target: u32) -> u32 {
 }
 
 #[cube]
-fn gaussian_power(conic: layout::Vec3F, dx: f32, dy: f32) -> f32 {
+pub(crate) fn gaussian_power(conic: layout::Vec3F, dx: f32, dy: f32) -> f32 {
     0.5f32 * (conic.x * dx * dx + conic.z * dy * dy) + conic.y * dx * dy
 }
 
@@ -74,16 +74,34 @@ fn quantize_u8(v: f32) -> u32 {
     (v * 255.0).clamp(0.0, 255.0) as u32
 }
 
+/// Finalize the tile pipeline: walk each pixel's depth-sorted splat run.
+/// The RGB mode blends per-pixel colors into `bitmap`; the ε modes
+/// (`rgb = false`) accumulate each splat's rendering weight w = α·T
+/// instead — total responsibility into `resp`, or in evidence mode split
+/// by the mask bit into foreground/background pseudo-counts. One kernel
+/// for all modes: same traversal, cutoffs, and saturation early-exit, so
+/// ε sees exactly what the RGB image shows. Comptime-dead buffer args are
+/// not always dropped from the launch signature; dead slots alias the
+/// `tile_ids` input (buffer arg 0) — see `render::Splats::finalize`, the
+/// single launch site.
 #[cube(launch)]
 pub(crate) fn rasterize_kernel(
     img_size_x: u32,
     img_size_y: u32,
     row_stride: u32,
     num_isects: u32,
+    scale: f32,
     tile_ids: &[u32],
     gaussian_ids_by_tile: &[u32],
     projected: &[f32],
+    #[comptime] rgb: bool,
+    #[comptime] evidence: bool,
+    mask: &[u32],
+    mask_words_per_row: u32,
     bitmap: &mut [u32],
+    resp: &mut [Atomic<u32>],
+    fg: &mut [Atomic<u32>],
+    bg: &mut [Atomic<u32>],
 ) {
     let px = ABSOLUTE_POS_X;
     let py = ABSOLUTE_POS_Y;
@@ -126,6 +144,13 @@ pub(crate) fn rasterize_kernel(
     let pixel_x = px as f32 + 0.5f32;
     let pixel_y = py as f32 + 0.5f32;
 
+    // Loop-invariant per pixel; comptime-dead outside evidence mode,
+    // `in_bounds` guards edge tiles.
+    let mut inside = 0u32;
+    if evidence && in_bounds {
+        inside = (mask[(px / 32 + py * mask_words_per_row) as usize] >> (px % 32)) & 1u32;
+    }
+
     let num_chunks = (range_end - range_start).div_ceil(layout::TILE_SIZE);
     for c in 0..num_chunks {
         let chunk = range_start + c * layout::TILE_SIZE;
@@ -156,9 +181,6 @@ pub(crate) fn rasterize_kernel(
                     y: stage[base + 3],
                     z: stage[base + 4],
                 };
-                let color_r = stage[base + 5];
-                let color_g = stage[base + 6];
-                let color_b = stage[base + 7];
                 let color_a = stage[base + 8];
 
                 let power = gaussian_power(conic, mean_x - pixel_x, mean_y - pixel_y);
@@ -166,9 +188,27 @@ pub(crate) fn rasterize_kernel(
 
                 if alpha >= 1.0f32 / u8::MAX as f32 {
                     let vis = alpha * transmittance;
-                    pix_r += color_r * vis;
-                    pix_g += color_g * vis;
-                    pix_b += color_b * vis;
+                    if rgb {
+                        let color_r = stage[base + 5];
+                        let color_g = stage[base + 6];
+                        let color_b = stage[base + 7];
+                        pix_r += color_r * vis;
+                        pix_g += color_g * vis;
+                        pix_b += color_b * vis;
+                    } else {
+                        // w ≤ 1, so the fixed-point product always fits u32.
+                        let splat = gaussian_ids_by_tile[(chunk + j) as usize] as usize;
+                        let q = (vis * scale) as u32;
+                        if evidence {
+                            if inside == 1u32 {
+                                fg[splat].fetch_add(q);
+                            } else {
+                                bg[splat].fetch_add(q);
+                            }
+                        } else {
+                            resp[splat].fetch_add(q);
+                        }
+                    }
                     transmittance *= 1.0f32 - alpha;
                     // Remaining weight < 1 LSB of the final 8-bit channels.
                     if transmittance < 1.0f32 / 255.0f32 {
@@ -180,7 +220,7 @@ pub(crate) fn rasterize_kernel(
         }
     }
 
-    if in_bounds {
+    if rgb && in_bounds {
         let r = quantize_u8(pix_r);
         let g = quantize_u8(pix_g);
         let b = quantize_u8(pix_b);

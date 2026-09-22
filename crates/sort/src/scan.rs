@@ -278,12 +278,12 @@ fn scan_and_apply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::RngExt;
+    use rand::{RngExt, SeedableRng};
 
     #[test]
     fn test_scan_gather_matches_cpu() {
         let (_gpu, client) = crate::tensor::test_client();
-        let mut rng = rand::rng();
+        let mut rng = rand::rngs::StdRng::seed_from_u64(0x5EED_0005);
         for n in [1usize, 5, 1024, 1025, 100_000] {
             let counts: Vec<u32> = (0..n).map(|_| rng.random_range(0..20)).collect();
             // Random permutation as the gather indices.

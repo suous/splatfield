@@ -3,10 +3,10 @@ use crate::layout::{
     PLANE_SZ, PLANE_X, PLANE_Y, PLANE_Z,
 };
 use crate::render::CpuSplats;
-use anyhow::{Context, Result, anyhow, bail};
-use std::io::BufRead;
+use anyhow::{Context, Result, anyhow, bail, ensure};
+use std::io::{BufRead, BufWriter, Write};
 
-pub fn parse_ply(mut reader: impl BufRead) -> Result<CpuSplats> {
+pub(crate) fn parse_ply(mut reader: impl BufRead) -> Result<CpuSplats> {
     let mut vertex_count: usize = 0;
     let mut properties = Vec::new();
 
@@ -42,20 +42,15 @@ pub fn parse_ply(mut reader: impl BufRead) -> Result<CpuSplats> {
             .ok_or_else(|| anyhow!("Missing property: {name}"))
     };
 
-    let (idx_x, idx_y, idx_z) = (get_idx("x")?, get_idx("y")?, get_idx("z")?);
-    let (idx_s0, idx_s1, idx_s2) = (
-        get_idx("scale_0")?,
-        get_idx("scale_1")?,
-        get_idx("scale_2")?,
-    );
-    let idx_op = get_idx("opacity")?;
-    let (idx_r0, idx_r1, idx_r2, idx_r3) = (
-        get_idx("rot_0")?,
-        get_idx("rot_1")?,
-        get_idx("rot_2")?,
-        get_idx("rot_3")?,
-    );
-    let (idx_dc0, idx_dc1, idx_dc2) = (get_idx("f_dc_0")?, get_idx("f_dc_1")?, get_idx("f_dc_2")?);
+    // Checked left-to-right: the first missing name is the one reported.
+    #[rustfmt::skip]
+    let [idx_x, idx_y, idx_z, idx_s0, idx_s1, idx_s2, idx_op, idx_r0, idx_r1, idx_r2, idx_r3, idx_dc0, idx_dc1, idx_dc2] =
+        ["x", "y", "z", "scale_0", "scale_1", "scale_2", "opacity", "rot_0", "rot_1", "rot_2", "rot_3", "f_dc_0", "f_dc_1", "f_dc_2"]
+            .into_iter()
+            .map(get_idx)
+            .collect::<Result<Vec<_>>>()?
+            .try_into()
+            .unwrap();
 
     let mut rest_keys: Vec<(usize, usize)> = properties
         .iter()
@@ -114,6 +109,75 @@ pub fn parse_ply(mut reader: impl BufRead) -> Result<CpuSplats> {
         attributes,
         sh_coeffs: shs,
     })
+}
+
+impl CpuSplats {
+    /// Binary little-endian 3DGS PLY of this scene — the exact inverse of
+    /// `parse_ply`'s input contract: canonical INRIA property order, zero
+    /// normals, rot with w first, `f_rest` channel-major. The fields are
+    /// exactly what `parse_ply` produces: `attributes` field-major
+    /// [`ATTR_PLANES`] planes, `sh_coeffs` field-major 3·`k_per_ch` planes.
+    pub fn write_ply(&self, out: impl Write) -> Result<()> {
+        let n = self.count();
+        ensure!(n > 0, "no splats to write");
+        let k_per_ch = self.sh_coeffs.len() / (3 * n);
+        let attr = &self.attributes;
+        let sh = &self.sh_coeffs;
+        ensure!(attr.len() == n * ATTR_PLANES);
+        ensure!(sh.len() == n * k_per_ch * 3);
+        ensure!(k_per_ch > 0);
+        let rest = (k_per_ch - 1) * 3;
+        let floats = 17 + rest; // xyz nnn dc3 rest op1 scale3 rot4
+
+        let mut props = Vec::from(
+            [
+                "x", "y", "z", "nx", "ny", "nz", "f_dc_0", "f_dc_1", "f_dc_2",
+            ]
+            .map(String::from),
+        );
+        props.extend((0..rest).map(|j| format!("f_rest_{j}")));
+        props.extend(
+            [
+                "opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3",
+            ]
+            .map(String::from),
+        );
+        let mut header = String::with_capacity(1024 + rest * 24);
+        header.push_str("ply\nformat binary_little_endian 1.0\nelement vertex ");
+        header.push_str(&n.to_string());
+        header.push('\n');
+        header.extend(props.iter().map(|p| format!("property float {p}\n")));
+        header.push_str("end_header\n");
+
+        let mut out = BufWriter::new(out);
+        out.write_all(header.as_bytes())?;
+        let mut row = vec![0f32; floats];
+        for i in 0..n {
+            let a = |plane: usize| attr[plane * n + i];
+            row[0] = a(PLANE_X);
+            row[1] = a(PLANE_Y);
+            row[2] = a(PLANE_Z);
+            row[3..6].fill(0.0);
+            row[6] = sh[i];
+            row[7] = sh[n + i];
+            row[8] = sh[2 * n + i];
+            for j in 0..rest {
+                let (c, coef) = (j / (rest / 3), j % (rest / 3));
+                row[9 + j] = sh[((coef + 1) * 3 + c) * n + i];
+            }
+            row[9 + rest] = a(PLANE_OPACITY);
+            row[10 + rest] = a(PLANE_SX);
+            row[11 + rest] = a(PLANE_SY);
+            row[12 + rest] = a(PLANE_SZ);
+            row[13 + rest] = a(PLANE_QW);
+            row[14 + rest] = a(PLANE_QX);
+            row[15 + rest] = a(PLANE_QY);
+            row[16 + rest] = a(PLANE_QZ);
+            out.write_all(bytemuck::cast_slice(&row))?;
+        }
+        out.flush()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -221,5 +285,38 @@ mod tests {
             .into_bytes();
         let err = parse_ply(&bytes[..]).unwrap_err().to_string();
         assert!(err.contains("Unsupported property type"), "{err}");
+    }
+
+    /// Writer→parser roundtrip: a written file parses back to the exact
+    /// planes, for every SH degree in use. Rotation must be stored
+    /// normalized — parse re-normalizes on read.
+    #[test]
+    fn test_write_ply_roundtrips_parse() {
+        for k_per_ch in [1, 3] {
+            let n = 3usize;
+            let mut attr = vec![0f32; n * ATTR_PLANES];
+            for (i, a) in attr.iter_mut().enumerate() {
+                *a = ((i * 7 % 23) as f32 - 11.0) / 8.0;
+            }
+            for i in 0..n {
+                attr[PLANE_QW * n + i] = 1.0;
+                attr[PLANE_QX * n + i] = 0.0;
+                attr[PLANE_QY * n + i] = 0.0;
+                attr[PLANE_QZ * n + i] = 0.0;
+            }
+            let sh: Vec<f32> = (0..n * k_per_ch * 3)
+                .map(|i| i as f32 * 0.25 - 9.0)
+                .collect();
+
+            let scene = CpuSplats {
+                attributes: attr,
+                sh_coeffs: sh,
+            };
+            let mut bytes = Vec::new();
+            scene.write_ply(&mut bytes).unwrap();
+            let cpu = parse_ply(&bytes[..]).unwrap();
+            assert_eq!(cpu.attributes, scene.attributes);
+            assert_eq!(cpu.sh_coeffs, scene.sh_coeffs);
+        }
     }
 }

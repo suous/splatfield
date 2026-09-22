@@ -24,7 +24,7 @@ GPU-accelerated Gaussian Splatting renderer. egui GUI loads PLY files via drag-a
 GPU kernel passes per frame:
 
 1. **Project** — 3D→2D projection, covariance, SH color, per-splat tile counts + bbox
-2. **Depth sort** — radix sort by depth (`sort::radix_argsort_with`)
+2. **Depth sort** — radix sort by depth (`splat_sort::RadixScratch::argsort`)
 3. **Scan** — prefix-sum tile counts in depth order (`scan::exclusive_scan_gather`)
 4. **Map** — emit intersections at scan offsets, pre-sorted by depth
 5. **Tile sort** — stable radix sort by tile; stability preserves depth order in-tile
@@ -37,7 +37,7 @@ GPU kernel passes per frame:
 | `attributes` | `[n, 11]` | field-major planes `x, y, z, qw, qx, qy, qz, sx, sy, sz, opacity` — plane k of splat i at `k * n + i` (warp-coalesced reads) |
 | `sh_coeffs` | `[n, channels, 3]` | field-major SH: coefficient k channel c of splat i at `(k * 3 + c) * n + i` |
 | `projected` | `[n, 9]` | `mean2d_xy, conic_xyz, rgb, opacity` |
-| output | `[h, w]` | packed `u32` RGBA8 |
+| output | `[h, row_stride]` | packed `u32` RGBA8; `row_stride = (w * 4).next_multiple_of(256) / 4` (256-byte-aligned rows for wgpu copy) |
 
 ### GPU Compute
 

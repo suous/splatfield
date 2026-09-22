@@ -73,3 +73,5 @@ jobs:
         with:
           files: artifacts/*
           generate_release_notes: true
+          # rc/beta tags (v0.2.0-rc.1) publish as prerelease; plain tags (v0.2.0) as stable
+          prerelease: ${{ contains(github.ref, '-') }}

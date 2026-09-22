@@ -78,10 +78,8 @@ fn codebook<'a>(cb: &'a [f32], what: &str) -> Result<&'a [f32; 256]> {
 }
 
 fn unpack_quat(px: u8, py: u8, pz: u8, tag: u8) -> [f32; 4] {
-    let sqrt2 = core::f32::consts::SQRT_2;
-    let a = (px as f32 / u8::MAX as f32 * 2.0 - 1.0) / sqrt2;
-    let b = (py as f32 / u8::MAX as f32 * 2.0 - 1.0) / sqrt2;
-    let c = (pz as f32 / u8::MAX as f32 * 2.0 - 1.0) / sqrt2;
+    let u = |v: u8| (v as f32 / u8::MAX as f32 * 2.0 - 1.0) / core::f32::consts::SQRT_2;
+    let (a, b, c) = (u(px), u(py), u(pz));
     let d = (1.0 - a * a - b * b - c * c).max(0.0).sqrt();
     match tag {
         252 => [d, a, b, c],
@@ -240,7 +238,12 @@ mod tests {
             "data/bear.3d71a266_sh1.sog",
             "data/bear.3d71a266_sh2.sog",
         ];
-        if !std::path::Path::new(files[0]).exists() {
+        if !files.iter().all(|f| std::path::Path::new(f).exists()) {
+            if std::env::var_os("SPLATFIELD_ALLOW_MISSING_ASSETS").is_none() {
+                panic!(
+                    "missing sog fixtures {files:?} — this test is the only parse_sog coverage; set SPLATFIELD_ALLOW_MISSING_ASSETS=1 to skip"
+                );
+            }
             eprintln!("skipping: no sog fixtures");
             return;
         }

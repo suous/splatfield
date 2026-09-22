@@ -22,7 +22,7 @@ impl Camera {
     /// Reference fov every `fit_fov` derives from. The fit must never evolve
     /// the previous frame's `fov`: both branches only grow one axis, so
     /// in-place fitting ratchets the fov wider on every aspect reversal.
-    const BASE_FOV: Vec2 = Vec2::splat(0.8);
+    pub(crate) const BASE_FOV: Vec2 = Vec2::splat(0.8);
 
     pub fn fit_fov(&mut self, pixel_size: UVec2) {
         let tan = (Self::BASE_FOV * 0.5).map(f32::tan);
@@ -39,7 +39,7 @@ impl Camera {
         img_size.as_vec2() * 0.5 / (self.fov * 0.5).map(f32::tan)
     }
 
-    pub fn w2c(&self) -> Affine3A {
+    pub(crate) fn w2c(&self) -> Affine3A {
         Affine3A::from_rotation_translation(self.rotation, self.position).inverse()
     }
 
@@ -51,6 +51,32 @@ impl Camera {
         self.rotation = Quat::from_rotation_x(-core::f32::consts::FRAC_PI_2);
         d
     }
+
+    /// A camera at `position` facing `target` (the frame looks along local +Z,
+    /// via the minimal arc from +Z) with the reference fov.
+    pub(crate) fn look_at(position: Vec3, target: Vec3) -> Self {
+        Self {
+            position,
+            rotation: Quat::from_rotation_arc(Vec3::Z, (target - position).normalize()),
+            fov: Self::BASE_FOV,
+        }
+    }
+}
+
+/// Project a world point into `camera`'s normalized uv at render resolution
+/// `img` — the inverse of the renderer's ray convention (screen =
+/// focal·cam.xy/cam.z + size/2). None when the point is behind the camera
+/// or outside the frame.
+pub(crate) fn guide_point(camera: &Camera, point: Vec3, img: UVec2) -> Option<Vec2> {
+    let q = camera.w2c().transform_point3(point);
+    if q.z <= 0.0 {
+        return None;
+    }
+    let f = camera.focal(img);
+    let c = img.as_vec2() * 0.5;
+    // Exact inverse of the (px + 0.5 − c)/f ray convention.
+    let uv = Vec2::new(q.x / q.z * f.x + c.x - 0.5, q.y / q.z * f.y + c.y - 0.5) / img.as_vec2();
+    (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0).then_some(uv)
 }
 
 pub struct Controller {
@@ -72,8 +98,10 @@ impl Controller {
         self.focus_distance = self.camera.frame_bounds(bounds);
     }
 
-    /// Apply one frame of input. Returns whether the camera actually moved —
-    /// the caller skips re-rendering otherwise.
+    /// Apply one frame of input: primary drag orbits, middle/secondary
+    /// (or ctrl+primary) pans, scroll/touch pinches zoom. Shift+primary
+    /// drag is left to the caller (box-select). Returns whether the
+    /// camera actually moved — the caller skips re-rendering otherwise.
     pub fn tick(&mut self, response: &Response, ui: &egui::Ui) -> bool {
         let (touch, mods, pointer_delta, scroll, translation) = ui.input(|i| {
             (
@@ -89,10 +117,12 @@ impl Controller {
             && (response.dragged_by(PointerButton::Middle)
                 || response.dragged_by(PointerButton::Secondary)
                 || response.dragged_by(PointerButton::Primary) && mods.ctrl);
-        let is_orbit = !t && response.dragged_by(PointerButton::Primary) && !is_pan;
+        let is_orbit = !t && response.dragged_by(PointerButton::Primary) && !is_pan && !mods.shift;
 
         if response.hovered() {
-            ui.set_cursor_icon(if mods.ctrl || is_pan {
+            ui.set_cursor_icon(if mods.shift {
+                CursorIcon::Crosshair
+            } else if mods.ctrl || is_pan {
                 CursorIcon::Move
             } else {
                 CursorIcon::PointingHand
@@ -137,6 +167,10 @@ impl Controller {
 mod tests {
     use super::*;
 
+    fn close(a: Vec2, b: Vec2) -> bool {
+        (a - b).abs().max_element() < 1e-5
+    }
+
     /// Aspect round trips must not drift the fov: deriving from the previous
     /// frame's value ratcheted both axes wider per reversal, shrinking and
     /// radially warping the model with each resize until restart.
@@ -156,5 +190,44 @@ mod tests {
         camera.fit_fov(glam::uvec2(1600, 1000));
         let focal = camera.focal(glam::uvec2(1600, 1000));
         assert!((focal.x - focal.y).abs() < 1e-3);
+    }
+
+    #[test]
+    fn test_guide_point_centers_on_optical_axis() {
+        let cam = Camera::default();
+        let uv = guide_point(&cam, Vec3::new(0.0, 0.0, 5.0), UVec2::splat(512)).unwrap();
+        // The grid center sits at pixel res/2 − 0.5 under the ray convention.
+        assert!(close(uv, Vec2::splat(0.5 - 0.5 / 512.0)), "{uv}");
+    }
+
+    #[test]
+    fn test_guide_point_roundtrips_through_ray_convention() {
+        // A guide point regenerated through the renderer's ray convention
+        // must pass through the original world point.
+        let cam = Camera {
+            position: Vec3::new(3.0, -2.0, 7.0),
+            rotation: Quat::from_rotation_arc(Vec3::Z, Vec3::new(-0.3, 0.4, 1.0).normalize()),
+            ..Camera::default()
+        };
+        let res = 512;
+        // Just off-axis, comfortably inside the 0.8 rad fov.
+        let p = cam.position + cam.rotation * Vec3::Z * 8.0 + Vec3::new(0.5, 0.3, 0.0);
+        let uv = guide_point(&cam, p, UVec2::splat(res)).unwrap() * res as f32;
+
+        let f = cam.focal(UVec2::splat(res));
+        let c = res as f32 * 0.5;
+        let dir = cam.rotation
+            * glam::Vec3::new((uv.x + 0.5 - c) / f.x, (uv.y + 0.5 - c) / f.y, 1.0).normalize();
+        // Distance from point p to the ray origin + t * dir.
+        let t = (p - cam.position).dot(dir);
+        let closest = cam.position + dir * t;
+        assert!((closest - p).length() < 1e-3, "{closest} vs {p}");
+    }
+
+    #[test]
+    fn test_guide_point_rejects_behind_and_off_frame() {
+        let cam = Camera::default();
+        assert!(guide_point(&cam, Vec3::new(0.0, 0.0, -5.0), UVec2::splat(512)).is_none());
+        assert!(guide_point(&cam, Vec3::new(100.0, 0.0, 5.0), UVec2::splat(512)).is_none());
     }
 }

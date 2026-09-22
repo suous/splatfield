@@ -1,8 +1,8 @@
 [workspace]
-members = ["crates/sort"]
+members = ["crates/sort", "crates/gsam"]
 
 [workspace.package]
-version = "0.1.4"
+version = "0.2.0"
 edition = "2024"
 
 [workspace.dependencies]
@@ -13,6 +13,9 @@ edition = "2024"
 # rasterizer's per-tile intersection ranges.
 cubecl = { version = "=0.11.0-pre.3", default-features = false, features = ["wgpu", "exclusive-memory-only"] }
 bytemuck = "1.25"
+anyhow = "1.0.104"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 rand = "0.10"
 criterion = "0.8"
 
@@ -23,18 +26,41 @@ edition.workspace = true
 
 [dependencies]
 cubecl.workspace = true
+# Direct dep (also transitively pinned by cubecl) for the stream-policy API.
+cubecl-environment = "=0.11.0-pre.3"
 bytemuck.workspace = true
 glam = "0.33"
-anyhow = "1.0.104"
+anyhow.workspace = true
 image = { version = "0.25", default-features = false, features = ["webp"] }
 zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-eframe = { version = "0.36", default-features = false, features = ["default_fonts", "wgpu", "x11", "wayland"] }
+serde.workspace = true
+serde_json.workspace = true
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "links", "wgpu", "x11", "wayland"] }
 splat-sort = { path = "crates/sort" }
+
+# First-run oracle model fetch (fetch module): one release-zip download into
+# the gsam cache.
+ureq = "3"
+# Install-time integrity: the cache files' SHA-256 pins are verified during
+# extraction (fetch module); not re-hashed on launch.
+sha2 = "0.10"
+
+# The `splatfield seg` subcommand's argument parsing.
+clap = { version = "4", features = ["derive"] }
+
+# Text-prompted 2D segmentation (B3-Seg): GroundingDINO detection -> SAM2 box
+# decode on ONNX Runtime (CPU). See crates/gsam/ for the model contract.
+gsam = { path = "crates/gsam" }
 
 [dev-dependencies]
 criterion.workspace = true
+# oracle_smoke_on_bus decodes data/bus.jpg; no production path decodes JPEG.
+image = { version = "0.25", default-features = false, features = ["jpeg"] }
+# seg's Beta-Bernoulli tests sample Beta posteriors; baseline doesn't need it.
+rand.workspace = true
+# GPU tests share the sort crate's serialized test client; the test-utils
+# feature keeps it out of production builds.
+splat-sort = { path = "crates/sort", features = ["test-utils"] }
 
 [[bench]]
 name = "render_frame"

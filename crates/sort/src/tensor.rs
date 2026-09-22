@@ -6,13 +6,13 @@ use cubecl::zspace::Shape;
 /// Serializes GPU-touching tests: concurrent clients share one physical GPU,
 /// and the memory pressure makes pool-reclaim–sensitive assertions (memory
 /// accounting) flaky. CPU-only tests don't take this lock.
-#[cfg(test)]
-pub(crate) static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+#[cfg(any(test, feature = "test-utils"))]
+pub static GPU_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Lock the GPU and hand back a client on the shared test device. Hold the
 /// guard for the whole test body.
-#[cfg(test)]
-pub(crate) fn test_client() -> (
+#[cfg(any(test, feature = "test-utils"))]
+pub fn test_client() -> (
     std::sync::MutexGuard<'static, ()>,
     ComputeClient<WgpuRuntime>,
 ) {

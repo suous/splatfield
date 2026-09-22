@@ -3,6 +3,11 @@ name = "splat-sort"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Test-only GPU test client for workspace crates' test builds — gated out of
+# production builds.
+test-utils = []
+
 [dependencies]
 cubecl.workspace = true
 bytemuck.workspace = true

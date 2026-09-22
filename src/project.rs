@@ -326,7 +326,13 @@ pub(crate) fn project_splats(
     packed_bbox[pack + 1] = bb.max_x | (bb.max_y << 16u32);
 }
 
-const SH_C0: f32 = 0.282_094_8_f32;
+pub(crate) const SH_C0: f32 = 0.282_094_8_f32;
+
+/// Display color → SH DC coefficient: rgb = C0·f_dc + 0.5 — the palette
+/// conversion shared by the GUI's tints and the seg tests.
+pub fn to_dc(color: [f32; 3]) -> [f32; 3] {
+    color.map(|c| (c - 0.5) / SH_C0)
+}
 const SH_C1: f32 = 0.488_602_52_f32;
 const SH_C2_0: f32 = 0.946_174_7_f32;
 const SH_C2_1: f32 = 0.315_391_57_f32;

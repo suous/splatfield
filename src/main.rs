@@ -1,39 +1,44 @@
+mod scene;
+mod ui;
+mod worker;
+
 use std::sync::{Arc, Mutex};
 
-use anyhow::Context;
-
-use cubecl::wgpu::{RuntimeOptions, WgpuRuntime, WgpuSetup, init_device};
+use cubecl::wgpu::{MemoryConfiguration, RuntimeOptions, WgpuRuntime, WgpuSetup, init_device};
 use cubecl::{Runtime, client::ComputeClient};
-use eframe::egui::{self, Color32, Rect};
+use eframe::egui;
 use eframe::wgpu;
-use splatfield::{camera, ply, render, sog, texture};
+use splat_sort::tensor::GpuTensor;
+use splatfield::{camera, render, texture};
 
-const UV_RECT: Rect = Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0));
+use scene::{FrameGpu, Loaded};
+use worker::SegUi;
 
-/// The loaded model plus its "reframe the camera" flag under one lock: the
-/// loader callback and the UI thread coordinate through this alone.
-#[derive(Default)]
-struct Loaded {
-    splats: Option<Arc<render::Splats>>,
-    reframe: bool,
-}
-
-/// GPU frame state: the presentation texture and the per-frame scratch
-/// (built on first use, reused every frame after).
-struct FrameGpu {
-    backbuffer: texture::GpuTexture,
-    scratch: Option<render::RenderScratch>,
-}
+/// Selection highlight color: the box overlay and the selected splats' tint.
+const SELECT_GREEN: [u8; 3] = [0x30, 0xff, 0x55];
 
 struct App {
     gpu: FrameGpu,
     controller: camera::Controller,
     client: ComputeClient<WgpuRuntime>,
     splats: Arc<Mutex<Loaded>>,
+    seg: SegUi,
+    /// Palette index for the next segmentation's color.
+    next_color: usize,
+    /// Selected splats (ascending, current display numbering) and the
+    /// box-select edit state: the removed-set in master numbering plus the
+    /// undo stack — one (prior removed-set, cut's DC colors) level per edit,
+    /// popped last-action-first.
+    sel: Vec<usize>,
+    removed: Vec<usize>,
+    undo: Vec<(Vec<usize>, Option<GpuTensor>)>,
     // What the backbuffer currently shows: the frame size and the model it
     // was rendered from (the camera is implied — it only moves through
-    // Controller::tick, which reports moves).
+    // Controller::tick, which reports moves). In-place GPU mutations that a
+    // fresh Arc can't cover — the segmentation tint, posterior updates,
+    // heatmap/reset toggles — go through paint_dirty instead.
     rendered: Option<(glam::UVec2, Arc<render::Splats>)>,
+    paint_dirty: bool,
 }
 
 fn wgpu_config() -> eframe::egui_wgpu::WgpuConfiguration {
@@ -56,21 +61,15 @@ fn wgpu_config() -> eframe::egui_wgpu::WgpuConfiguration {
     }
 }
 
-enum SplatFormat {
-    Ply,
-    Sog,
-}
-
-fn splat_format(path: &std::path::Path) -> Option<SplatFormat> {
-    match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
-        "ply" => Some(SplatFormat::Ply),
-        "sog" => Some(SplatFormat::Sog),
-        _ => None,
-    }
-}
-
 impl App {
     fn new(cc: &eframe::CreationContext) -> Self {
+        // Stick to dark: the 3D viewport renders on black, and a light-mode
+        // OS shouldn't flip the panel on top of it.
+        cc.egui_ctx.set_theme(egui::Theme::Dark);
+        // One ordered submission stream: the segmentation worker and the UI
+        // thread share GPU buffers (tint, posterior), and cubecl's default
+        // per-thread streams don't order against each other.
+        splatfield::use_single_stream();
         let render_state = cc.wgpu_render_state.as_ref().expect("Must use wgpu");
         let device = init_device(
             WgpuSetup {
@@ -82,7 +81,7 @@ impl App {
             },
             RuntimeOptions {
                 tasks_max: 64,
-                ..Default::default()
+                memory_config: MemoryConfiguration::ExclusivePages,
             },
         );
 
@@ -99,134 +98,33 @@ impl App {
             controller: camera::Controller::default(),
             client: WgpuRuntime::client(&device),
             splats: Arc::new(Mutex::new(Loaded::default())),
+            seg: SegUi::default(),
+            next_color: 0,
+            sel: Vec::new(),
+            removed: Vec::new(),
+            undo: Vec::new(),
             rendered: None,
+            paint_dirty: false,
         }
-    }
-
-    fn load_dropped(&self, file: egui::DroppedFileHandle, format: SplatFormat, ctx: egui::Context) {
-        let client = self.client.clone();
-        let splats = Arc::clone(&self.splats);
-
-        let load = move |reader| -> anyhow::Result<render::Splats> {
-            let cpu = match format {
-                SplatFormat::Sog => sog::parse_sog(reader)?,
-                SplatFormat::Ply => ply::parse_ply(reader)?,
-            };
-            Ok(cpu.upload(&client))
-        };
-
-        let on_loaded = move |result: anyhow::Result<render::Splats>| match result {
-            Ok(data) => {
-                let mut slot = splats.lock().unwrap();
-                slot.splats = Some(Arc::new(data));
-                slot.reframe = true;
-                drop(slot);
-                ctx.request_repaint();
-            }
-            Err(e) => eprintln!("Failed to load splat: {e:#}"),
-        };
-
-        let path = file.path().to_owned();
-        std::thread::spawn(move || {
-            on_loaded(
-                std::fs::File::open(&path)
-                    .with_context(|| format!("Failed to open {path:?}"))
-                    .and_then(|f| load(std::io::BufReader::new(f))),
-            );
-        });
     }
 }
 
-/// Render `splats` into the frame's scratch and present the bitmap to the
-/// backbuffer; the pipeline syncs on the counters readback, on the UI thread.
-fn render_frame(
-    client: &ComputeClient<WgpuRuntime>,
-    frame: &mut FrameGpu,
-    splats: &render::Splats,
-    camera: &camera::Camera,
-    pixel: glam::UVec2,
-) {
-    let img = splats.render_with(
-        frame.scratch.get_or_insert_with(|| {
-            render::RenderScratch::new(client, splats.attributes.shape[0], pixel)
-        }),
-        camera,
-        pixel,
-    );
-    frame.backbuffer.update_texture(&img, pixel);
-}
-
-impl eframe::App for App {
-    fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
-        let dropped = ui.input(|i| {
-            i.raw
-                .dropped_files
-                .iter()
-                .find_map(|f| splat_format(f.path()).map(|format| (f.clone(), format)))
-        });
-        if let Some((file, format)) = dropped {
-            self.load_dropped(file, format, ui.ctx().clone());
-        }
-
-        let mut slot = self.splats.lock().unwrap();
-        if slot.reframe
-            && let Some(s) = &slot.splats
-        {
-            self.controller.frame_bounds(s.bounds);
-            slot.reframe = false;
-        }
-        let Some(splats) = slot.splats.clone() else {
-            ui.centered_and_justified(|ui| ui.heading("Drag and drop a .ply or .sog file"));
-            return;
-        };
-        drop(slot);
-
-        let size = ui.available_size();
-        let (rect, response) = ui.allocate_exact_size(size, egui::Sense::drag());
-        let pixel = (glam::vec2(size.x, size.y) * ui.pixels_per_point()).as_uvec2();
-
-        // Below ~8px the aspect is 0/0: fit_fov would poison the camera with
-        // NaN for every later frame, so skip input + render entirely.
-        if pixel.x > 8 && pixel.y > 8 {
-            let moved = self.controller.tick(&response, ui);
-            self.controller.camera.fit_fov(pixel);
-
-            // A camera-neutral event (e.g. a bare click) would re-run the
-            // whole ~30-launch pipeline only to repaint an identical bitmap —
-            // skip it. Any load brings a fresh Arc, so pointer inequality
-            // covers reframes too.
-            let stale = moved
-                || self.rendered.as_ref().is_none_or(|(last_px, last_splats)| {
-                    *last_px != pixel || !Arc::ptr_eq(last_splats, &splats)
-                });
-            if stale {
-                render_frame(
-                    &self.client,
-                    &mut self.gpu,
-                    &splats,
-                    &self.controller.camera,
-                    pixel,
-                );
-                self.rendered = Some((pixel, Arc::clone(&splats)));
-            }
-        }
-
-        ui.painter().image(
-            self.gpu.backbuffer.texture_id(),
-            rect,
-            UV_RECT,
-            Color32::WHITE,
-        );
+fn main() -> std::process::ExitCode {
+    if std::env::args().nth(1).as_deref() == Some("seg") {
+        return splatfield::cli::run(std::env::args().skip(2));
     }
-}
-
-fn main() -> eframe::Result<()> {
-    eframe::run_native(
+    match eframe::run_native(
         "SplatField",
         eframe::NativeOptions {
             wgpu_options: wgpu_config(),
             ..Default::default()
         },
         Box::new(|cc| Ok(Box::new(App::new(cc)))),
-    )
+    ) {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("splatfield: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
 }

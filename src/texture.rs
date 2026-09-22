@@ -1,20 +1,22 @@
 use std::sync::Arc;
 
-use splat_sort::tensor::GpuTensor;
 use eframe::egui::{TextureId, epaint::mutex::RwLock};
 use eframe::egui_wgpu::Renderer;
 use eframe::wgpu;
+use splat_sort::tensor::GpuTensor;
 
 pub struct GpuTexture {
     device: wgpu::Device,
     queue: wgpu::Queue,
     renderer: Arc<RwLock<Renderer>>,
     texture: wgpu::Texture,
-    id: TextureId,
+    /// The egui registration — `recreate_texture` reuses it so egui's
+    /// texture set doesn't grow across resizes.
+    pub id: TextureId,
 }
 
 impl GpuTexture {
-    /// Registers a zero-initialized 1×1 texture: wgpu zeroes new buffers, so
+    /// Registers a zero-initialized 1×1 texture: wgpu zeroes new textures, so
     /// the placeholder paints fully transparent until the first render.
     pub fn new(renderer: Arc<RwLock<Renderer>>, device: wgpu::Device, queue: wgpu::Queue) -> Self {
         let texture = Self::create_texture(&device, glam::UVec2::ONE);
@@ -29,10 +31,6 @@ impl GpuTexture {
             texture,
             id,
         }
-    }
-
-    pub fn texture_id(&self) -> TextureId {
-        self.id
     }
 
     pub fn update_texture(&mut self, img: &GpuTensor, size: glam::UVec2) {

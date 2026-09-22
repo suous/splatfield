@@ -21,6 +21,11 @@ fn make_data(n: usize, dist: &str) -> Vec<u32> {
         "random" => (0..n).map(|_| rng.random::<u32>()).collect(),
         "sequential" => (0..n as u32).collect(),
         "reverse" => (0..n).map(|i| n as u32 - 1 - i as u32).collect(),
+        // Depth-like keys: positive f32 bit patterns in a bounded z range,
+        // so the high digits are near-constant like the render pipeline's.
+        "depth" => (0..n)
+            .map(|_| (rng.random::<f32>() * 999.9 + 0.1).to_bits())
+            .collect(),
         _ => panic!("unknown distribution: {dist}"),
     }
 }
@@ -52,6 +57,7 @@ fn bench_sort(
     vals: &GpuTensor,
     scratch: &RadixScratch,
     bits: u32,
+    write_keys: bool,
 ) {
     let n = keys.shape[0];
     group.throughput(Throughput::Elements(n as u64));
@@ -68,7 +74,7 @@ fn bench_sort(
             let start = std::time::Instant::now();
             for i in 0..iters {
                 let s = if i % 2 == 0 { scratch } else { &scratch_b };
-                let (nk, nv) = s.argsort(black_box(&k), black_box(&v), n as u32, bits, true);
+                let (nk, nv) = s.argsort(black_box(&k), black_box(&v), n as u32, bits, write_keys);
                 k = nk;
                 v = nv;
             }
@@ -80,12 +86,25 @@ fn bench_sort(
 
 /// One criterion group over a shared client; each case is
 /// (benchmark id, element count, key distribution, key bits).
-fn bench_sweep(c: &mut Criterion, name: &str, cases: Vec<(BenchmarkId, usize, &'static str, u32)>) {
+fn bench_sweep(
+    c: &mut Criterion,
+    name: &str,
+    cases: Vec<(BenchmarkId, usize, &'static str, u32)>,
+    write_keys: bool,
+) {
     let client = cubecl::wgpu::WgpuRuntime::client(&Default::default());
     let mut group = bench_group(c, name);
     for (id, n, dist, bits) in &cases {
         let (keys, vals, scratch) = sort_fixture(&client, *n, dist);
-        bench_sort(&mut group, id.clone(), &keys, &vals, &scratch, *bits);
+        bench_sort(
+            &mut group,
+            id.clone(),
+            &keys,
+            &vals,
+            &scratch,
+            *bits,
+            write_keys,
+        );
     }
     group.finish();
 }
@@ -98,6 +117,7 @@ fn bench_size_sweep(c: &mut Criterion) {
             .iter()
             .map(|&n| (BenchmarkId::from_parameter(n), n, "random", 32))
             .collect(),
+        true,
     );
 }
 
@@ -108,6 +128,7 @@ fn bench_bits_sweep(c: &mut Criterion) {
         [4u32, 8, 12, 16, 20, 24, 28, 32]
             .map(|bits| (BenchmarkId::from_parameter(bits), 1_000_000, "random", bits))
             .to_vec(),
+        true,
     );
 }
 
@@ -118,6 +139,20 @@ fn bench_distribution(c: &mut Criterion) {
         ["random", "sequential", "reverse"]
             .map(|d| (BenchmarkId::from_parameter(d), 1_000_000, d, 32))
             .to_vec(),
+        true,
+    );
+}
+
+/// Values-only mode at depth-like keys — the render pipeline's depth sort
+/// (write_keys=false), whose per-pass traffic the key-writing sweeps miss.
+fn bench_values_only(c: &mut Criterion) {
+    bench_sweep(
+        c,
+        "radix_argsort/values_only",
+        [1_000_000usize, 5_000_000]
+            .map(|n| (BenchmarkId::from_parameter(n), n, "depth", 32))
+            .to_vec(),
+        false,
     );
 }
 
@@ -150,6 +185,7 @@ criterion_group!(
     bench_size_sweep,
     bench_bits_sweep,
     bench_distribution,
+    bench_values_only,
     bench_end_to_end
 );
 criterion_main!(benches);
