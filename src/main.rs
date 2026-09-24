@@ -71,6 +71,13 @@ impl App {
         // per-thread streams don't order against each other.
         splatfield::use_single_stream();
         let render_state = cc.wgpu_render_state.as_ref().expect("Must use wgpu");
+        // wgpu's default uncaptured-error handler panics; device-loss isn't
+        // even observable without one. Log instead — a lost/OOM device then
+        // shows up as an explanatory stderr line instead of a downstream
+        // egui staging-buffer panic with misleading size numbers.
+        render_state.device.on_uncaptured_error(Arc::new(|err| {
+            eprintln!("splatfield: wgpu device error: {err}");
+        }));
         let device = init_device(
             WgpuSetup {
                 instance: render_state.instance.clone(),

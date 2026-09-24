@@ -42,7 +42,10 @@ pub fn run_text(
     crate::fetch::ensure_models(on_progress)?;
     // The sensor closure bakes the prompt in — `Detector::load` tokenizes
     // and fixes it, so one target description serves the whole run.
+    // Session creation is tens of seconds of silent ONNX work; announce it.
+    on_progress("loading GroundingDINO (detector)…");
     let mut detector = Detector::load(prompt)?;
+    on_progress("loading SAM2…");
     let mut sam = Sam2::load()?;
     // GroundingDINO localizes the target in the view and the best-confidence
     // box prompts one SAM2 decode; nothing found means an all-background mask
@@ -97,6 +100,7 @@ mod tests {
         }
 
         let mut sam = Sam2::load().unwrap();
+        eprintln!("sam2 loaded");
         let image = image::ImageReader::open(asset)
             .unwrap()
             .with_guessed_format()
@@ -107,9 +111,11 @@ mod tests {
         let (w, h) = (image.width(), image.height());
         let rgb = image.as_raw();
         let total = (w * h) as usize;
+        eprintln!("image {w}x{h}, running sam2 segment");
         let mask = sam
             .segment(rgb, w, h, &[0.0, 0.0, w as f32 * 0.4, h as f32])
             .unwrap();
+        eprintln!("segment done");
         let frac = mask.iter().filter(|&&b| b == 255).count() as f64 / total as f64;
         eprintln!("box prompt (left 40%): {:.2}%", frac * 100.0);
         assert!(

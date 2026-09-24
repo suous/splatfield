@@ -19,10 +19,15 @@ pub(crate) fn build(path: &std::path::Path, level: GraphOptimizationLevel) -> Re
     // worker while the app must stay interactive. Inter-op parallelism
     // barely helps these sequential graphs - one intra-op pool is the
     // documented pattern.
+    //
+    // The pool is also capped: at full width on many-core hybrid CPUs the
+    // quantized encoder graphs access-violate inside ORT's threaded kernels
+    // (reproduced on a 24-core Core Ultra 9 275HX: 16 threads pass, 22
+    // segfault; 8 is as fast as 16 on that machine, so cap there).
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
-    builder = builder.with_intra_threads(threads.saturating_sub(2).max(1))?;
+    builder = builder.with_intra_threads(threads.saturating_sub(2).clamp(1, 8))?;
     builder = builder.with_inter_threads(1)?;
     Ok(builder.commit_from_file(path)?)
 }

@@ -79,8 +79,10 @@ fn keep_indices(labels: &[bool]) -> Vec<usize> {
 
 fn segment(a: Args) -> Result<()> {
     crate::use_single_stream();
+    eprintln!("splatfield: initializing GPU…");
     let client = WgpuRuntime::client(&cubecl::wgpu::WgpuDevice::default());
 
+    eprintln!("splatfield: loading {}…", a.input);
     let cpu = if a.input == "-" {
         ply::parse_ply(std::io::stdin().lock()).context("reading stdin")?
     } else {
@@ -88,6 +90,7 @@ fn segment(a: Args) -> Result<()> {
             .with_context(|| format!("parsing {}", a.input))?
     };
     let total = cpu.count();
+    eprintln!("splatfield: uploading {total} splats to GPU…");
     let splats = std::sync::Arc::new(cpu.clone().upload(&client));
 
     // The paper's bootstrap observation: one canonical view of the whole
