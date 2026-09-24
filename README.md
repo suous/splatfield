@@ -23,7 +23,7 @@ Built to learn the details of [3D Gaussian Splatting](https://arxiv.org/abs/2308
 
 ## How to use
 
-1. Grab a native binary from [Releases](https://github.com/suous/splatfield/releases/tag/v0.2.0-rc.1) — Windows, Linux, macOS (Apple Silicon).
+1. Grab a native binary from [Releases](https://github.com/suous/splatfield/releases/tag/v0.2.0-rc.2) — Windows, Linux, macOS (Apple Silicon).
 2. Run it:
 
    ```sh
