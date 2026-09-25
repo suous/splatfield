@@ -59,6 +59,39 @@ impl App {
         let mut save_clicked = false;
         let mut cancel_clicked = false;
         let mut editing = false;
+
+        // Shared by the `?` hover tooltip and the click-pinned popup.
+        fn help_body(ui: &mut egui::Ui) {
+            ui.set_max_width(340.0);
+            ui.strong("SplatField — text-prompted 3DGS segmentation");
+            ui.add_space(4.0);
+            egui::Grid::new("help")
+                .num_columns(2)
+                .spacing([12.0, 3.0])
+                .show(ui, |ui| {
+                    ui.strong("Scene");
+                    ui.label("drag & drop a .ply / .sog file");
+                    ui.end_row();
+                    ui.strong("View");
+                    ui.label("drag orbits · middle/right-drag pans · scroll zooms");
+                    ui.end_row();
+                    ui.strong("Select");
+                    ui.label("Shift + drag a box (Esc cancels)");
+                    ui.end_row();
+                    ui.strong("Delete");
+                    ui.label("Del / Backspace · undo with ⌘/Ctrl + Z");
+                    ui.end_row();
+                    ui.strong("Segment");
+                    ui.label("type a prompt, segment, then cut extracts the object");
+                    ui.end_row();
+                    ui.strong("Reset / save");
+                    ui.label("initial model · <source>.edited.ply");
+                    ui.end_row();
+                });
+            ui.separator();
+            ui.hyperlink("https://sony.github.io/B3-Seg-project");
+        }
+
         egui::Panel::bottom("b3seg").show(ui, |ui| {
             ui.horizontal(|ui| {
                 let btn = |ui: &mut egui::Ui, label: &str, enabled: bool| {
@@ -93,36 +126,13 @@ impl App {
                 save_clicked |= btn(ui, "save", has_model && !locked);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let help = ui.add(egui::Button::new("?").small());
-                    help.on_hover_ui(|ui| {
-                        ui.set_max_width(340.0);
-                        ui.strong("SplatField — text-prompted 3DGS segmentation");
-                        ui.add_space(4.0);
-                        egui::Grid::new("help")
-                            .num_columns(2)
-                            .spacing([12.0, 3.0])
-                            .show(ui, |ui| {
-                                ui.strong("Scene");
-                                ui.label("drag & drop a .ply / .sog file");
-                                ui.end_row();
-                                ui.strong("View");
-                                ui.label("drag orbits · middle/right-drag pans · scroll zooms");
-                                ui.end_row();
-                                ui.strong("Select");
-                                ui.label("Shift + drag a box (Esc cancels)");
-                                ui.end_row();
-                                ui.strong("Delete");
-                                ui.label("Del / Backspace · undo with ⌘/Ctrl + Z");
-                                ui.end_row();
-                                ui.strong("Segment");
-                                ui.label("type a prompt, segment, then cut extracts the object");
-                                ui.end_row();
-                                ui.strong("Reset / save");
-                                ui.label("initial model · <source>.edited.ply");
-                                ui.end_row();
-                            });
-                        ui.separator();
-                        ui.hyperlink("https://sony.github.io/B3-Seg-project");
-                    });
+                    let help = help.on_hover_ui(help_body);
+                    // The tooltip only appears after egui's hover delay, and
+                    // new users click instead — so a click pins the same
+                    // panel open; clicking anywhere else dismisses it.
+                    egui::Popup::from_toggle_button_response(&help)
+                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                        .show(help_body);
                 });
             });
         });
