@@ -214,7 +214,11 @@ impl App {
                 // constant, not a guess.
                 let mb = splatfield::fetch::ZIP_BYTES as f64 / 1e6;
                 self.set_status(
-                    format!("fetching models {p:.0}% ({:.0}/{mb:.0} MB)", p * mb),
+                    format!(
+                        "fetching models {:.0}% ({:.0}/{mb:.0} MB)",
+                        p * 100.0,
+                        p * mb
+                    ),
                     false,
                 );
             }
