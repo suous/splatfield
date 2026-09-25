@@ -5,7 +5,8 @@
 //! Split by target. The host half downloads the zip into the gsam on-disk
 //! cache for the native oracle path (`seg::prompted`). The wasm half streams
 //! it off a same-origin file server with the browser `fetch` API — only
-//! `download_zip` touches the network there, and no test reaches it; the
+//! `download_zip` and `fetch_demo_scene` touch the network there, and no
+//! test reaches either; the
 //! install logic is shared verbatim between the halves and host-tested, so
 //! both targets verify the identical pin tables.
 
@@ -352,28 +353,21 @@ fn extract_into(
     Ok(())
 }
 
-/// Stream the release zip off the network with fractional progress (0..1).
-/// Native builds never download: this is the browser branch. Runs inside the
-/// pipeline worker — `global()` is the WorkerGlobalScope, and it declares
-/// the same Request-based fetch the page has.
+/// GET `url` from whichever scope declares fetch — a Window on the page, a
+/// WorkerGlobalScope inside the pipeline worker — and require an OK
+/// `Response`. `cache`, when given, rides the request's `RequestInit`;
+/// `None` leaves every field at its default (wire-identical to no init).
 #[cfg(target_arch = "wasm32")]
-pub async fn download_zip(on_progress: &mut dyn FnMut(f64)) -> Result<Vec<u8>> {
-    use wasm_bindgen::JsCast;
-    // JsValue is not a StdError, so JS rejections are mapped, not
-    // context-wrapped; opfs owns the one mapper.
+async fn fetch_ok(url: &str, cache: Option<web_sys::RequestCache>) -> Result<web_sys::Response> {
     use crate::opfs::js_err;
+    use wasm_bindgen::JsCast;
 
     let init = web_sys::RequestInit::new();
-    // Revalidate before use: a same-origin cache entry from an earlier dev
-    // session (possibly behind a different server state) otherwise shadows
-    // the pinned release and the sha256 pin rejects bytes the user cannot
-    // fix except by clearing browser state. With `no-cache` a stale entry
-    // costs one conditional request; a fresh file answers 200 unchanged.
-    init.set_cache(web_sys::RequestCache::NoCache);
-    let request = web_sys::Request::new_with_str_and_init(ZIP_URL, &init)
-        .map_err(|e| js_err(e).context(format!("building the request for {ZIP_URL}")))?;
-    // `window()` is None in a worker, so resolve fetch off the global scope:
-    // a Window on the page, a WorkerGlobalScope inside the worker.
+    if let Some(cache) = cache {
+        init.set_cache(cache);
+    }
+    let request = web_sys::Request::new_with_str_and_init(url, &init)
+        .map_err(|e| js_err(e).context(format!("building the request for {url}")))?;
     let fetch_promise = match js_sys::global().dyn_into::<web_sys::Window>() {
         Ok(window) => window.fetch_with_request(&request),
         Err(global) => global
@@ -382,11 +376,29 @@ pub async fn download_zip(on_progress: &mut dyn FnMut(f64)) -> Result<Vec<u8>> {
     };
     let response = wasm_bindgen_futures::JsFuture::from(fetch_promise)
         .await
-        .map_err(|e| js_err(e).context(format!("fetching {ZIP_URL}")))?;
+        .map_err(|e| js_err(e).context(format!("fetching {url}")))?;
     let response: web_sys::Response = response
         .dyn_into()
-        .map_err(|_| anyhow::anyhow!("fetch of {ZIP_URL} did not yield a Response"))?;
-    ensure!(response.ok(), "fetch {ZIP_URL}: HTTP {}", response.status());
+        .map_err(|_| anyhow::anyhow!("fetch of {url} did not yield a Response"))?;
+    ensure!(response.ok(), "fetch {url}: HTTP {}", response.status());
+    Ok(response)
+}
+
+/// Stream the release zip off the network with fractional progress (0..1).
+/// Native builds never download: this is the browser branch.
+#[cfg(target_arch = "wasm32")]
+pub async fn download_zip(on_progress: &mut dyn FnMut(f64)) -> Result<Vec<u8>> {
+    use wasm_bindgen::JsCast;
+    // JsValue is not a StdError, so JS rejections are mapped, not
+    // context-wrapped; opfs owns the one mapper.
+    use crate::opfs::js_err;
+
+    // Revalidate before use: a same-origin cache entry from an earlier dev
+    // session (possibly behind a different server state) otherwise shadows
+    // the pinned release and the sha256 pin rejects bytes the user cannot
+    // fix except by clearing browser state. With `no-cache` a stale entry
+    // costs one conditional request; a fresh file answers 200 unchanged.
+    let response = fetch_ok(ZIP_URL, Some(web_sys::RequestCache::NoCache)).await?;
     let total = response
         .headers()
         .get("content-length")
@@ -432,6 +444,38 @@ pub async fn download_zip(on_progress: &mut dyn FnMut(f64)) -> Result<Vec<u8>> {
             on_progress((zip.len() as f64 / total as f64).min(1.0));
         }
     }
+}
+
+/// The demo scene the help panel's button loads — the SH1 bear on the
+/// fixtures release, same assets CI tests against. Cross-origin from the
+/// Pages deployment; GitHub release downloads answer
+/// `Access-Control-Allow-Origin: *` on both redirect hops.
+#[cfg(target_arch = "wasm32")]
+pub const DEMO_SCENE_URL: &str =
+    "https://github.com/suous/splatfield/releases/download/fixtures-v1/bear.3d71a266_sh1.sog";
+
+/// Fetch the demo scene bytes. One buffer, no streaming progress: the asset
+/// is 14 MB and the status pill covers the wait.
+///
+/// Plain GET, deliberately no cache override: `no-cache` appends a
+/// `Cache-Control` request header, which is not CORS-safelisted, so the
+/// browser forces a preflight the release endpoint does not answer — the
+/// whole fetch dies as `TypeError: Failed to fetch`. (The models fetch
+/// carries the same init but never trips this: it is same-origin.) The
+/// asset is immutable under the fixtures-v1 tag, so HTTP caching is safe.
+#[cfg(target_arch = "wasm32")]
+pub async fn fetch_demo_scene() -> Result<Vec<u8>> {
+    use crate::opfs::js_err;
+
+    let response = fetch_ok(DEMO_SCENE_URL, None).await?;
+    let buffer = wasm_bindgen_futures::JsFuture::from(
+        response
+            .array_buffer()
+            .map_err(|e| js_err(e).context("reading the demo scene body"))?,
+    )
+    .await
+    .map_err(|e| js_err(e).context("reading the demo scene body"))?;
+    Ok(js_sys::Uint8Array::new(&buffer).to_vec())
 }
 
 /// Verify the zip's sha256, unzip in memory, keep exactly the required

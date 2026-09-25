@@ -12,6 +12,8 @@ use eframe::egui;
 use eframe::wasm_bindgen::JsCast;
 use splat_sort::tensor::GpuTensor;
 #[cfg(target_arch = "wasm32")]
+use splatfield::fetch;
+#[cfg(target_arch = "wasm32")]
 use splatfield::seg::beta::map_labels;
 use splatfield::{camera, render, texture, to_dc};
 
@@ -112,10 +114,17 @@ impl Loaded {
 pub(crate) type FrameSlot = Rc<RefCell<Option<FrameGpu>>>;
 
 impl App {
-    /// Parse and upload a dropped scene off the UI thread; of two racing
-    /// loads the one requested LAST wins.
+    /// Parse and upload scene bytes off the UI thread; of two racing loads
+    /// the one requested LAST wins. The `bytes` future is the only
+    /// difference between callers: the drop path reads a browser file
+    /// handle, the demo button fetches a release asset.
     #[cfg(target_arch = "wasm32")]
-    pub(crate) fn load_file(&self, file: egui::DroppedFileHandle, ctx: egui::Context) {
+    pub(crate) fn load_bytes(
+        &self,
+        name: String,
+        ctx: egui::Context,
+        bytes: impl std::future::Future<Output = anyhow::Result<Vec<u8>>> + 'static,
+    ) {
         let client = self.client.clone();
         let splats = Arc::clone(&self.splats);
 
@@ -128,11 +137,12 @@ impl App {
         };
 
         // The source FILE NAME (web has no directories) — the save button
-        // derives `<name>.edited.ply` from it.
-        let name = std::path::Path::new(file.path())
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "scene".into());
+        // derives `<name>.edited.ply` from it — and the extension
+        // `load_scene` dispatches on.
+        let ext = std::path::Path::new(&name)
+            .extension()
+            .unwrap_or_default()
+            .to_owned();
 
         let on_loaded = move |result: anyhow::Result<render::CpuSplats>| {
             let payload = result.map(|cpu| {
@@ -170,17 +180,51 @@ impl App {
             ctx.request_repaint();
         };
 
-        // `file.path()` on wasm is the file NAME (eframe sets it from
-        // File::name) — extension detection still works.
         wasm_bindgen_futures::spawn_local(async move {
-            match file.bytes_async().await {
-                Ok(bytes) => on_loaded(splatfield::load_scene(
-                    file.path().extension().unwrap_or_default(),
-                    std::io::Cursor::new(bytes),
-                )),
-                Err(e) => on_loaded(Err(anyhow::anyhow!("Failed to read dropped file: {e}"))),
+            match bytes.await {
+                Ok(bytes) => on_loaded(splatfield::load_scene(&ext, std::io::Cursor::new(bytes))),
+                Err(e) => on_loaded(Err(e)),
             }
         });
+    }
+
+    /// A drag-and-dropped file: read its bytes through the browser handle.
+    /// `file.path()` on wasm is the file NAME (eframe sets it from
+    /// File::name) — extension detection still works.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn load_file(&self, file: egui::DroppedFileHandle, ctx: egui::Context) {
+        let name = std::path::Path::new(file.path())
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "scene".into());
+        self.load_bytes(name, ctx, async move {
+            file.bytes_async()
+                .await
+                .map_err(|e| anyhow::anyhow!("Failed to read dropped file: {e}"))
+        });
+    }
+
+    /// The help panel's demo row — fetch the fixtures-release bear and load
+    /// it like a drop — shared by the hover tooltip and the click-pinned
+    /// panel: egui keeps tooltips containing interactive widgets
+    /// interactable, so the button is clickable in both. Disabled like a
+    /// drop is guarded: loading during a run would leave the worker tinting
+    /// a stale model.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn demo_button(&mut self, ui: &mut egui::Ui) {
+        ui.separator();
+        if ui
+            .add_enabled(!self.locked(), egui::Button::new("load demo scene (bear)"))
+            .clicked()
+        {
+            self.set_status("fetching demo scene…", false);
+            // Dismiss the pinned panel; the status pill narrates from here.
+            egui::Popup::close_all(ui.ctx());
+            // The URL's file name: the save button derives
+            // `<name>.edited.ply` from it, exactly like a dropped file.
+            let name = fetch::DEMO_SCENE_URL.rsplit('/').next().unwrap().to_owned();
+            self.load_bytes(name, ui.ctx().clone(), fetch::fetch_demo_scene());
+        }
     }
 
     /// Box-select: keep the splats whose projected centers fall in the

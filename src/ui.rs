@@ -16,6 +16,9 @@ const UV_RECT: Rect = Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0))
 
 /// How long an idle status message stays in the pill before dismissing.
 const STATUS_LIFETIME: std::time::Duration = std::time::Duration::from_secs(4);
+/// Failures outlive outcomes — long enough to read a long message — but
+/// stay bounded: an error that never dismisses reads as a stuck state.
+const ERROR_STATUS_LIFETIME: std::time::Duration = std::time::Duration::from_secs(16);
 
 /// Whether a drag-and-dropped file is a loadable scene.
 #[cfg(target_arch = "wasm32")]
@@ -41,6 +44,38 @@ fn draw_selection_box(painter: &egui::Painter, rect: egui::Rect) {
     );
 }
 
+/// The help text shared by the `?` hover tooltip and the click-pinned popup.
+fn help_body(ui: &mut egui::Ui) {
+    ui.set_max_width(340.0);
+    ui.strong("SplatField — text-prompted 3DGS segmentation");
+    ui.add_space(4.0);
+    egui::Grid::new("help")
+        .num_columns(2)
+        .spacing([12.0, 3.0])
+        .show(ui, |ui| {
+            ui.strong("Scene");
+            ui.label("drag & drop a .ply / .sog file");
+            ui.end_row();
+            ui.strong("View");
+            ui.label("drag orbits · middle/right-drag pans · scroll zooms");
+            ui.end_row();
+            ui.strong("Select");
+            ui.label("Shift + drag a box (Esc cancels)");
+            ui.end_row();
+            ui.strong("Delete");
+            ui.label("Del / Backspace · undo with ⌘/Ctrl + Z");
+            ui.end_row();
+            ui.strong("Segment");
+            ui.label("type a prompt, segment, then cut extracts the object");
+            ui.end_row();
+            ui.strong("Reset / save");
+            ui.label("initial model · <source>.edited.ply");
+            ui.end_row();
+        });
+    ui.separator();
+    ui.hyperlink("https://sony.github.io/B3-Seg-project");
+}
+
 impl App {
     /// Draw the docked B3-Seg panel; returns the user's triggers
     /// (run_requested, reset_clicked, cut_clicked, save_clicked,
@@ -59,38 +94,6 @@ impl App {
         let mut save_clicked = false;
         let mut cancel_clicked = false;
         let mut editing = false;
-
-        // Shared by the `?` hover tooltip and the click-pinned popup.
-        fn help_body(ui: &mut egui::Ui) {
-            ui.set_max_width(340.0);
-            ui.strong("SplatField — text-prompted 3DGS segmentation");
-            ui.add_space(4.0);
-            egui::Grid::new("help")
-                .num_columns(2)
-                .spacing([12.0, 3.0])
-                .show(ui, |ui| {
-                    ui.strong("Scene");
-                    ui.label("drag & drop a .ply / .sog file");
-                    ui.end_row();
-                    ui.strong("View");
-                    ui.label("drag orbits · middle/right-drag pans · scroll zooms");
-                    ui.end_row();
-                    ui.strong("Select");
-                    ui.label("Shift + drag a box (Esc cancels)");
-                    ui.end_row();
-                    ui.strong("Delete");
-                    ui.label("Del / Backspace · undo with ⌘/Ctrl + Z");
-                    ui.end_row();
-                    ui.strong("Segment");
-                    ui.label("type a prompt, segment, then cut extracts the object");
-                    ui.end_row();
-                    ui.strong("Reset / save");
-                    ui.label("initial model · <source>.edited.ply");
-                    ui.end_row();
-                });
-            ui.separator();
-            ui.hyperlink("https://sony.github.io/B3-Seg-project");
-        }
 
         egui::Panel::bottom("b3seg").show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -126,13 +129,13 @@ impl App {
                 save_clicked |= btn(ui, "save", has_model && !locked);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let help = ui.add(egui::Button::new("?").small());
-                    let help = help.on_hover_ui(help_body);
+                    let help = help.on_hover_ui(|ui| self.help_panel(ui));
                     // The tooltip only appears after egui's hover delay, and
                     // new users click instead — so a click pins the same
                     // panel open; clicking anywhere else dismisses it.
                     egui::Popup::from_toggle_button_response(&help)
                         .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                        .show(help_body);
+                        .show(|ui| self.help_panel(ui));
                 });
             });
         });
@@ -156,6 +159,16 @@ impl App {
             save_clicked,
             cancel_clicked,
         )
+    }
+
+    /// The help body plus the demo row (wasm) — one panel shared by the `?`
+    /// hover tooltip and the click-pinned popup. The interactive demo button
+    /// makes egui keep the tooltip interactable, so the row is clickable on
+    /// hover too.
+    fn help_panel(&mut self, ui: &mut egui::Ui) {
+        help_body(ui);
+        #[cfg(target_arch = "wasm32")]
+        self.demo_button(ui);
     }
 }
 
@@ -263,18 +276,25 @@ impl eframe::App for App {
 
         // The pill speaks whenever the engine has something to say: live
         // progress while a run is active, idle outcomes self-dismissing.
-        // Failures persist until replaced — vanishing errors get missed.
-        // The app repaints only when dirty, so the dismissal deadline
-        // schedules its own wake-up.
+        // Failures get a longer window (and red text) instead of living
+        // forever. The app repaints only when dirty, so the dismissal
+        // deadline schedules its own wake-up.
         let busy = self.seg.busy;
-        if !busy && !self.seg.status_error {
-            match STATUS_LIFETIME.checked_sub(self.seg.status_at.elapsed()) {
+        let lifetime = if self.seg.status_error {
+            ERROR_STATUS_LIFETIME
+        } else {
+            STATUS_LIFETIME
+        };
+        if !busy {
+            match lifetime.checked_sub(self.seg.status_at.elapsed()) {
                 None => self.seg.status.clear(),
                 Some(left) => ui.ctx().request_repaint_after(left),
             }
         }
         if !self.seg.status.is_empty() {
-            egui::Area::new(egui::Id::new("seg-progress"))
+            let error = self.seg.status_error;
+            let status = &self.seg.status;
+            let response = egui::Area::new(egui::Id::new("seg-progress"))
                 .anchor(egui::Align2::CENTER_TOP, [0.0, 14.0])
                 .show(ui, |ui| {
                     egui::Frame::popup(ui.style())
@@ -285,10 +305,22 @@ impl eframe::App for App {
                                 if busy {
                                     ui.add(egui::Spinner::new());
                                 }
-                                ui.label(&self.seg.status);
-                            });
-                        });
-                });
+                                if error {
+                                    ui.colored_label(ui.style().visuals.error_fg_color, status);
+                                } else {
+                                    ui.label(status);
+                                }
+                            })
+                            .response
+                        })
+                        .response
+                })
+                .response;
+            // Clicking the pill dismisses it now instead of waiting out
+            // the lifetime.
+            if response.clicked() {
+                self.seg.status.clear();
+            }
         }
 
         let mut slot = self.splats.lock().unwrap();

@@ -190,7 +190,8 @@ impl App {
     }
 
     /// Post a status message: the pill shows it, dismissing idle outcomes
-    /// after the status pill's lifetime unless they are failures.
+    /// after the status lifetime and failures after a longer one — errors
+    /// get more time to be read, not eternity.
     pub(crate) fn set_status(&mut self, msg: impl Into<String>, error: bool) {
         self.seg.status = msg.into();
         self.seg.status_error = error;
