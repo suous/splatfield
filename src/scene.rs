@@ -117,7 +117,7 @@ impl App {
     /// Parse and upload scene bytes off the UI thread; of two racing loads
     /// the one requested LAST wins. The `bytes` future is the only
     /// difference between callers: the drop path reads a browser file
-    /// handle, the demo button fetches a release asset.
+    /// handle, the demo button fetches the same-origin demo scene.
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn load_bytes(
         &self,

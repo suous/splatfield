@@ -447,27 +447,40 @@ pub async fn download_zip(on_progress: &mut dyn FnMut(f64)) -> Result<Vec<u8>> {
 }
 
 /// The demo scene the help panel's button loads — the SH1 bear on the
-/// fixtures release, same assets CI tests against. Cross-origin from the
-/// Pages deployment; GitHub release downloads answer
-/// `Access-Control-Allow-Origin: *` on both redirect hops.
+/// fixtures release, same assets CI tests against. Relative on purpose,
+/// like `ZIP_URL`: the page's `<base>` (trunk's public URL) resolves it
+/// next to index.html, where `scripts/dev_server.py` serves the durable
+/// `data/` master copy and the deploy workflow ships the release asset
+/// into the Pages artifact. The release URL itself is unreachable from a
+/// browser: the github.com download redirect chain sends no CORS headers
+/// (curl never shows this — it does not enforce CORS).
 #[cfg(target_arch = "wasm32")]
-pub const DEMO_SCENE_URL: &str =
-    "https://github.com/suous/splatfield/releases/download/fixtures-v1/bear.3d71a266_sh1.sog";
+pub const DEMO_SCENE_URL: &str = "bear.3d71a266_sh1.sog";
 
 /// Fetch the demo scene bytes. One buffer, no streaming progress: the asset
-/// is 14 MB and the status pill covers the wait.
-///
-/// Plain GET, deliberately no cache override: `no-cache` appends a
-/// `Cache-Control` request header, which is not CORS-safelisted, so the
-/// browser forces a preflight the release endpoint does not answer — the
-/// whole fetch dies as `TypeError: Failed to fetch`. (The models fetch
-/// carries the same init but never trips this: it is same-origin.) The
-/// asset is immutable under the fixtures-v1 tag, so HTTP caching is safe.
+/// is 14 MB and the status pill covers the wait. Same origin, so plain
+/// CORS rules apply and no cache override is needed (unlike the models
+/// zip): the content-hashed name is immutable — new fixture bytes get a
+/// new name, so default HTTP caching can never serve a stale scene.
 #[cfg(target_arch = "wasm32")]
 pub async fn fetch_demo_scene() -> Result<Vec<u8>> {
     use crate::opfs::js_err;
 
     let response = fetch_ok(DEMO_SCENE_URL, None).await?;
+    // A dev server that answers unknown paths with index.html (trunk
+    // serve's SPA fallback) reports 200 + text/html — name that failure
+    // instead of letting HTML surface as a cryptic zip error in parse.
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .map_err(|e| anyhow::anyhow!("reading content-type: {e:?}"))?
+        .unwrap_or_default();
+    ensure!(
+        !content_type.starts_with("text/"),
+        "the demo scene endpoint answered {content_type:?} — the asset is not \
+         deployed next to the app; local development must serve it via \
+         scripts/dev_server.py"
+    );
     let buffer = wasm_bindgen_futures::JsFuture::from(
         response
             .array_buffer()

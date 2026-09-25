@@ -18,6 +18,7 @@ concurrency:
 
 env:
   MODELS_URL: https://github.com/suous/splatfield/releases/download/models-v1/splatfield-models.zip
+  DEMO_SCENE_URL: https://github.com/suous/splatfield/releases/download/fixtures-v1/bear.3d71a266_sh1.sog
 
 jobs:
   build:
@@ -61,13 +62,19 @@ jobs:
 
       - run: trunk build --release --public-url "$BASE_PATH"
 
-      # The deployment contract: models.zip same-origin, next to the app —
-      # the worker fetches it relatively, so it must land in dist/.
-      - name: Fetch the pinned models zip
+      # The deployment contract: data fetches are same-origin, next to the
+      # app — the worker fetches models.zip relatively and the help panel
+      # fetches the demo scene relatively, so both must land in dist/. The
+      # demo scene cannot be fetched from the release URL client-side: the
+      # github.com download redirect chain sends no CORS headers. No hash
+      # pin for the bear — the content-hashed name is the identity, and a
+      # bad download just fails the demo load in the status pill.
+      - name: Fetch the pinned models zip and demo scene
         run: |
           curl -fsSL --retry 3 -o dist/models.zip "$MODELS_URL"
           echo "$MODELS_SHA256  dist/models.zip" | sha256sum --check -
           test "$(stat -c%s dist/models.zip)" = "$MODELS_BYTES"
+          curl -fsSL --retry 3 -o dist/bear.3d71a266_sh1.sog "$DEMO_SCENE_URL"
 
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
