@@ -3,18 +3,18 @@ permissions:
   contents: read
 on:
   push:
-    branches: [main, roadmap/05_segment]
+    branches: [roadmap/06_wasm]
     paths-ignore:
       - '**.md'
       - 'assets/**'
       - 'docs/**'
-      - '.github/workflows/release.yml'
+      - '.github/workflows/deploy.yml'
   pull_request:
     paths-ignore:
       - '**.md'
       - 'assets/**'
       - 'docs/**'
-      - '.github/workflows/release.yml'
+      - '.github/workflows/deploy.yml'
   workflow_dispatch:
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
@@ -22,17 +22,19 @@ concurrency:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (pin from jonhoo/rust-ci-conf)
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
         with:
           components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
       - name: cargo fmt --check
         run: cargo fmt --check
       - name: cargo clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
       - name: cargo doc
-        run: cargo doc --no-deps
+        run: cargo doc --no-deps --locked
         env:
           RUSTDOCFLAGS: -D warnings
   test:
@@ -40,9 +42,11 @@ jobs:
     # software Vulkan on ubuntu runners) lacks; Apple Silicon/Metal has
     # them. See crates/sort plane_sort_path.
     runs-on: macos-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (pin from jonhoo/rust-ci-conf)
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
       - name: Fetch test fixtures (release-hosted; gitignored)
         run: |
           base=https://github.com/suous/splatfield/releases/download/fixtures-v1
@@ -54,7 +58,7 @@ jobs:
           (cd data && sha256sum -c SHA256SUMS)
       - name: Restore the model release (models-v1)
         id: models
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           # gsam's models_dir() follows the platform cache convention,
           # which is ~/Library/Caches (not ~/.cache) on macOS.

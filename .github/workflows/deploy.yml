@@ -1,0 +1,88 @@
+name: Deploy
+
+on:
+  push:
+    branches: [roadmap/06_wasm]
+    paths-ignore:
+      - '**.md'
+      - 'assets/**'
+      - 'docs/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+env:
+  MODELS_URL: https://github.com/suous/splatfield/releases/download/models-v1/splatfield-models.zip
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (pin from jonhoo/rust-ci-conf)
+
+      # The release identity the app pins is single-sourced in src/fetch.rs
+      # (ZIP_SHA256/ZIP_BYTES) over gsam::RELEASE_TAG's asset. Parse it out
+      # below so CI and the binary can never disagree — drift fails the
+      # deploy instead of the user's first segmentation click.
+      - name: Derive the pinned models identity from src/fetch.rs
+        run: |
+          sha="$(sed -n 's/^pub const ZIP_SHA256: &str = "\(.*\)";$/\1/p' src/fetch.rs)"
+          bytes="$(sed -n 's/^pub const ZIP_BYTES: u64 = \(.*\);$/\1/p' src/fetch.rs | tr -d '_')"
+          test -n "$sha"
+          test -n "$bytes"
+          echo "MODELS_SHA256=$sha" >> "$GITHUB_ENV"
+          echo "MODELS_BYTES=$bytes" >> "$GITHUB_ENV"
+
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@63fed3e2fecf6f7b51dc6f043341b79ef82a9ae7 # v2.9.2
+
+      - uses: cargo-bins/cargo-binstall@b874e25ea559687bec77e281e9b271aa1367b624 # v1.23.0
+
+      # index.html's data-wasm-opt links are load-bearing for release size;
+      # trunk silently skips optimization when the binary is absent.
+      - run: sudo apt-get update && sudo apt-get install -y binaryen
+
+      # Pinned to the version the app's data-* attributes (worker loader
+      # shim, wasm-opt params) are validated against.
+      - run: cargo binstall --no-confirm trunk@0.21.14
+
+      # Project Pages serves the app under /<repo>/; the same subpath is
+      # baked into index.html's <base> and every asset reference.
+      - run: echo "BASE_PATH=/${GITHUB_REPOSITORY#*/}/" >> "$GITHUB_ENV"
+
+      - run: trunk build --release --public-url "$BASE_PATH"
+
+      # The deployment contract: models.zip same-origin, next to the app —
+      # the worker fetches it relatively, so it must land in dist/.
+      - name: Fetch the pinned models zip
+        run: |
+          curl -fsSL --retry 3 -o dist/models.zip "$MODELS_URL"
+          echo "$MODELS_SHA256  dist/models.zip" | sha256sum --check -
+          test "$(stat -c%s dist/models.zip)" = "$MODELS_BYTES"
+
+      - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/deploy-pages@368f82528645a54fb793d4d04e342629a3f51346 # v5.0.1
+        id: deployment
