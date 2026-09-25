@@ -267,8 +267,9 @@ impl Segmenter {
         (self.state.a.read_vec(), self.state.b.read_vec())
     }
 
-    /// Async twin of [`Segmenter::posteriors`] — the terminal a/b readback
-    /// the wasm loop's tint step labels with `map_labels`.
+    /// Async twin of the test-only blocking `posteriors` readback — the
+    /// terminal a/b readback the wasm loop's tint step labels with
+    /// `map_labels`.
     pub async fn posteriors_async(&self) -> (Vec<f32>, Vec<f32>) {
         (
             self.state.a.read_vec_async().await,

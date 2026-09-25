@@ -1,8 +1,8 @@
 //! Worker<->main-thread message protocol for the segmentation pipeline.
 //!
-//! The worker owns the whole model pipeline: [`Request::EnsureModels`]
+//! The worker owns the whole model pipeline: [`crate::pipeline::Request::EnsureModels`]
 //! downloads/verifies the pinned release and loads the SAM2 sessions, and
-//! the per-image [`Request::Segment`] runs detect → encode → decode. Frames
+//! the per-image [`crate::pipeline::Request::Segment`] runs detect → encode → decode. Frames
 //! cross postMessage as bincode bytes in a `Uint8Array` — the same
 //! encode/decode the host tests exercise, so the wire format is pinned
 //! where it can be run.
