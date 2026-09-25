@@ -1,26 +1,42 @@
+// The wasm32 binary is the product; on host this crate only has to keep
+// compiling for `cargo test`/`clippy`, where the wasm entry is cfg'd out
+// and nothing is reachable from the tombstone main.
+#![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
+
 mod scene;
 mod ui;
 mod worker;
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
-use cubecl::wgpu::{MemoryConfiguration, RuntimeOptions, WgpuRuntime, WgpuSetup, init_device};
-use cubecl::{Runtime, client::ComputeClient};
+#[cfg(target_arch = "wasm32")]
+use eframe::{wasm_bindgen::JsCast, web_sys};
+
+use cubecl::wgpu::{MemoryConfiguration, RuntimeOptions, WgpuSetup, init_device};
+use cubecl::{Device, client::Client};
 use eframe::egui;
 use eframe::wgpu;
 use splat_sort::tensor::GpuTensor;
 use splatfield::{camera, render, texture};
 
-use scene::{FrameGpu, Loaded};
+use scene::{FrameGpu, FrameSlot, Loaded};
 use worker::SegUi;
 
 /// Selection highlight color: the box overlay and the selected splats' tint.
 const SELECT_GREEN: [u8; 3] = [0x30, 0xff, 0x55];
 
 struct App {
-    gpu: FrameGpu,
+    /// Clone of the egui context: async tasks (the segmentation loop) that
+    /// publish outside a frame request repaints through it.
+    ctx: egui::Context,
+    gpu: FrameSlot,
+    // Stable for the texture's lifetime — recreate_texture reuses the id — so
+    // the paint path never borrows `gpu`.
+    tex_id: eframe::egui::TextureId,
     controller: camera::Controller,
-    client: ComputeClient<WgpuRuntime>,
+    client: Client,
     splats: Arc<Mutex<Loaded>>,
     seg: SegUi,
     /// Palette index for the next segmentation's color.
@@ -32,12 +48,14 @@ struct App {
     sel: Vec<usize>,
     removed: Vec<usize>,
     undo: Vec<(Vec<usize>, Option<GpuTensor>)>,
-    // What the backbuffer currently shows: the frame size and the model it
-    // was rendered from (the camera is implied — it only moves through
-    // Controller::tick, which reports moves). In-place GPU mutations that a
-    // fresh Arc can't cover — the segmentation tint, posterior updates,
-    // heatmap/reset toggles — go through paint_dirty instead.
-    rendered: Option<(glam::UVec2, Arc<render::Splats>)>,
+    // What the backbuffer currently shows: the frame size, the model, and
+    // the camera pose it was rendered from. Fresh Arcs cover new loads; the
+    // pose comparison catches motion that arrived while a wasm render was
+    // in flight (the slot was busy, so the moved pose was never scheduled).
+    // In-place GPU mutations that a fresh Arc can't cover — the selection
+    // tint, posterior updates, heatmap/reset toggles — go through
+    // paint_dirty instead.
+    rendered: Option<(glam::UVec2, Arc<render::Splats>, camera::Camera)>,
     paint_dirty: bool,
 }
 
@@ -97,15 +115,33 @@ impl App {
             render_state.device.clone(),
             render_state.queue.clone(),
         );
+        // Take the texture id BEFORE the backbuffer moves into the slot.
+        let tex_id = backbuffer.id;
+        let seg = SegUi::default();
+        // The pipeline worker's replies feed the seg inbox and repaint —
+        // without the repaint request the pill would never draw progress.
+        // (The spawn itself is lazy; installing here starts it.)
+        #[cfg(target_arch = "wasm32")]
+        {
+            let inbox = Rc::clone(&seg.inbox);
+            let ctx = cc.egui_ctx.clone();
+            worker::on_response(Box::new(move |response| {
+                inbox.borrow_mut().push(response);
+                ctx.request_repaint();
+            }));
+            worker::install();
+        }
         Self {
-            gpu: FrameGpu {
+            ctx: cc.egui_ctx.clone(),
+            gpu: Rc::new(RefCell::new(Some(FrameGpu {
                 backbuffer,
                 scratch: None,
-            },
+            }))),
+            tex_id,
             controller: camera::Controller::default(),
-            client: WgpuRuntime::client(&device),
+            client: Device::Wgpu(device).client(),
             splats: Arc::new(Mutex::new(Loaded::default())),
-            seg: SegUi::default(),
+            seg,
             next_color: 0,
             sel: Vec::new(),
             removed: Vec::new(),
@@ -116,22 +152,41 @@ impl App {
     }
 }
 
-fn main() -> std::process::ExitCode {
-    if std::env::args().nth(1).as_deref() == Some("seg") {
-        return splatfield::cli::run(std::env::args().skip(2));
-    }
-    match eframe::run_native(
-        "SplatField",
-        eframe::NativeOptions {
-            wgpu_options: wgpu_config(),
-            ..Default::default()
-        },
-        Box::new(|cc| Ok(Box::new(App::new(cc)))),
-    ) {
-        Ok(()) => std::process::ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("splatfield: {e}");
-            std::process::ExitCode::FAILURE
+#[cfg(not(target_arch = "wasm32"))]
+fn main() {
+    eprintln!(
+        "splatfield: native support removed — this build targets wasm32 (see README: trunk serve)"
+    );
+    std::process::exit(1);
+}
+
+#[cfg(target_arch = "wasm32")]
+fn main() {
+    wasm_bindgen_futures::spawn_local(async {
+        let document = web_sys::window()
+            .expect("no window")
+            .document()
+            .expect("no document");
+        let canvas = document
+            .get_element_by_id("the_canvas_id")
+            .expect("missing #the_canvas_id")
+            .dyn_into::<web_sys::HtmlCanvasElement>()
+            .expect("#the_canvas_id is not a canvas");
+
+        eframe::WebRunner::new()
+            .start(
+                canvas,
+                eframe::WebOptions {
+                    wgpu_options: wgpu_config(),
+                    ..Default::default()
+                },
+                Box::new(|cc| Ok(Box::new(App::new(cc)))),
+            )
+            .await
+            .expect("failed to start");
+
+        if let Some(el) = document.get_element_by_id("loading_text") {
+            el.remove();
         }
-    }
+    });
 }

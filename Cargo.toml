@@ -11,7 +11,7 @@ edition = "2024"
 # `storage, read` instead of read_write; without it the WGSL uniformity
 # analysis rejects barrier loops bounded by a loaded value — e.g. the
 # rasterizer's per-tile intersection ranges.
-cubecl = { version = "=0.11.0-pre.3", default-features = false, features = ["wgpu", "exclusive-memory-only"] }
+cubecl = { version = "=0.11.0-pre.4", default-features = false, features = ["wgpu", "exclusive-memory-only"] }
 bytemuck = "1.25"
 anyhow = "1.0.104"
 serde = { version = "1", features = ["derive"] }
@@ -24,10 +24,27 @@ name = "splatfield"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Gate for the splatfield-worker bin target: host builds never enable it, so
+# host cargo build/test/clippy skip the bin entirely (required-features).
+# Only index.html's data-type="worker" link passes --features worker.
+worker = []
+# Test-fixture gate: the shared synthetic-scene builders in render.rs gate on
+# cfg(any(test, feature = "test-utils")) so the bench target — which links
+# this lib without cfg(test) — can use them instead of re-copying the seg
+# fixture math. Enabled for test/bench builds only, via the self
+# dev-dependency below; never part of the shipped wasm lib.
+test-utils = []
+
+[[bin]]
+name = "splatfield-worker"
+path = "src/worker_main.rs"
+required-features = ["worker"]
+
 [dependencies]
 cubecl.workspace = true
 # Direct dep (also transitively pinned by cubecl) for the stream-policy API.
-cubecl-environment = "=0.11.0-pre.3"
+cubecl-environment = "=0.11.0-pre.4"
 bytemuck.workspace = true
 glam = "0.33"
 anyhow.workspace = true
@@ -35,22 +52,78 @@ image = { version = "0.25", default-features = false, features = ["webp"] }
 zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
 serde.workspace = true
 serde_json.workspace = true
+# Install-time integrity: the cache files' SHA-256 pins are verified during
+# extraction (fetch module); not re-hashed on launch. Both targets.
+sha2 = "0.10"
+# The worker<->main-thread message protocol (pipeline module) and the OPFS
+# cache manifest. serde is already in the tree; bincode is the only new
+# package — the payloads are binary, and the same encode/decode runs on the
+# host tests and the wire.
+bincode = "1"
 eframe = { version = "0.36", default-features = false, features = ["default_fonts", "links", "wgpu", "x11", "wayland"] }
 splat-sort = { path = "crates/sort" }
+# Both targets: the host build gets the ort session layer, the wasm build
+# the release data model (REQUIRED_FILES + ModelStore) the fetch/install and
+# OPFS cache paths share.
+gsam = { path = "crates/gsam" }
+# std::time::Instant on host, performance.now on wasm — the status pill's
+# clock, and the worker's stage timers.
+web-time = "1"
 
+# Native-only: ort (inside gsam) cannot target wasm32. Web inference is the
+# worker bin's job (see src/worker_main.rs).
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 # First-run oracle model fetch (fetch module): one release-zip download into
 # the gsam cache.
 ureq = "3"
-# Install-time integrity: the cache files' SHA-256 pins are verified during
-# extraction (fetch module); not re-hashed on launch.
-sha2 = "0.10"
 
-# The `splatfield seg` subcommand's argument parsing.
-clap = { version = "4", features = ["derive"] }
-
-# Text-prompted 2D segmentation (B3-Seg): GroundingDINO detection -> SAM2 box
-# decode on ONNX Runtime (CPU). See crates/gsam/ for the model contract.
-gsam = { path = "crates/gsam" }
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+# rand -> cubecl-environment pulls getrandom; unknown-unknown needs its JS
+# backend feature (inert on host, where std is the backend).
+getrandom = { version = "0.4", features = ["wasm_js"] }
+# Save flow: blob download via a detached anchor (Url/HtmlAnchorElement/Blob).
+# The rest: fetch.rs streams the release zip (Request*/Response/ReadableStream,
+# Headers), opfs.rs caches it (StorageManager + FileSystem*), the page spawns
+# the pipeline worker (Worker/MessageEvent), the worker registers its handler
+# (WorkerGlobalScope/DedicatedWorkerGlobalScope/Navigator on either scope),
+# and console mirrors errors to the devtools console.
+web-sys = { version = "0.3", features = [
+    "Url",
+    "HtmlAnchorElement",
+    # main.rs dyn_into's the page canvas; without this the wasm build only
+    # compiles while eframe happens to enable the feature transitively.
+    "HtmlCanvasElement",
+    "Blob",
+    "File",
+    "Window",
+    "Headers",
+    "Request",
+    "RequestInit",
+    "RequestCache",
+    "Response",
+    "ReadableStream",
+    "ReadableStreamDefaultReader",
+    "console",
+    "Worker",
+    "MessageEvent",
+    "WorkerGlobalScope",
+    "DedicatedWorkerGlobalScope",
+    "Navigator",
+    "WorkerNavigator",
+    "StorageManager",
+    "FileSystemDirectoryHandle",
+    "FileSystemFileHandle",
+    "FileSystemWritableFileStream",
+    "FileSystemGetDirectoryOptions",
+    "FileSystemGetFileOptions",
+    "FileSystemRemoveOptions",
+] }
+js-sys = "0.3"
+# A worker panic aborts the wasm module; the hook routes the message to the
+# devtools console so the abort is diagnosable.
+console_error_panic_hook = "0.1"
 
 [dev-dependencies]
 criterion.workspace = true
@@ -61,6 +134,10 @@ rand.workspace = true
 # GPU tests share the sort crate's serialized test client; the test-utils
 # feature keeps it out of production builds.
 splat-sort = { path = "crates/sort", features = ["test-utils"] }
+# Self-reference: dev-dependencies apply to test/bench builds only, so this
+# is what lets the bench target (a separate crate linking this lib without
+# cfg(test)) see the test-utils fixtures. Never reaches the shipped build.
+splatfield = { path = ".", features = ["test-utils"] }
 
 [[bench]]
 name = "render_frame"
@@ -72,4 +149,3 @@ opt-level = 'z'
 codegen-units = 1
 panic = "abort"
 strip = true
-

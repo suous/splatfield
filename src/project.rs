@@ -8,7 +8,6 @@ use crate::layout::{
     PLANE_Y, PLANE_Z, PROJ_FLOATS, TILE_WIDTH, Vec2F, Vec3F,
 };
 use cubecl::prelude::*;
-use cubecl::wgpu::WgpuRuntime;
 
 const ALPHA_CUTOFF: f32 = 10.0 / u8::MAX as f32;
 
@@ -73,7 +72,7 @@ pub(crate) struct CameraView {
     pub tile_bounds: Vec2F,
 }
 
-impl CameraViewLaunch<WgpuRuntime> {
+impl CameraViewLaunch {
     /// Kernel view of `camera` for an `img_size` frame of `tile_bounds` tiles.
     pub(crate) fn for_camera(
         camera: &crate::camera::Camera,
@@ -391,7 +390,6 @@ fn sh_to_rgb(chs: u32, dir: Vec3F, splat: u32, n: u32, shs: &[f32]) -> (f32, f32
 mod tests {
     use super::*;
     use cubecl::calculate_cube_count_elemwise;
-    use cubecl::wgpu::WgpuRuntime;
     use splat_sort::tensor::GpuTensor;
 
     const SENTINEL: u32 = 0xDEAD_BEEF;
@@ -412,7 +410,7 @@ mod tests {
         let tile_counts = GpuTensor::from(&client, [1], &[SENTINEL][..]);
         let tile_bbox = GpuTensor::from(&client, [1, 2], &[SENTINEL; 2][..]);
 
-        project_splats::launch::<WgpuRuntime>(
+        project_splats::launch(
             &client,
             calculate_cube_count_elemwise(&client, 1, CubeDim::new_1d(256)),
             CubeDim::new_1d(256),

@@ -19,8 +19,11 @@
 use std::sync::Arc;
 
 use anyhow::{Context, ensure};
+use core::future::Future;
 
-use super::beta::{BetaState, map_labels};
+use super::beta::BetaState;
+#[cfg(test)]
+use super::beta::map_labels;
 use super::views::{self, ObjectLocalization};
 use super::{Accumulators, Mask};
 use crate::camera::Camera;
@@ -38,20 +41,6 @@ pub struct Config {
     pub candidates: usize,
     /// Active iterations (T).
     pub iterations: usize,
-}
-
-/// The shipped GUI/CLI defaults: 512² oracle renders, 20 candidate views,
-/// and T = 20 iterations — the paper's T, adopted as the default by
-/// explicit decision (an earlier revision required every production site
-/// to set it per run).
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            resolution: 512,
-            candidates: 20,
-            iterations: 20,
-        }
-    }
 }
 
 /// One oracle observation, as the loop took it.
@@ -91,7 +80,7 @@ impl Segmenter {
         ensure!(cfg.resolution >= 16, "resolution must be >= 16");
         ensure!(
             cfg.candidates >= 1,
-            "candidates must be >= 1: zero would panic select_view's cameras[0] index"
+            "candidates must be >= 1: zero would panic select_view_async's cameras[0] index"
         );
         let client = &splats.attributes.client;
         let n = splats.attributes.shape[0];
@@ -109,18 +98,21 @@ impl Segmenter {
 
     /// Score all candidate views around the current localization and return
     /// the best. The current posterior never changes during scoring, so the
-    /// candidates compete purely on predicted entropy reduction.
-    fn select_view(&mut self, localization: &ObjectLocalization) -> (Camera, f32) {
+    /// candidates compete purely on predicted entropy reduction — rendered
+    /// through the async responsibility/EIG paths.
+    async fn select_view_async(&mut self, localization: &ObjectLocalization) -> (Camera, f32) {
         let cameras = views::candidates(localization, self.cfg.candidates);
         let mut best = (cameras[0], f32::NEG_INFINITY);
         for camera in &cameras {
-            self.splats.render_responsibility(
-                &mut self.scratch,
-                &mut self.acc,
-                camera,
-                UVec2::splat(self.cfg.resolution),
-            );
-            let eig = self.state.eig(&self.acc);
+            self.splats
+                .render_responsibility_async(
+                    &mut self.scratch,
+                    &mut self.acc,
+                    camera,
+                    UVec2::splat(self.cfg.resolution),
+                )
+                .await;
+            let eig = self.state.eig_async(&self.acc).await;
             if eig > best.1 {
                 best = (*camera, eig);
             }
@@ -129,15 +121,20 @@ impl Segmenter {
     }
 
     /// One observation round: round 0 from the bootstrap camera, then
-    /// EIG-best candidates.
-    fn step(
-        &mut self,
-        oracle: &mut impl FnMut(&[u8], UVec2, &Camera) -> anyhow::Result<Vec<u8>>,
-    ) -> anyhow::Result<Iteration> {
+    /// EIG-best candidates. Awaits sit at the readbacks (`localize_async`,
+    /// `bitmap_to_rgb_async`) and the oracle call, which is an async sensor
+    /// here. `oracle` borrows the rendered `rgb` slice only to hand it to
+    /// the sensor; the sensor's future must therefore consume what it needs
+    /// (e.g. copy the bytes) before its first await.
+    async fn step_async<O, Fut>(&mut self, oracle: &mut O) -> anyhow::Result<Iteration>
+    where
+        O: FnMut(&[u8], UVec2, &Camera) -> Fut,
+        Fut: Future<Output = anyhow::Result<Vec<u8>>>,
+    {
         let res = UVec2::splat(self.cfg.resolution);
 
-        let (camera, eig) = match views::localize(&self.splats, &self.state) {
-            Some(loc) => self.select_view(&loc),
+        let (camera, eig) = match views::localize_async(&self.splats, &self.state).await {
+            Some(loc) => self.select_view_async(&loc).await,
             // Round 0 observes blind from the caller's camera; the uniform
             // posterior has nothing foreground to localize.
             None if !self.bootstrapped => (self.camera, 0.0),
@@ -146,10 +143,11 @@ impl Segmenter {
             // replaying a view that taught nothing.
             None => {
                 let (min, max) = self.splats.bounds;
-                self.select_view(&ObjectLocalization {
+                self.select_view_async(&ObjectLocalization {
                     center: (min + max) * 0.5,
                     radius: (max - min).max_element() * 0.5,
                 })
+                .await
             }
         };
         self.bootstrapped = true;
@@ -161,11 +159,14 @@ impl Segmenter {
         // The isects alias `scratch`'s sort buffers (valid until its next
         // `prepare_isects`) and `scratch.projected` must still hold this
         // frame's projection.
-        let isects = self.splats.prepare_isects(&mut self.scratch, &camera, res);
+        let isects = self
+            .splats
+            .prepare_isects_async(&mut self.scratch, &camera, res)
+            .await;
         self.splats
             .finalize(&self.scratch, &isects, res, Finalize::Rgb);
-        let view = bitmap_to_rgb(&self.scratch.bitmap, self.cfg.resolution);
-        let mask_bytes = oracle(&view, res, &camera).context("oracle failed")?;
+        let view = bitmap_to_rgb_async(&self.scratch.bitmap, self.cfg.resolution).await;
+        let mask_bytes = oracle(&view, res, &camera).await.context("oracle failed")?;
         let mask = Mask::from_bytes(&self.state.a.client, res, &mask_bytes);
 
         // Lift 2D evidence to 3D pseudo-counts and fold into the posterior —
@@ -182,34 +183,58 @@ impl Segmenter {
         })
     }
 
-    /// The loop: T oracle observations — round 0 on the caller's camera, the
-    /// rest on the highest-EIG view — with a per-round callback: `on_round`
-    /// sees each iteration as it lands, together with the current posterior,
-    /// so an interactive caller publishes progress without re-implementing
-    /// the loop's stop rules.
-    /// Returning `false` from `on_round` stops the run after the round just
-    /// delivered: the returned rounds and the segmenter's posterior are the
-    /// state so far — a cancelled run is a valid partial result.
-    ///
-    /// The run also ends early on an empty mask with nothing localized yet:
-    /// an empty mask carries no foreground evidence, so before anything is
-    /// localized the remaining rounds would only spend oracle calls. An
-    /// empty mask still folds background evidence into the posterior; the
-    /// break fires only while no round has seen foreground.
+    /// Blocking [`Self::run_with_async`] for host callers: drives the loop
+    /// future on this thread, which is what cubecl's own sync reads do
+    /// internally. The oracle closure wraps each call in
+    /// `std::future::ready`, so the async body's future-must-not-borrow-
+    /// `rgb` rule holds trivially.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn run_with(
+        &mut self,
+        mut oracle: impl FnMut(&[u8], UVec2, &Camera) -> anyhow::Result<Vec<u8>>,
+        on_round: impl FnMut(&Iteration, &BetaState) -> bool,
+    ) -> anyhow::Result<Vec<Iteration>> {
+        cubecl::future::block_on(self.run_with_async(
+            move |rgb: &[u8], size: UVec2, camera: &Camera| {
+                std::future::ready(oracle(rgb, size, camera))
+            },
+            on_round,
+        ))
+    }
+
+    /// `on_round` sees each iteration as it lands, together with the
+    /// current posterior, so an interactive caller publishes progress
+    /// without re-implementing the loop's stop rules. Returning `false`
+    /// stops the run after the round just delivered: the returned rounds and
+    /// the segmenter's posterior are the state so far — a cancelled run is a
+    /// valid partial result.
     ///
     /// `oracle` is the expensive 2D semantic sensor as a mutable closure:
     /// `rgb` is RGB8, row-major, `size` pixels, rendered from `camera`; the
     /// return is one byte per pixel, nonzero = foreground. Any black box
     /// with this signature plugs in — the text prompt rides in the capture.
-    pub fn run_with(
+    ///
+    /// The loop body — the one implementation both entry points run: the
+    /// host `run_with` is its `block_on` shim, so the host GPU tests pin
+    /// exactly this body and the wasm app executes it directly (invariant
+    /// row 45). `oracle` is generic over a future-returning `FnMut` because
+    /// the wasm sensor awaits a worker round trip; its future must not
+    /// borrow the `rgb` argument (copy before the first await) — that keeps
+    /// `Fut` a single type across the higher-ranked calls, which is what
+    /// lets this be a plain generic instead of a boxed dyn callback.
+    pub async fn run_with_async<O, Fut>(
         &mut self,
-        mut oracle: impl FnMut(&[u8], UVec2, &Camera) -> anyhow::Result<Vec<u8>>,
+        mut oracle: O,
         mut on_round: impl FnMut(&Iteration, &BetaState) -> bool,
-    ) -> anyhow::Result<Vec<Iteration>> {
+    ) -> anyhow::Result<Vec<Iteration>>
+    where
+        O: FnMut(&[u8], UVec2, &Camera) -> Fut,
+        Fut: Future<Output = anyhow::Result<Vec<u8>>>,
+    {
         let mut any_fg = false;
         let mut rounds = Vec::with_capacity(self.cfg.iterations);
         for _ in 0..self.cfg.iterations {
-            let round = self.step(&mut oracle)?;
+            let round = self.step_async(&mut oracle).await?;
             any_fg |= round.fg_pixels > 0;
             let stop = !on_round(&round, &self.state);
             let missed = round.fg_pixels == 0;
@@ -225,14 +250,30 @@ impl Segmenter {
     }
 
     /// The 3D segmentation so far: {i : a_i > b_i} (the MAP label under the
-    /// symmetric prior).
-    pub fn segmentation(&self) -> Vec<bool> {
+    /// symmetric prior). Test-only twin of [`Segmenter::posteriors_async`]
+    /// (the wasm loop labels via `posteriors_async` + `map_labels` directly);
+    /// this survives as the blocking-readback pin, same shape as
+    /// [`bitmap_to_rgb`].
+    #[cfg(test)]
+    fn segmentation(&self) -> Vec<bool> {
         let (a, b) = self.posteriors();
         map_labels(&a, &b)
     }
 
+    /// The current posterior counts, blocking readback (test-only twin of
+    /// [`Segmenter::posteriors_async`]).
+    #[cfg(test)]
     fn posteriors(&self) -> (Vec<f32>, Vec<f32>) {
         (self.state.a.read_vec(), self.state.b.read_vec())
+    }
+
+    /// Async twin of [`Segmenter::posteriors`] — the terminal a/b readback
+    /// the wasm loop's tint step labels with `map_labels`.
+    pub async fn posteriors_async(&self) -> (Vec<f32>, Vec<f32>) {
+        (
+            self.state.a.read_vec_async().await,
+            self.state.b.read_vec_async().await,
+        )
     }
 }
 
@@ -240,11 +281,30 @@ impl Segmenter {
 /// stride) into tightly-packed RGB bytes for oracle consumption — the
 /// models take RGB, so the alpha byte is dropped while un-striding.
 /// `cast_slice` reinterprets natively — byte order matches `to_le_bytes` on
-/// every little-endian host wgpu supports.
+/// every little-endian host wgpu supports. Test-only twin of
+/// [`bitmap_to_rgb_async`] (the loop runs the async readback via `run_with`'s
+/// `block_on` shim; this survives as the bit-identity pin for the shared
+/// `unpack_rgb`).
+#[cfg(test)]
 pub(crate) fn bitmap_to_rgb(bitmap: &GpuTensor, width: u32) -> Vec<u8> {
     let stride = bitmap.shape[1];
     let height = bitmap.shape[0];
     let words: Vec<u32> = bitmap.read_vec();
+    unpack_rgb(&words, stride, height, width)
+}
+
+/// Async twin of [`bitmap_to_rgb`] — same unpack over the async readback
+/// (cubecl's blocking reads poll once and panic on wasm).
+pub(crate) async fn bitmap_to_rgb_async(bitmap: &GpuTensor, width: u32) -> Vec<u8> {
+    let stride = bitmap.shape[1];
+    let height = bitmap.shape[0];
+    let words: Vec<u32> = bitmap.read_vec_async().await;
+    unpack_rgb(&words, stride, height, width)
+}
+
+/// The pure row-unpack both `bitmap_to_rgb` twins share — keeping it here
+/// once is what stops the sync and async bodies from drifting.
+fn unpack_rgb(words: &[u32], stride: usize, height: usize, width: u32) -> Vec<u8> {
     let mut rgb = Vec::with_capacity(height * width as usize * 3);
     for row in 0..height {
         for px in bytemuck::cast_slice::<u32, [u8; 4]>(&words[row * stride..][..width as usize]) {
@@ -257,7 +317,8 @@ pub(crate) fn bitmap_to_rgb(bitmap: &GpuTensor, width: u32) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::seg::views::{PER_CLUSTER, cluster_scene, sphere_oracle, target};
+    use crate::render::{sphere_oracle, target};
+    use crate::seg::views::{PER_CLUSTER, cluster_scene};
 
     /// The row-unpack must skip stride padding and drop alpha: a [2, 5]
     /// bitmap with 3 valid pixels per row yields exactly the 18 real RGB
@@ -313,7 +374,7 @@ mod tests {
     }
 
     /// Config validation fails at the constructor, before any GPU work: zero
-    /// candidates would panic `select_view`'s `cameras[0]` index.
+    /// candidates would panic `select_view_async`'s `cameras[0]` index.
     #[test]
     fn test_segmenter_rejects_invalid_config() {
         let (_gpu, client) = crate::gpu_testing::test_client();

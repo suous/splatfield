@@ -2,6 +2,7 @@
 //! frame. Declared from `main.rs` — binary code, so library items go
 //! through `splatfield::`.
 
+use std::rc::Rc;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -17,6 +18,7 @@ const UV_RECT: Rect = Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(1.0, 1.0))
 const STATUS_LIFETIME: std::time::Duration = std::time::Duration::from_secs(4);
 
 /// Whether a drag-and-dropped file is a loadable scene.
+#[cfg(target_arch = "wasm32")]
 fn is_scene(path: &std::path::Path) -> bool {
     path.extension().is_some_and(|e| {
         splatfield::SCENE_EXTENSIONS
@@ -42,12 +44,14 @@ fn draw_selection_box(painter: &egui::Painter, rect: egui::Rect) {
 impl App {
     /// Draw the docked B3-Seg panel; returns the user's triggers
     /// (run_requested, reset_clicked, cut_clicked, save_clicked,
-    /// cancel_clicked).
+    /// cancel_clicked). `busy` drives the run/stop pair; `locked` — runs
+    /// plus in-flight cut readbacks — drives the edit buttons.
     pub(crate) fn seg_panel(
         &mut self,
         ui: &mut egui::Ui,
         busy: bool,
         has_model: bool,
+        locked: bool,
     ) -> (bool, bool, bool, bool, bool) {
         let mut run = false;
         let mut reset_clicked = false;
@@ -84,9 +88,9 @@ impl App {
                     has_model && !busy && !self.seg.prompt.trim().is_empty(),
                 );
                 cancel_clicked |= btn(ui, "stop", busy);
-                reset_clicked |= btn(ui, "reset", has_model && !busy);
-                cut_clicked |= btn(ui, "cut", has_model && !busy && self.seg.result.is_some());
-                save_clicked |= btn(ui, "save", has_model && !busy);
+                reset_clicked |= btn(ui, "reset", has_model && !locked);
+                cut_clicked |= btn(ui, "cut", has_model && !locked && self.seg.result.is_some());
+                save_clicked |= btn(ui, "save", has_model && !locked);
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let help = ui.add(egui::Button::new("?").small());
                     help.on_hover_ui(|ui| {
@@ -147,6 +151,36 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _: &mut eframe::Frame) {
+        // Worker replies accumulated since last frame fold into the seg
+        // state first, so the panel and pill draw this frame's busy/progress.
+        // Taken before the loop: the cell guard must not live across a fold.
+        #[cfg(target_arch = "wasm32")]
+        {
+            let responses = std::mem::take(&mut *self.seg.inbox.borrow_mut());
+            for response in responses {
+                self.fold_response(response);
+            }
+            // Then the loop task's publications (progress, terminal).
+            let msgs = std::mem::take(&mut *self.seg.msgs.borrow_mut());
+            for msg in msgs {
+                self.fold_seg_msg(msg);
+            }
+            // A finished cut readback applies here, on the UI thread where
+            // the undo bookkeeping lives; the lock re-opens only when a
+            // staged cut actually landed (an empty drain means the readback
+            // is still in flight — see `Loaded::drain_cut`).
+            let staged = self.splats.lock().unwrap().drain_cut();
+            if let Some(crate::scene::CutStaged {
+                apply: Some((cut, colors)),
+            }) = staged
+            {
+                self.apply_removal(cut, Some(colors));
+            }
+        }
+
+        // Drag-and-drop loading is wasm-only: the load reads the dropped
+        // file's bytes through the browser handle.
+        #[cfg(target_arch = "wasm32")]
         let dropped = ui.input(|i| {
             i.raw
                 .dropped_files
@@ -154,20 +188,25 @@ impl eframe::App for App {
                 .find(|f| is_scene(f.path()))
                 .cloned()
         });
-        // A drop during a run would leave the worker tinting the old model
-        // and reporting old counts — reject until it finishes.
+        // A drop during a run or a cut readback would leave the worker
+        // tinting a stale model or the staged cut folding over new
+        // numbering — reject until both are done.
+        #[cfg(target_arch = "wasm32")]
         if let Some(file) = dropped
-            && !self.seg.busy()
+            && !self.locked()
         {
-            self.load_file(file.path(), ui.ctx().clone());
+            self.load_file(file, ui.ctx().clone());
         }
 
         // B3-Seg sidebar: docked bottom panel with the text-prompt controls.
-        let busy = self.seg.busy();
+        let busy = self.seg.busy;
         let has_model = self.splats.lock().unwrap().scene.is_some();
+        // The edit buttons wait for runs and in-flight cut readbacks alike
+        // (they all stage against the live scene's numbering).
+        let locked = self.locked();
         let heatmap_before = self.seg.heatmap;
         let (run, reset_clicked, cut_clicked, save_clicked, cancel_clicked) =
-            self.seg_panel(ui, busy, has_model);
+            self.seg_panel(ui, busy, has_model, locked);
         if self.seg.heatmap != heatmap_before {
             // Toggling the heatmap switches what the viewport paints.
             self.paint_dirty = true;
@@ -195,19 +234,29 @@ impl eframe::App for App {
             self.save_ply();
         }
         if cancel_clicked {
-            if let Some(c) = &self.seg.cancel {
-                c.store(true, Ordering::Relaxed);
+            // Store the flag the loop task's on_round polls — false stops
+            // the run at the round boundary (a delivered round is a valid
+            // partial result). During the fetch phase no flag exists yet:
+            // EnsureModels cannot be cancelled, the queued run still starts.
+            if let Some(cancel) = &self.seg.cancel {
+                cancel.store(true, Ordering::Relaxed);
             }
             self.set_status("cancelling…", false);
         }
-        self.drain_segmentation();
+
+        // A finished save reports through the pill; the lock drops before
+        // set_status borrows the app.
+        let save_result = self.splats.lock().unwrap().save_result.take();
+        if let Some((msg, error)) = save_result {
+            self.set_status(msg, error);
+        }
 
         // The pill speaks whenever the engine has something to say: live
         // progress while a run is active, idle outcomes self-dismissing.
         // Failures persist until replaced — vanishing errors get missed.
         // The app repaints only when dirty, so the dismissal deadline
         // schedules its own wake-up.
-        let busy = self.seg.busy();
+        let busy = self.seg.busy;
         if !busy && !self.seg.status_error {
             match STATUS_LIFETIME.checked_sub(self.seg.status_at.elapsed()) {
                 None => self.seg.status.clear(),
@@ -249,6 +298,15 @@ impl eframe::App for App {
             self.seg.result = None;
         }
         let Some(splats) = slot.scene.as_ref().map(|s| s.splats.clone()) else {
+            // No scene yet: a failed first load must still reach the pill —
+            // wasm has no stderr to fall back on, and this path returns
+            // before the with-scene set_status below. The repaint schedules
+            // the frame the pill is drawn in.
+            drop(slot);
+            if let Some((msg, error)) = load_failed {
+                self.set_status(msg, error);
+                ui.ctx().request_repaint();
+            }
             ui.centered_and_justified(|ui| ui.heading("Drag and drop a .ply or .sog file"));
             return;
         };
@@ -304,33 +362,65 @@ impl eframe::App for App {
                 self.request_segmentation(prompt);
             }
 
-            let posterior = self.seg.posterior.as_ref().filter(|_| self.seg.heatmap);
+            let posterior = self
+                .seg
+                .posterior
+                .as_ref()
+                .filter(|_| self.seg.heatmap)
+                .cloned();
             // A camera-neutral event (e.g. a bare click) would re-run the
             // whole ~30-launch pipeline only to repaint an identical bitmap —
             // skip it. Any load brings a fresh Arc, so pointer inequality
-            // covers reframes too; the segmentation tint and posterior
-            // updates mutate in place, so they set paint_dirty instead.
+            // covers reframes too; the pose comparison covers motion that
+            // arrived while a wasm render was in flight, and the segmentation
+            // tint and posterior updates mutate in place, so they set
+            // paint_dirty instead.
             let stale = moved
                 || self.paint_dirty
-                || self.rendered.as_ref().is_none_or(|(last_px, last_splats)| {
-                    *last_px != pixel || !Arc::ptr_eq(last_splats, &splats)
-                });
+                || self
+                    .rendered
+                    .as_ref()
+                    .is_none_or(|(last_px, last_splats, last_cam)| {
+                        *last_px != pixel
+                            || !Arc::ptr_eq(last_splats, &splats)
+                            || *last_cam != self.controller.camera
+                    });
             if stale {
-                render_frame(
-                    &self.client,
-                    &mut self.gpu,
-                    &splats,
-                    &self.controller.camera,
-                    pixel,
-                    posterior,
-                );
-                self.rendered = Some((pixel, Arc::clone(&splats)));
-                self.paint_dirty = false;
+                // Record the pose this flight renders — not the current
+                // controller state, which may drift further while it runs.
+                let camera = self.controller.camera;
+                let gpu = Rc::clone(&self.gpu);
+
+                // Single-flight on wasm: the slot holds `None` while a render
+                // is in flight, so back-to-back stale frames coalesce, and the
+                // task's request_repaint brings the loop back to schedule
+                // whatever camera state the flight missed. Native drives the
+                // same render inline (tombstone build), where the slot is
+                // never busy.
+                if gpu.borrow().is_some() {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    cubecl::future::block_on(render_frame(
+                        &gpu, &splats, &camera, pixel, posterior,
+                    ));
+
+                    #[cfg(target_arch = "wasm32")]
+                    {
+                        let ctx = ui.ctx().clone();
+                        let splats = Arc::clone(&splats);
+                        wasm_bindgen_futures::spawn_local(async move {
+                            render_frame(&gpu, &splats, &camera, pixel, posterior).await;
+                            ctx.request_repaint();
+                        });
+                    }
+
+                    self.rendered = Some((pixel, Arc::clone(&splats), camera));
+                    self.paint_dirty = false;
+                }
             }
         }
 
         ui.painter()
-            .image(self.gpu.backbuffer.id, rect, UV_RECT, Color32::WHITE);
+            .image(self.tex_id, rect, UV_RECT, Color32::WHITE);
 
         // Selection overlay: the live Shift+drag box.
         if let (Some(start), Some(end)) = (self.seg.box_drag, response.interact_pointer_pos()) {

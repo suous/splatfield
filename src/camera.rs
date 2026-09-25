@@ -1,7 +1,7 @@
 use eframe::egui::{self, CursorIcon, PointerButton, Response};
 use glam::{Affine3A, Quat, UVec2, Vec2, Vec3};
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Camera {
     pub fov: Vec2,
     pub position: Vec3,

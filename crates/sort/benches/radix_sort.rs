@@ -2,9 +2,8 @@ use criterion::measurement::WallTime;
 use criterion::{
     BenchmarkGroup, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main,
 };
-use cubecl::Runtime;
-use cubecl::client::ComputeClient;
-use cubecl::wgpu::WgpuRuntime;
+use cubecl::client::Client;
+
 use rand::RngExt;
 use splat_sort::sort::RadixScratch;
 use splat_sort::tensor::GpuTensor;
@@ -32,11 +31,7 @@ fn make_data(n: usize, dist: &str) -> Vec<u32> {
 
 /// Keys (distribution `dist`), identity values, and scratch — the setup every
 /// sort bench shares.
-fn sort_fixture(
-    client: &ComputeClient<WgpuRuntime>,
-    n: usize,
-    dist: &str,
-) -> (GpuTensor, GpuTensor, RadixScratch) {
+fn sort_fixture(client: &Client, n: usize, dist: &str) -> (GpuTensor, GpuTensor, RadixScratch) {
     let keys = GpuTensor::from(client, [n], make_data(n, dist));
     let vals = GpuTensor::from(client, [n], (0..n as u32).collect::<Vec<_>>());
     (keys, vals, RadixScratch::new(client, n))
@@ -92,7 +87,7 @@ fn bench_sweep(
     cases: Vec<(BenchmarkId, usize, &'static str, u32)>,
     write_keys: bool,
 ) {
-    let client = cubecl::wgpu::WgpuRuntime::client(&Default::default());
+    let client = cubecl::Device::default().client();
     let mut group = bench_group(c, name);
     for (id, n, dist, bits) in &cases {
         let (keys, vals, scratch) = sort_fixture(&client, *n, dist);
@@ -157,7 +152,7 @@ fn bench_values_only(c: &mut Criterion) {
 }
 
 fn bench_end_to_end(c: &mut Criterion) {
-    let client = cubecl::wgpu::WgpuRuntime::client(&Default::default());
+    let client = cubecl::Device::default().client();
     let mut group = bench_group(c, "radix_argsort/end_to_end");
 
     for &n in SIZES {

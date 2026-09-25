@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <base data-trunk-public-url />
+    <link rel="icon" type="image/svg+xml" href="favicon.svg" />
+    <title>SplatField</title>
+    <!-- The post-MVP params are load-bearing: wasm-opt rejects the bulk-memory /
+         sign-ext / nontrapping-float-to-int instructions the toolchain emits. -->
+    <link data-trunk rel="rust" data-wasm-opt="2" data-wasm-opt-params="--enable-bulk-memory --enable-sign-ext --enable-nontrapping-float-to-int" />
+    <!-- Pipeline worker (src/worker_main.rs): trunk builds the bin with
+         --features worker (required-features keeps it out of host builds),
+         as a no-modules wasm-bindgen target. It injects NO script tag —
+         dist gets splatfield-worker.js/-_bg.wasm plus, via
+         data-loader-shim, splatfield-worker_loader.js (a classic-worker
+         bootstrap); the page spawns it itself (src/worker.rs). -->
+    <link data-trunk rel="rust" data-type="worker" data-bin="splatfield-worker" data-cargo-features="worker" data-loader-shim data-wasm-opt="2" data-wasm-opt-params="--enable-bulk-memory --enable-sign-ext --enable-nontrapping-float-to-int" />
+    <link data-trunk rel="copy-file" path="favicon.svg" href="favicon.svg" />
+    <style>
+        html, body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: #000;
+        }
+        canvas {
+            width: 100vw;
+            height: 100vh;
+            display: block;
+        }
+        .centered {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            color: #f0f0f0;
+            font-size: 24px;
+            font-family: Helvetica, sans-serif;
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <canvas id="the_canvas_id"></canvas>
+    <div class="centered" id="loading_text">
+        <p>Loading SplatField...</p>
+    </div>
+</body>
+</html>

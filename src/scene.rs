@@ -2,21 +2,24 @@
 //! / cut edits over it, and the viewport render path. Declared from
 //! `main.rs` — binary code, so library items go through `splatfield::`.
 
+use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Arc;
 
-use cubecl::client::ComputeClient;
-use cubecl::wgpu::WgpuRuntime;
+#[cfg(target_arch = "wasm32")]
 use eframe::egui;
+#[cfg(target_arch = "wasm32")]
+use eframe::wasm_bindgen::JsCast;
 use splat_sort::tensor::GpuTensor;
+#[cfg(target_arch = "wasm32")]
 use splatfield::seg::beta::map_labels;
 use splatfield::{camera, render, texture, to_dc};
 
 use super::{App, SELECT_GREEN};
 
 /// A loaded scene: the GPU model, the pristine CPU master it rebuilds
-/// from, the untouched DC color snapshot (for the reset button), and the
-/// source path the save button writes alongside. Fields are always set
-/// together, so a half-loaded state is unrepresentable.
+/// from, and the untouched DC color snapshot (for the reset button).
+/// Fields are always set together, so a half-loaded state is unrepresentable.
 pub(crate) struct Scene {
     pub(crate) splats: Arc<render::Splats>,
     /// Pristine CPU master the box-select deletion gathers from — the GPU
@@ -28,7 +31,9 @@ pub(crate) struct Scene {
     /// the zeros are uploaded once and only ever read by the tint.
     pub(crate) sel_mask: GpuTensor,
     pub(crate) sel_zeros: GpuTensor,
-    pub(crate) path: std::path::PathBuf,
+    /// The source FILE NAME (web has no directories): the save button
+    /// derives `<name>.edited.ply` from it.
+    pub(crate) name: String,
 }
 
 /// The loaded scene and its "reframe the camera" flag under one lock.
@@ -42,6 +47,21 @@ pub(crate) struct Loaded {
     /// Load failures (drag-drop), surfaced in the status pill — a GUI
     /// launch has no stderr to read.
     pub(crate) load_error: Option<String>,
+    /// Finished saves report (message, error) here — the async save task
+    /// can't borrow `self`, so the next frame drains it into the status
+    /// pill, mirroring `load_error`.
+    pub(crate) save_result: Option<(String, bool)>,
+    /// The wasm cut's two-phase state (see `cut_object`): `cut_in_flight`
+    /// from click until the staged outcome drains, then `cut` holds the
+    /// outcome for the next frame's UI drain. Both live under this lock so
+    /// the release rule is one testable place: the lock re-opens only when
+    /// a staged cut actually lands — an empty drain means the readback is
+    /// still running and every numbering-sensitive edit stays out.
+    pub(crate) cut_in_flight: bool,
+    /// The wasm cut task's staged outcome, drained by the UI like
+    /// `save_result`. (Host never stages — the host cut stub is a no-op —
+    /// so the field sits empty there.)
+    pub(crate) cut: Option<CutStaged>,
 }
 
 /// GPU frame state: the presentation texture and the per-frame scratch
@@ -51,8 +71,51 @@ pub(crate) struct FrameGpu {
     pub(crate) scratch: Option<render::RenderScratch>,
 }
 
+/// Staged outcome of a cut's async readback (wasm): `None` apply is a no-op
+/// cut (everything object or everything background — it must not spend the
+/// undo level). The readback task stages it; the next frame's UI drain
+/// applies it on the UI thread, where the undo/removed bookkeeping lives.
+pub(crate) struct CutStaged {
+    pub(crate) apply: Option<(Vec<usize>, GpuTensor)>,
+}
+
+impl Loaded {
+    /// Open the cut lock: the readback task may now stage against the
+    /// scene, and every numbering-sensitive edit is shut out until
+    /// [`Loaded::drain_cut`] lands a staged outcome.
+    pub(crate) fn begin_cut(&mut self) {
+        self.cut_in_flight = true;
+    }
+
+    /// The readback task publishes its outcome (a no-op cut stages
+    /// `apply: None` — it still releases the lock). Wasm-only caller.
+    pub(crate) fn stage_cut(&mut self, staged: CutStaged) {
+        self.cut = Some(staged);
+    }
+
+    /// Take the staged cut, releasing the lock ONLY when one actually
+    /// landed. Clearing on an empty drain would re-open the edits while the
+    /// readback is still in flight: a delete/undo in that window folds the
+    /// landing cut over a renumbered scene, and a box-select's tint lands
+    /// in the cut's undo-level colors.
+    pub(crate) fn drain_cut(&mut self) -> Option<CutStaged> {
+        let staged = self.cut.take();
+        if staged.is_some() {
+            self.cut_in_flight = false;
+        }
+        staged
+    }
+}
+
+/// The render task moves the frame state out for the duration of a frame, so
+/// no borrow is held across its await; `None` means a render is in flight.
+pub(crate) type FrameSlot = Rc<RefCell<Option<FrameGpu>>>;
+
 impl App {
-    pub(crate) fn load_file(&self, path: &std::path::Path, ctx: egui::Context) {
+    /// Parse and upload a dropped scene off the UI thread; of two racing
+    /// loads the one requested LAST wins.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn load_file(&self, file: egui::DroppedFileHandle, ctx: egui::Context) {
         let client = self.client.clone();
         let splats = Arc::clone(&self.splats);
 
@@ -64,8 +127,13 @@ impl App {
             slot.load_gen
         };
 
-        let path = path.to_owned();
-        let save_path = path.clone();
+        // The source FILE NAME (web has no directories) — the save button
+        // derives `<name>.edited.ply` from it.
+        let name = std::path::Path::new(file.path())
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "scene".into());
+
         let on_loaded = move |result: anyhow::Result<render::CpuSplats>| {
             let payload = result.map(|cpu| {
                 let data = Arc::new(cpu.clone().upload(&client));
@@ -85,13 +153,12 @@ impl App {
                         colors,
                         sel_mask: GpuTensor::empty(&client, [n]),
                         sel_zeros: GpuTensor::from(&client, [n], vec![0f32; n]),
-                        path: save_path,
+                        name,
                     });
                     slot.reframe = true;
                     drop(slot);
                 }
                 Err(e) => {
-                    eprintln!("Failed to load splat: {e:#}");
                     let mut slot = splats.lock().unwrap();
                     if slot.load_gen != load_id {
                         return;
@@ -103,15 +170,23 @@ impl App {
             ctx.request_repaint();
         };
 
-        std::thread::spawn(move || {
-            on_loaded(splatfield::load_scene_file(&path));
+        // `file.path()` on wasm is the file NAME (eframe sets it from
+        // File::name) — extension detection still works.
+        wasm_bindgen_futures::spawn_local(async move {
+            match file.bytes_async().await {
+                Ok(bytes) => on_loaded(splatfield::load_scene(
+                    file.path().extension().unwrap_or_default(),
+                    std::io::Cursor::new(bytes),
+                )),
+                Err(e) => on_loaded(Err(anyhow::anyhow!("Failed to read dropped file: {e}"))),
+            }
         });
     }
 
     /// Box-select: keep the splats whose projected centers fall in the
     /// viewport-pixel rect and repaint the highlight.
     pub(crate) fn select_in_rect(&mut self, pixel: glam::UVec2, min: glam::Vec2, max: glam::Vec2) {
-        if self.seg.busy() {
+        if self.locked() {
             return;
         }
         {
@@ -158,7 +233,7 @@ impl App {
     /// previous state is the single undo level) and rebuild the scene from
     /// the pristine CPU master.
     pub(crate) fn delete_selection(&mut self) {
-        if self.seg.busy() || self.sel.is_empty() {
+        if self.locked() || self.sel.is_empty() {
             return;
         }
         let slot = self.splats.lock().unwrap();
@@ -199,7 +274,7 @@ impl App {
     /// repaints its pre-cut colors. One level per keystroke, last action
     /// first.
     pub(crate) fn undo_delete(&mut self) {
-        if self.seg.busy() {
+        if self.locked() {
             return;
         }
         if let Some((prev, colors)) = self.undo.pop() {
@@ -218,37 +293,64 @@ impl App {
     /// posterior puts in the background, rebuilding from the pristine CPU
     /// master so the extracted object shows its original colors. The
     /// pre-cut removed-set and DC colors become the undo level.
+    ///
+    /// The a/b readback is blocking (panics on wasm) and cannot borrow the
+    /// app across an await, so on wasm the labels are computed in a task
+    /// and the outcome is staged for the next frame's UI drain — all App
+    /// mutation stays on the UI thread (the `save_result` pattern).
+    /// [`App::locked`] keeps a second cut — and every
+    /// numbering-sensitive edit — out until it lands, so `kept` (captured
+    /// here) still describes the scene when the drain applies it.
+    #[cfg(target_arch = "wasm32")]
     pub(crate) fn cut_object(&mut self) {
-        if self.seg.busy() {
+        if self.locked() {
             return;
         }
         let Some((a, b)) = &self.seg.result else {
             return;
         };
-        let slot = self.splats.lock().unwrap();
-        let Some(scene) = &slot.scene else {
-            return;
+        let kept = {
+            let slot = self.splats.lock().unwrap();
+            let Some(scene) = &slot.scene else {
+                return;
+            };
+            // A posterior from before a box-delete no longer matches the
+            // live scene's numbering — cut only when the counts agree.
+            let kept = scene.cpu.kept(&self.removed);
+            if kept.len() != scene.splats.attributes.shape[0] || kept.len() != a.shape[0] {
+                return;
+            }
+            kept
         };
-        // A posterior from before a box-delete no longer matches the live
-        // scene's numbering — cut only when the counts agree.
-        let kept = scene.cpu.kept(&self.removed);
-        if kept.len() != scene.splats.attributes.shape[0] || kept.len() != a.shape[0] {
-            return;
-        }
-        let (a, b): (Vec<f32>, Vec<f32>) = (a.read_vec(), b.read_vec());
-        let labels = map_labels(&a, &b);
-        let cut: Vec<usize> = (0..kept.len())
-            .filter_map(|i| (!labels[i]).then_some(kept[i]))
-            .collect();
-        // A no-op cut — everything object or everything background — must
-        // not spend the undo level; removing everything starves the renderer.
-        if cut.is_empty() || cut.len() == kept.len() {
-            return;
-        }
-        let colors = scene.splats.save_colors();
-        drop(slot);
-        self.apply_removal(cut, Some(colors));
+        self.splats.lock().unwrap().begin_cut();
+        let (a, b) = (a.clone(), b.clone());
+        let splats = Arc::clone(&self.splats);
+        wasm_bindgen_futures::spawn_local(async move {
+            let (pa, pb) = (a.read_vec_async().await, b.read_vec_async().await);
+            let labels = map_labels(&pa, &pb);
+            let cut: Vec<usize> = (0..kept.len())
+                .filter_map(|i| (!labels[i]).then_some(kept[i]))
+                .collect();
+            let apply = if cut.is_empty() || cut.len() == kept.len() {
+                None
+            } else {
+                // Snapshot the pre-cut DC colors on the live scene; a scene
+                // that vanished mid-readback leaves nothing to cut.
+                let colors = splats
+                    .lock()
+                    .unwrap()
+                    .scene
+                    .as_ref()
+                    .map(|s| s.splats.save_colors());
+                colors.map(|colors| (cut, colors))
+            };
+            splats.lock().unwrap().stage_cut(CutStaged { apply });
+        });
     }
+
+    /// Native main is a tombstone — the real cut runs on wasm.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn cut_object(&mut self) {}
 
     /// Rebuild the GPU scene from the CPU master minus the removed-set. A
     /// fresh Arc repaints automatically; the color snapshot is retaken at
@@ -268,55 +370,172 @@ impl App {
     }
 
     /// Save the live scene — current colors and removals exactly as shown —
-    /// as a PLY next to the source file. Every plane except SH DC is the
+    /// as a PLY the browser downloads. Every plane except SH DC is the
     /// pristine master's gather (tint/restore mutate only DC on the GPU),
     /// so only the 3n DC floats are read back; a full-scene readback synced
     /// the UI thread for tens of MB for nothing.
+    #[cfg(target_arch = "wasm32")]
     pub(crate) fn save_ply(&mut self) {
-        if self.seg.busy() {
+        if self.locked() {
             return;
         }
-        let (path, cpu) = {
+        let (name, colors, cpu) = {
             let slot = self.splats.lock().unwrap();
             let Some(scene) = &slot.scene else {
                 return;
             };
             let kept = scene.cpu.kept(&self.removed);
-            let mut cpu = scene.cpu.gather(&kept);
-            let dc = scene.splats.save_colors().read_vec();
-            cpu.sh_coeffs[..dc.len()].copy_from_slice(&dc);
-            (scene.path.clone(), cpu)
+            let cpu = scene.cpu.gather(&kept);
+            let colors = scene.splats.save_colors();
+            (scene.name.clone(), colors, cpu)
         };
-        let out = path.with_extension("edited.ply");
-        let saved = || -> anyhow::Result<()> { cpu.write_ply(std::fs::File::create(&out)?) }();
-        let (msg, error) = match saved {
-            Ok(()) => (format!("saved {}", out.display()), false),
-            Err(e) => (format!("save failed: {e}"), true),
-        };
-        self.set_status(msg, error);
+        // std's with_extension: the source's extension is replaced, so
+        // `bear.3d71a266.sog` saves as `bear.3d71a266.edited.ply` — the
+        // native flow's exact naming.
+        let out = std::path::PathBuf::from(&name)
+            .with_extension("edited.ply")
+            .to_string_lossy()
+            .into_owned();
+        self.set_status("saving models…", false);
+        let splats = Arc::clone(&self.splats);
+        wasm_bindgen_futures::spawn_local(async move {
+            let saved = async {
+                // The pill must paint before the main thread blocks on the
+                // readback/write/copy pipeline, so yield one macrotask first.
+                let delay = js_sys::eval("new Promise((resolve) => setTimeout(resolve, 50))")
+                    .map_err(|e| anyhow::anyhow!("scheduling the save: {e:?}"))?;
+                wasm_bindgen_futures::JsFuture::from(delay.unchecked_into::<js_sys::Promise>())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("save interrupted: {e:?}"))?;
+                let dc = colors.read_vec_async::<f32>().await;
+                let mut cpu = cpu;
+                cpu.sh_coeffs[..dc.len()].copy_from_slice(&dc);
+                // One reservation instead of Vec doubling: the output is
+                // tens to hundreds of MB and every doubling re-memcpys the
+                // whole file inside linear memory.
+                let n = cpu.attributes.len() / splatfield::layout::ATTR_PLANES;
+                let floats = 17 + (cpu.sh_coeffs.len() / (3 * n) - 1) * 3;
+                let mut bytes = Vec::with_capacity(n * floats * 4 + 1024 + (floats - 17) * 24);
+                cpu.write_ply(&mut bytes)?;
+                download_bytes(&bytes, &out)
+            }
+            .await;
+            let result = match saved {
+                Ok(()) => (format!("saved {out} — check your downloads"), false),
+                Err(e) => (format!("save failed: {e:#}"), true),
+            };
+            splats.lock().unwrap().save_result = Some(result);
+        });
+    }
+
+    /// Native main is a tombstone — the UI never runs here.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn save_ply(&mut self) {}
+}
+
+/// Hand `bytes` to the browser as a file download named `name`: a blob URL
+/// on a detached anchor, clicked and revoked — detached anchors download
+/// fine, no DOM insertion needed.
+///
+/// The Uint8Array goes INSIDE a JS array: `new Blob(parts)` takes a
+/// sequence of BlobPart, and a bare Uint8Array is itself iterable —
+/// passing it directly makes the browser walk it byte-by-byte and fall
+/// through to the USVString branch, stringifying every value: slowly
+/// assembling a text file of decimal digits while the page sits frozen.
+#[cfg(target_arch = "wasm32")]
+fn download_bytes(bytes: &[u8], name: &str) -> anyhow::Result<()> {
+    let document = web_sys::window()
+        .ok_or_else(|| anyhow::anyhow!("no window"))?
+        .document()
+        .ok_or_else(|| anyhow::anyhow!("no document"))?;
+    let parts = js_sys::Array::of1(&js_sys::Uint8Array::from(bytes).into());
+    let blob = web_sys::Blob::new_with_u8_array_sequence(parts.as_ref())
+        .map_err(|e| anyhow::anyhow!("create blob: {e:?}"))?;
+    let url = web_sys::Url::create_object_url_with_blob(&blob)
+        .map_err(|e| anyhow::anyhow!("create object url: {e:?}"))?;
+    let anchor = document
+        .create_element("a")
+        .map_err(|e| anyhow::anyhow!("create anchor: {e:?}"))?
+        .dyn_into::<web_sys::HtmlAnchorElement>()
+        .map_err(|e| anyhow::anyhow!("anchor is not an <a>: {e:?}"))?;
+    anchor.set_href(&url);
+    anchor.set_download(name);
+    anchor.click();
+    web_sys::Url::revoke_object_url(&url).map_err(|e| anyhow::anyhow!("revoke url: {e:?}"))?;
+    Ok(())
+}
+
+/// Holds the frame state for the duration of a render and returns it to the
+/// slot on drop. The drop path matters: a panic mid-pipeline would otherwise
+/// leave the slot empty forever, and on wasm every later frame would see a
+/// busy slot and render nothing — a frozen app with no error.
+struct SlotGuard {
+    slot: FrameSlot,
+    frame: Option<FrameGpu>,
+}
+
+impl Drop for SlotGuard {
+    fn drop(&mut self) {
+        *self.slot.borrow_mut() = self.frame.take();
     }
 }
 
 /// Render `splats` into the frame's scratch and present the bitmap to the
-/// backbuffer; the pipeline syncs on the counters readback, on the UI thread.
-/// With `posterior` set, splats are painted by their Beta posterior mean
-/// instead of their SH color.
-pub(crate) fn render_frame(
-    client: &ComputeClient<WgpuRuntime>,
-    frame: &mut FrameGpu,
+/// backbuffer. With `posterior` set, splats are painted by their Beta
+/// posterior mean instead of their SH color. The frame state moves out of
+/// the slot for the duration of the pipeline's counters readback, so no
+/// borrow is held across the await.
+pub(crate) async fn render_frame(
+    slot: &FrameSlot,
     splats: &render::Splats,
     camera: &camera::Camera,
     pixel: glam::UVec2,
-    posterior: Option<&(GpuTensor, GpuTensor)>,
+    posterior: Option<(GpuTensor, GpuTensor)>,
 ) {
-    let img = {
+    let Some(frame) = slot.borrow_mut().take() else {
+        return;
+    };
+    let mut guard = SlotGuard {
+        slot: Rc::clone(slot),
+        frame: Some(frame),
+    };
+    if let Some(frame) = guard.frame.as_mut() {
+        let client = &splats.attributes.client;
         let scratch = frame.scratch.get_or_insert_with(|| {
             render::RenderScratch::new(client, splats.attributes.shape[0], pixel)
         });
-        match posterior {
-            Some((a, b)) => splats.render_posterior(scratch, a, b, camera, pixel),
-            None => splats.render_with(scratch, camera, pixel),
-        }
-    };
-    frame.backbuffer.update_texture(&img, pixel);
+        let img = match &posterior {
+            Some((a, b)) => {
+                splats
+                    .render_posterior_async(scratch, a, b, camera, pixel)
+                    .await
+            }
+            None => splats.render_with_async(scratch, camera, pixel).await,
+        };
+        frame.backbuffer.update_texture(&img, pixel);
+    }
+}
+
+#[cfg(test)]
+mod cut_lock_tests {
+    use super::{CutStaged, Loaded};
+
+    /// The cut lock releases only when a staged cut actually drains: a
+    /// frame whose drain finds nothing (readback still in flight) must keep
+    /// `cut_in_flight` set, or the numbering-sensitive edits re-open in the
+    /// window before the outcome lands.
+    #[test]
+    fn cut_lock_releases_only_when_a_staged_cut_drains() {
+        let mut loaded = Loaded::default();
+        loaded.begin_cut();
+        // The readback is still running: the drain finds nothing and the
+        // lock must hold.
+        assert!(loaded.drain_cut().is_none());
+        assert!(loaded.cut_in_flight);
+        // The outcome lands — here the no-op cut, `apply: None`, which
+        // carries no GPU payload and still releases the lock.
+        loaded.stage_cut(CutStaged { apply: None });
+        assert!(loaded.drain_cut().is_some());
+        assert!(!loaded.cut_in_flight);
+    }
 }

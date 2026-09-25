@@ -6,21 +6,35 @@ use crate::scan::{ScanScratch, exclusive_scan_buf};
 use crate::tensor::GpuTensor;
 use cubecl::calculate_cube_count_elemwise;
 use cubecl::prelude::*;
-use cubecl::wgpu::WgpuRuntime;
 
 const SORT_WG: u32 = 128;
-// 6-bit digits: few passes, and 2048/64 = 32-element digit runs (two cache
-// lines) keep the scatter's global writes coalesced.
+// Fallback path (no plane ops): 4-bit digits, per-lane private histograms.
+const BITS_PER_PASS_FALLBACK: u32 = 4;
+const SORT_BINS: u32 = 1 << BITS_PER_PASS_FALLBACK;
+const ELEMS_PER_THREAD: u32 = 8;
+const SORT_BLOCK: u32 = SORT_WG * ELEMS_PER_THREAD;
+// Plane path: 6-bit digits cut the pass count by a third while digit runs
+// stay wide enough (2048/64 = 32 elements, two cache lines) that the
+// scatter's global writes coalesce.
 const BINS_PLANE: u32 = 64;
 const BITS_PLANE: u32 = 6;
 const EPT_PLANE: u32 = 16;
 const BLOCK_PLANE: u32 = SORT_WG * EPT_PLANE;
 
-/// Histogram each 6-bit digit into per-workgroup counts, bin-major
+/// Histogram each `bins`-bit digit into per-workgroup counts, bin-major
 /// `counts[bin * num_wgs + wg]`, so one flat exclusive scan yields each
-/// (bin, wg) cell's global scatter offset directly.
+/// (bin, wg) cell's global scatter offset directly. `bins` must be a power
+/// of two at or below SORT_WG (one bin per thread).
 #[cube(launch)]
-fn count_kernel(num_wgs: u32, shift: u32, num_keys: u32, src: &[u32], counts: &mut [u32]) {
+fn count_kernel(
+    num_wgs: u32,
+    shift: u32,
+    num_keys: u32,
+    #[comptime] bins: u32,
+    #[comptime] block: u32,
+    src: &[u32],
+    counts: &mut [u32],
+) {
     // CUBE_POS linearizes the workgroup id: the grid may be spread over Y/Z
     // when the X count exceeds the hardware limit (CubeCountSelection).
     let wg = CUBE_POS as u32;
@@ -29,24 +43,99 @@ fn count_kernel(num_wgs: u32, shift: u32, num_keys: u32, src: &[u32], counts: &m
     }
 
     // Workgroup-shared histogram — each key is read once, not once per bin.
-    let histogram = Shared::<[Atomic<u32>]>::new_slice(BINS_PLANE as usize);
-    if UNIT_POS < BINS_PLANE {
+    let histogram = Shared::<[Atomic<u32>]>::new_slice(bins as usize);
+    if UNIT_POS < bins {
         histogram[UNIT_POS as usize].store(0u32);
     }
     sync_cube();
 
-    let base = BLOCK_PLANE * wg + UNIT_POS;
-    for e in 0..(BLOCK_PLANE / SORT_WG) {
+    let base = block * wg + UNIT_POS;
+    for e in 0..(block / SORT_WG) {
         let idx = base + e * SORT_WG;
         if idx < num_keys {
-            let bin = (src[idx as usize] >> shift) & (BINS_PLANE - 1u32);
+            let bin = (src[idx as usize] >> shift) & (bins - 1u32);
             histogram[bin as usize].fetch_add(1u32);
         }
     }
     sync_cube();
 
-    if UNIT_POS < BINS_PLANE {
+    // bins is comptime and below SORT_WG: one bin per thread.
+    if UNIT_POS < bins {
         counts[(UNIT_POS * num_wgs + wg) as usize] = histogram[UNIT_POS as usize].load();
+    }
+}
+
+/// One 4-bit radix fallback pass, for devices without plane ops: each thread
+/// owns a contiguous ELEMS_PER_THREAD chunk and a PRIVATE column of the
+/// [bin][lane] histogram, so ranking needs no atomics and equal keys keep
+/// their relative order. `write_keys` is comptime-false when the caller
+/// discards sorted keys (the depth sort): the final pass only moves values.
+#[cube(launch)]
+fn scatter_kernel(
+    num_wgs: u32,
+    shift: u32,
+    num_keys: u32,
+    #[comptime] write_keys: bool,
+    src: &[u32],
+    values: &[u32],
+    counts: &[u32],
+    out: &mut [u32],
+    out_values: &mut [u32],
+) {
+    let wg = CUBE_POS as u32;
+    if wg >= num_wgs {
+        terminate!();
+    }
+
+    // Stability — equal keys scatter in lane order — is what the render
+    // pipeline's tile sort relies on to preserve depth order within a tile.
+    let mut hist = Shared::<[u32]>::new_slice((SORT_BINS * SORT_WG) as usize);
+    for i in 0..SORT_BINS {
+        hist[(UNIT_POS + i * SORT_WG) as usize] = 0u32;
+    }
+    sync_cube();
+
+    let base = SORT_BLOCK * wg + UNIT_POS * ELEMS_PER_THREAD;
+    for e in 0..ELEMS_PER_THREAD {
+        let idx = base + e;
+        if idx < num_keys {
+            let bin = (src[idx as usize] >> shift) & (SORT_BINS - 1u32);
+            hist[(bin * SORT_WG + UNIT_POS) as usize] += 1u32;
+        }
+    }
+    sync_cube();
+
+    // Per-bin serial scan: one thread walks its bin's SORT_WG private lane
+    // counts in lane order, replacing each count with its exclusive offset.
+    // Lane order matches the chunk layout (lane-major), which is what makes
+    // the scatter stable across the block. A serial walk is acceptable here:
+    // SORT_BINS is small and the short dependent chain is dwarfed by the
+    // global scatter that follows.
+    if UNIT_POS < SORT_BINS {
+        let mut running = counts[(UNIT_POS * num_wgs + wg) as usize];
+        for l in 0..SORT_WG {
+            let cell = (UNIT_POS * SORT_WG + l) as usize;
+            let c = hist[cell];
+            hist[cell] = running;
+            running += c;
+        }
+    }
+    sync_cube();
+
+    for e in 0..ELEMS_PER_THREAD {
+        let idx = base + e;
+        if idx < num_keys {
+            let key = src[idx as usize];
+            let val = values[idx as usize];
+            let bin = (key >> shift) & (SORT_BINS - 1u32);
+            let cell = (bin * SORT_WG + UNIT_POS) as usize;
+            let pos = hist[cell];
+            hist[cell] = pos + 1u32;
+            if write_keys {
+                out[pos as usize] = key;
+            }
+            out_values[pos as usize] = val;
+        }
     }
 }
 
@@ -260,19 +349,42 @@ pub fn bits_for(max_exclusive: u32) -> u32 {
     u32::BITS - max_exclusive.saturating_sub(1).leading_zeros()
 }
 
-/// The comptime worst-case plane count for [`scatter_plane_kernel`]:
-/// SORT_WG / hardware plane size minimum. Requires plane ops (supported:
-/// Apple Silicon/Metal3+, where cubecl hardcodes 32-lane planes). Shared
-/// memory: histograms + prefix + dual staging = 17 664 B on 32-lane planes,
-/// well under Metal's 32 KB.
-fn plane_sort_path(client: &ComputeClient<WgpuRuntime>) -> u32 {
+/// Whether the 6-bit plane path can run, and its comptime worst-case plane
+/// count (SORT_WG / hardware plane size minimum). `None` selects the 4-bit
+/// fallback.
+///
+/// Web is excluded by target, before any capability probe: cubecl's WGSL
+/// backend emits `subgroupBallot`/`subgroupShuffle` without the `enable
+/// subgroups;` directive (its feature pass only inserts f16), which every
+/// conforming browser validator rejects — and cubecl fabricates subgroup
+/// sizes (8..128) for WebGPU adapters that report none, so the probe below
+/// would wrongly pass. With the directive gap and non-universal browser
+/// subgroup support, the fallback is the only web path for now.
+fn plane_sort_path(client: &Client) -> Option<u32> {
+    if cfg!(target_arch = "wasm32") {
+        return None;
+    }
     let props = client.properties();
-    assert!(
-        props.features.plane.contains(cubecl::features::Plane::Ops)
-            && props.hardware.plane_size_min != 0,
-        "GPU lacks subgroup (plane) ops; supported platforms: Apple Silicon/Metal3+"
-    );
-    SORT_WG / props.hardware.plane_size_min
+    // Lack of subgroup (plane) ops is no longer fatal — the 4-bit fallback
+    // covers it (plane ops proven on Apple Silicon/Metal3+).
+    if !props.features.plane.contains(cubecl::features::Plane::Ops) {
+        return None;
+    }
+    let hw = &props.hardware;
+    // Ballot ranking reads a single 32-bit word per lane, so wider planes
+    // fall back.
+    if hw.plane_size_min == 0 || hw.plane_size_max > 32 {
+        return None;
+    }
+    let num_planes = SORT_WG / hw.plane_size_min;
+    // Shared must fit the per-plane histograms, the bin prefixes, and the
+    // dual staging buffers: (4*64 + 64 + 2*2048) * 4 B = 17 664 B on 32-lane
+    // planes, well under Metal's 32 KB.
+    let shared = (num_planes * BINS_PLANE + BINS_PLANE + 2 * BLOCK_PLANE) * 4;
+    if shared as usize > hw.max_shared_memory_size {
+        return None;
+    }
+    Some(num_planes)
 }
 
 /// Reusable ping-pong buffers for [`RadixScratch::argsort`], sized for a maximum
@@ -288,7 +400,10 @@ pub struct RadixScratch {
 }
 
 impl RadixScratch {
-    pub fn new(client: &ComputeClient<WgpuRuntime>, max_elems: usize) -> Self {
+    pub fn new(client: &Client, max_elems: usize) -> Self {
+        // The plane path's 64 bins over 2K-element blocks always need the
+        // most counter cells (4-bit fallback: 16 bins over 1K blocks — at
+        // most half as many for the same max_elems).
         let cells = ((max_elems as u32).div_ceil(BLOCK_PLANE) * BINS_PLANE) as usize;
         Self {
             count_buf: GpuTensor::empty(client, [cells]),
@@ -300,10 +415,12 @@ impl RadixScratch {
     }
 
     /// Stable argsort of `keys[0..n]` carrying `vals`, using the low `bits`
-    /// of each key (6-bit digits, plane ranking). Stability — equal keys keep
-    /// input order — is what the render pipeline's tile sort relies on for
-    /// depth order within a tile. Inputs are only read; the returned tensors
-    /// may alias this scratch after an odd pass count (see [`RadixScratch`]).
+    /// of each key: 6-bit digits with plane ranking when the device supports
+    /// it, the 4-bit per-lane histogram fallback otherwise. Stability — equal
+    /// keys keep input order — is what the render pipeline's tile sort relies
+    /// on for depth order within a tile. Inputs are only read; the returned
+    /// tensors may alias this scratch after an odd pass count (see
+    /// [`RadixScratch`]).
     ///
     /// With `write_keys = false` the sorted keys are not written: the
     /// returned key tensor holds stale scratch and must be discarded. Values
@@ -319,45 +436,71 @@ impl RadixScratch {
         if n <= 1 || bits == 0 {
             return (keys.clone(), vals.clone());
         }
-        let client = keys.client.clone();
-        assert!(
-            (n as usize) <= self.dst_keys.shape[0],
-            "radix scratch undersized: sorted {n} elements, capacity {}",
-            self.dst_keys.shape[0]
+        radix_argsort_path(
+            keys,
+            vals,
+            n,
+            bits,
+            write_keys,
+            plane_sort_path(&keys.client),
+            self,
+        )
+    }
+}
+
+fn radix_argsort_path(
+    keys: &GpuTensor,
+    vals: &GpuTensor,
+    n: u32,
+    bits: u32,
+    write_keys: bool,
+    planes: Option<u32>,
+    scratch: &RadixScratch,
+) -> (GpuTensor, GpuTensor) {
+    let client = keys.client.clone();
+    assert!(
+        (n as usize) <= scratch.dst_keys.shape[0],
+        "radix scratch undersized: sorted {n} elements, capacity {}",
+        scratch.dst_keys.shape[0]
+    );
+    let (block, bins, bits_per_pass) = match planes {
+        Some(_) => (BLOCK_PLANE, BINS_PLANE, BITS_PLANE),
+        None => (SORT_BLOCK, SORT_BINS, BITS_PER_PASS_FALLBACK),
+    };
+    // The launched grid may exceed the hardware X limit and get spread over
+    // Y/Z (CubeCountSelection), so kernels linearize the workgroup id.
+    let num_wgs = n.div_ceil(block);
+    let cube_count = calculate_cube_count_elemwise(&client, n as usize, CubeDim::new_1d(block));
+    let cube_dim = CubeDim::new_1d(SORT_WG);
+
+    let count_buf = &scratch.count_buf;
+    let mut dst_keys = scratch.dst_keys.clone();
+    let mut dst_vals = scratch.dst_vals.clone();
+
+    let mut cur_keys = keys.clone();
+    let mut cur_vals = vals.clone();
+
+    for shift in (0..bits).step_by(bits_per_pass as usize) {
+        // Only the final pass may skip the key writes: intermediate passes
+        // sort on, so their key output is the next pass's input.
+        let pass_writes_keys = write_keys || shift + bits_per_pass < bits;
+        count_kernel::launch(
+            &client,
+            cube_count.clone(),
+            cube_dim,
+            num_wgs,
+            shift,
+            n,
+            bins,
+            block,
+            cur_keys.as_buffer_arg(),
+            count_buf.as_buffer_arg(),
         );
-        let num_planes = plane_sort_path(&keys.client);
-        // The launched grid may exceed the hardware X limit and get spread over
-        // Y/Z (CubeCountSelection), so kernels linearize the workgroup id.
-        let num_wgs = n.div_ceil(BLOCK_PLANE);
-        let cube_count =
-            calculate_cube_count_elemwise(&client, n as usize, CubeDim::new_1d(BLOCK_PLANE));
-        let cube_dim = CubeDim::new_1d(SORT_WG);
 
-        let count_buf = &self.count_buf;
-        let mut dst_keys = self.dst_keys.clone();
-        let mut dst_vals = self.dst_vals.clone();
+        exclusive_scan_buf(&client, count_buf, bins * num_wgs, &scratch.scan);
 
-        let mut cur_keys = keys.clone();
-        let mut cur_vals = vals.clone();
-
-        for shift in (0..bits).step_by(BITS_PLANE as usize) {
-            // Only the final pass may skip the key writes: intermediate passes
-            // sort on, so their key output is the next pass's input.
-            let pass_writes_keys = write_keys || shift + BITS_PLANE < bits;
-            count_kernel::launch::<WgpuRuntime>(
-                &client,
-                cube_count.clone(),
-                cube_dim,
-                num_wgs,
-                shift,
-                n,
-                cur_keys.as_buffer_arg(),
-                count_buf.as_buffer_arg(),
-            );
-
-            exclusive_scan_buf(&client, count_buf, BINS_PLANE * num_wgs, &self.scan);
-
-            scatter_plane_kernel::launch::<WgpuRuntime>(
+        match planes {
+            Some(num_planes) => scatter_plane_kernel::launch(
                 &client,
                 cube_count.clone(),
                 cube_dim,
@@ -371,13 +514,27 @@ impl RadixScratch {
                 count_buf.as_buffer_arg(),
                 dst_keys.as_buffer_arg(),
                 dst_vals.as_buffer_arg(),
-            );
+            ),
+            None => scatter_kernel::launch(
+                &client,
+                cube_count.clone(),
+                cube_dim,
+                num_wgs,
+                shift,
+                n,
+                pass_writes_keys,
+                cur_keys.as_buffer_arg(),
+                cur_vals.as_buffer_arg(),
+                count_buf.as_buffer_arg(),
+                dst_keys.as_buffer_arg(),
+                dst_vals.as_buffer_arg(),
+            ),
+        };
 
-            std::mem::swap(&mut cur_keys, &mut dst_keys);
-            std::mem::swap(&mut cur_vals, &mut dst_vals);
-        }
-        (cur_keys, cur_vals)
+        std::mem::swap(&mut cur_keys, &mut dst_keys);
+        std::mem::swap(&mut cur_vals, &mut dst_vals);
     }
+    (cur_keys, cur_vals)
 }
 
 #[cfg(test)]
@@ -385,35 +542,45 @@ mod radix_sort_tests {
     use super::*;
     use rand::{RngExt, SeedableRng};
 
-    fn assert_argsort_bits(
-        client: &ComputeClient<WgpuRuntime>,
-        keys_inp: &[u32],
-        values_inp: &[u32],
-        bits: u32,
-    ) {
-        let keys = GpuTensor::from(client, [keys_inp.len()], keys_inp);
-        let values = GpuTensor::from(client, [values_inp.len()], values_inp);
-        let scratch = RadixScratch::new(client, keys_inp.len());
-        let n = keys_inp.len() as u32;
-        let (ret_keys, ret_values) = scratch.argsort(&keys, &values, n, bits, true);
-        let ret_keys: Vec<u32> = ret_keys.read_vec();
-        let ret_values: Vec<u32> = ret_values.read_vec();
+    /// Both dispatch paths: the 4-bit fallback always, plus the plane path
+    /// when the device supports it. Every sort test runs its assertions over
+    /// each entry, so the fallback (the wasm path) stays correct on
+    /// plane-capable machines too.
+    fn all_paths(client: &Client) -> Vec<Option<u32>> {
+        let mut paths = vec![None];
+        if let Some(planes) = plane_sort_path(client) {
+            paths.push(Some(planes));
+        }
+        paths
+    }
 
-        assert_eq!(ret_keys.len(), keys_inp.len());
-        assert_eq!(ret_values.len(), keys_inp.len());
+    fn assert_argsort_bits(client: &Client, keys_inp: &[u32], values_inp: &[u32], bits: u32) {
+        for planes in all_paths(client) {
+            let keys = GpuTensor::from(client, [keys_inp.len()], keys_inp);
+            let values = GpuTensor::from(client, [values_inp.len()], values_inp);
+            let scratch = RadixScratch::new(client, keys_inp.len());
+            let n = keys_inp.len() as u32;
+            let (ret_keys, ret_values) =
+                radix_argsort_path(&keys, &values, n, bits, true, planes, &scratch);
+            let ret_keys: Vec<u32> = ret_keys.read_vec();
+            let ret_values: Vec<u32> = ret_values.read_vec();
 
-        // Stability is asserted separately in test_sorting_stable; here
-        // assert sorted order and key/value pairing only.
-        let bad = ret_keys.windows(2).position(|w| w[0] > w[1]);
-        assert!(bad.is_none(), "keys not sorted at index {bad:?}");
+            assert_eq!(ret_keys.len(), keys_inp.len());
+            assert_eq!(ret_values.len(), keys_inp.len());
 
-        for i in 0..keys_inp.len() {
-            let sorted_key = ret_keys[i];
-            let original_idx = ret_values[i] as usize;
-            assert_eq!(
-                keys_inp[original_idx], sorted_key,
-                "Value at index {i} points to wrong original index"
-            );
+            // Stability is asserted separately in test_sorting_stable; here
+            // assert sorted order and key/value pairing only.
+            let bad = ret_keys.windows(2).position(|w| w[0] > w[1]);
+            assert!(bad.is_none(), "keys not sorted at index {bad:?}");
+
+            for i in 0..keys_inp.len() {
+                let sorted_key = ret_keys[i];
+                let original_idx = ret_values[i] as usize;
+                assert_eq!(
+                    keys_inp[original_idx], sorted_key,
+                    "Value at index {i} points to wrong original index"
+                );
+            }
         }
     }
 
@@ -434,8 +601,10 @@ mod radix_sort_tests {
     fn test_sorting_stable() {
         // The render pipeline relies on stability: intersections are emitted
         // in depth order and the tile sort must preserve that order among
-        // equal tile ids. Assert exact stable argsort, not just sortedness.
+        // equal tile ids. Assert exact stable argsort, not just sortedness,
+        // over both dispatch paths.
         let (_gpu, client) = crate::tensor::test_client();
+        let paths = all_paths(&client);
         let mut rng = rand::rngs::StdRng::seed_from_u64(0x5EED_0001);
         for n in [1000usize, 5000, 200_000] {
             let keys_inp: Vec<u32> = (0..n).map(|_| rng.random_range(0..37)).collect();
@@ -443,17 +612,21 @@ mod radix_sort_tests {
             let mut reference: Vec<u32> = (0..n as u32).collect();
             reference.sort_by_key(|&i| keys_inp[i as usize]); // stable
 
-            let keys = GpuTensor::from(&client, [n], &keys_inp[..]);
-            let values = GpuTensor::from(&client, [n], &values_inp[..]);
-            let scratch = RadixScratch::new(&client, n);
-            let (_, ret_values) = scratch.argsort(&keys, &values, n as u32, 8, true);
-            let ret_values: Vec<u32> = ret_values.read_vec();
-            assert_eq!(ret_values, reference, "n={n}: sort must be stable");
+            for &planes in &paths {
+                let keys = GpuTensor::from(&client, [n], &keys_inp[..]);
+                let values = GpuTensor::from(&client, [n], &values_inp[..]);
+                let scratch = RadixScratch::new(&client, n);
+                let (_, ret_values) =
+                    radix_argsort_path(&keys, &values, n as u32, 8, true, planes, &scratch);
+                let ret_values: Vec<u32> = ret_values.read_vec();
+                assert_eq!(ret_values, reference, "n={n}: sort must be stable");
+            }
         }
     }
 
     /// The render pipeline's depth sort discards the sorted keys; values-only
-    /// mode must still produce the exact stable permutation.
+    /// mode must still produce the exact stable permutation — on both paths,
+    /// so the fallback scatter's comptime `write_keys` stays exercised.
     #[test]
     fn test_sort_values_only() {
         let (_gpu, client) = crate::tensor::test_client();
@@ -464,12 +637,15 @@ mod radix_sort_tests {
         let mut reference: Vec<u32> = (0..n as u32).collect();
         reference.sort_by_key(|&i| keys_inp[i as usize]); // stable
 
-        let keys = GpuTensor::from(&client, [n], &keys_inp[..]);
-        let values = GpuTensor::from(&client, [n], &values_inp[..]);
-        let scratch = RadixScratch::new(&client, n);
-        let (_, ret_values) = scratch.argsort(&keys, &values, n as u32, 32, false);
-        let ret_values: Vec<u32> = ret_values.read_vec();
-        assert_eq!(ret_values, reference, "values-only argsort must be stable");
+        for planes in all_paths(&client) {
+            let keys = GpuTensor::from(&client, [n], &keys_inp[..]);
+            let values = GpuTensor::from(&client, [n], &values_inp[..]);
+            let scratch = RadixScratch::new(&client, n);
+            let (_, ret_values) =
+                radix_argsort_path(&keys, &values, n as u32, 32, false, planes, &scratch);
+            let ret_values: Vec<u32> = ret_values.read_vec();
+            assert_eq!(ret_values, reference, "values-only argsort must be stable");
+        }
     }
 
     #[test]
@@ -521,23 +697,27 @@ mod radix_sort_tests {
         let keys = GpuTensor::from(&client, [cap], &keys_inp[..]);
         let vals = GpuTensor::from(&client, [cap], &vals_inp[..]);
 
-        // Scratch sized for the sorted prefix n, not the tensor capacity.
-        let scratch = RadixScratch::new(&client, n);
-        let (sorted_keys, sorted_vals) = scratch.argsort(&keys, &vals, n as u32, 32, true);
-        let out: Vec<u32> = sorted_keys.read_vec();
-        // An even pass count ends on the original (capacity-sized) tensors;
-        // an odd count ends on the n-sized ping-pong scratch. Either is a
-        // valid result — only the first n entries are read downstream.
-        assert!(out.len() == cap || out.len() == n);
-        let sv: Vec<u32> = sorted_vals.read_vec();
-        let mut sorted = keys_inp[..n].to_vec();
-        sorted.sort_unstable();
-        assert_eq!(&out[..n], &sorted[..]);
-        for (i, &idx) in sv[..n].iter().enumerate() {
-            assert_eq!(
-                keys_inp[idx as usize], out[i],
-                "Value at index {i} points at the wrong key"
-            );
+        for planes in all_paths(&client) {
+            // Scratch sized for the sorted prefix n, not the tensor capacity.
+            let scratch = RadixScratch::new(&client, n);
+            let (sorted_keys, sorted_vals) =
+                radix_argsort_path(&keys, &vals, n as u32, 32, true, planes, &scratch);
+            let out: Vec<u32> = sorted_keys.read_vec();
+            // An even pass count ends on the original (capacity-sized)
+            // tensors; an odd count ends on the n-sized ping-pong scratch.
+            // Either is a valid result — only the first n entries are read
+            // downstream.
+            assert!(out.len() == cap || out.len() == n);
+            let sv: Vec<u32> = sorted_vals.read_vec();
+            let mut sorted = keys_inp[..n].to_vec();
+            sorted.sort_unstable();
+            assert_eq!(&out[..n], &sorted[..]);
+            for (i, &idx) in sv[..n].iter().enumerate() {
+                assert_eq!(
+                    keys_inp[idx as usize], out[i],
+                    "Value at index {i} points at the wrong key"
+                );
+            }
         }
     }
 }

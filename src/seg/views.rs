@@ -28,12 +28,33 @@ pub(crate) struct ObjectLocalization {
 /// Once-per-round host math (the EIG ranking renders ~20 views per round):
 /// one a/b readback (8 B/splat; positions come from the RAM copy on
 /// `Splats`) and two f32 passes. The result only places candidate cameras;
-/// it never feeds EIG or labels.
+/// it never feeds EIG or labels. Test-only twin of [`localize_async`] — the
+/// loop runs the async body (via `run_with`'s `block_on` shim), so this
+/// sync readback path survives as the bit-identity pin for the shared
+/// `localize_from` core.
+#[cfg(test)]
 pub(crate) fn localize(splats: &Splats, state: &BetaState) -> Option<ObjectLocalization> {
+    localize_from(&state.a.read_vec(), &state.b.read_vec(), splats)
+}
+
+/// The localization readback — the same moments as the [`localize`] pin,
+/// over the async a/b readback (cubecl's blocking reads poll once and
+/// panic on wasm).
+pub(crate) async fn localize_async(
+    splats: &Splats,
+    state: &BetaState,
+) -> Option<ObjectLocalization> {
+    let a = state.a.read_vec_async().await;
+    let b = state.b.read_vec_async().await;
+    localize_from(&a, &b, splats)
+}
+
+/// The pure core both `localize` twins share: the c_obj/r_obj moments over
+/// a/b already on the CPU. Keeping the math here once is what stops the
+/// sync and async bodies from drifting.
+fn localize_from(a: &[f32], b: &[f32], splats: &Splats) -> Option<ObjectLocalization> {
     let n = splats.attributes.shape[0];
     let attr = &splats.positions;
-    let a: Vec<f32> = state.a.read_vec();
-    let b: Vec<f32> = state.b.read_vec();
 
     let mut sums = [0f32; 4];
     for i in 0..n {
@@ -95,24 +116,13 @@ pub(crate) fn candidates(
         .collect()
 }
 
-/// Deterministic pseudo-random offset for splat `i`, in [-0.5, 0.5]³ — the
-/// shared scatter of the seg test fixtures.
-#[cfg(test)]
-pub(crate) fn jitter(i: usize) -> Vec3 {
-    glam::vec3(
-        ((i * 73) % 17) as f32 / 17.0 - 0.5,
-        ((i * 151) % 13) as f32 / 13.0 - 0.5,
-        ((i * 201) % 11) as f32 / 11.0 - 0.5,
-    )
-}
-
 /// Splats per cluster in [`cluster_scene`].
 #[cfg(test)]
 pub(crate) const PER_CLUSTER: usize = 40;
 
 /// A scene of three well-separated spherical clusters; cluster 0 is the
-/// segmentation target. The active-loop and cli suites share this exact
-/// geometry, so pass thresholds tuned to it stay meaningful everywhere.
+/// segmentation target. The active-loop tests share this exact geometry,
+/// so pass thresholds tuned to it stay meaningful everywhere.
 #[cfg(test)]
 pub(crate) fn cluster_scene() -> (Vec<f32>, Vec<(glam::Vec3, f32)>) {
     let centers = [
@@ -123,58 +133,9 @@ pub(crate) fn cluster_scene() -> (Vec<f32>, Vec<(glam::Vec3, f32)>) {
     let n = centers.len() * PER_CLUSTER;
     let a = crate::render::sample_opaque_attributes(n, |i| {
         let (c, r) = centers[i / PER_CLUSTER];
-        c + 1.4 * r * jitter(i)
+        c + 1.4 * r * crate::render::jitter(i)
     });
     (a, centers.to_vec())
-}
-
-/// A perfect oracle for tests, as the loop's sensor closure: the "object"
-/// is a set of spheres; a pixel is foreground iff its camera ray hits any
-/// sphere.
-#[cfg(test)]
-pub(crate) fn sphere_oracle(
-    spheres: Vec<(Vec3, f32)>,
-) -> impl FnMut(&[u8], glam::UVec2, &crate::camera::Camera) -> anyhow::Result<Vec<u8>> {
-    move |_rgb: &[u8], size: glam::UVec2, camera: &crate::camera::Camera| {
-        let focal = camera.focal(size);
-        let center = size.as_vec2() * 0.5;
-        let mut mask = vec![0u8; (size.x * size.y) as usize];
-        for y in 0..size.y {
-            for x in 0..size.x {
-                // The renderer's own pixel convention:
-                // screen = focal·cam.xy/cam.z + size/2.
-                let cam = glam::vec3(
-                    (x as f32 + 0.5 - center.x) / focal.x,
-                    (y as f32 + 0.5 - center.y) / focal.y,
-                    1.0,
-                );
-                let dir = camera.rotation * cam.normalize();
-                let hit = spheres.iter().any(|&(c, r)| {
-                    let oc = c - camera.position;
-                    let t = oc.dot(dir);
-                    // Center behind the camera: only a hit if the camera
-                    // sits inside the sphere.
-                    let d2 = if t < 0.0 {
-                        oc.length_squared()
-                    } else {
-                        oc.length_squared() - t * t
-                    };
-                    d2 <= r * r
-                });
-                mask[(y * size.x + x) as usize] = hit as u8;
-            }
-        }
-        Ok(mask)
-    }
-}
-
-/// A perfect oracle for one sphere — the tests' segmentation target.
-#[cfg(test)]
-pub(crate) fn target(
-    center: Vec3,
-    radius: f32,
-) -> impl FnMut(&[u8], glam::UVec2, &crate::camera::Camera) -> anyhow::Result<Vec<u8>> {
-    sphere_oracle(vec![(center, radius)])
 }
 
 #[cfg(test)]
@@ -192,7 +153,7 @@ mod tests {
     ) -> Vec<f32> {
         crate::render::sample_opaque_attributes(n_fg + n_bg, |i| {
             let c = if i < n_fg { fg_center } else { bg_center };
-            c + spread * jitter(i)
+            c + spread * crate::render::jitter(i)
         })
     }
 

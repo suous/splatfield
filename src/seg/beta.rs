@@ -29,9 +29,13 @@
 //! exactly 0 for splats saturated past the table — the same treatment the
 //! eps = 0 skip gives invisible ones. In-kernel f64 is not an option:
 //! Metal exposes no fp64.
+//!
+//! The f64 table build is pure std CPU code, so it runs on wasm as-is; the
+//! kernel launches are launch-only on both targets. Only the EIG readback
+//! is target-split: `eig` (host) and `eig_async` (wasm) share the launch —
+//! cubecl's blocking reads poll once and panic on wasm.
 
 use super::Accumulators;
-use cubecl::wgpu::WgpuRuntime;
 use cubecl::{calculate_cube_count_elemwise, prelude::*};
 use splat_sort::tensor::GpuTensor;
 use std::sync::OnceLock;
@@ -227,7 +231,7 @@ impl BetaState {
     /// The paper's uninformative prior: a_i = b_i = 1 for every Gaussian, so
     /// every posterior mean starts at 0.5 and the MAP decision a > b starts
     /// uncommitted.
-    pub fn new_uniform(client: &ComputeClient<WgpuRuntime>, total: usize) -> Self {
+    pub fn new_uniform(client: &Client, total: usize) -> Self {
         let table = entropy_table();
         Self {
             a: GpuTensor::from(client, [total], vec![1f32; total]),
@@ -237,8 +241,12 @@ impl BetaState {
         }
     }
 
-    /// Analytic EIG for one candidate's responsibility map: returns Σ_i ΔH_i.
-    pub fn eig(&self, acc: &Accumulators) -> f32 {
+    /// Launch the ΔH reduction for one candidate's responsibility map.
+    /// Shared by the [`BetaState::eig`]/[`BetaState::eig_async`] twins —
+    /// the readback is the only difference between them, so the launch (the
+    /// math) lives here once. Returns the workgroup count the `partials`
+    /// buffer holds.
+    fn launch_eig(&self, acc: &Accumulators) -> u32 {
         let client = &self.a.client;
         let n = self.a.shape[0];
         // Each workgroup covers EIG_BLOCK elements (EPT per thread); size the
@@ -249,7 +257,7 @@ impl BetaState {
             num_wgs as usize * EIG_WG as usize,
             CubeDim::new_1d(EIG_WG),
         );
-        entropy_delta_kernel::launch::<WgpuRuntime>(
+        entropy_delta_kernel::launch(
             client,
             count,
             CubeDim::new_1d(EIG_WG),
@@ -261,9 +269,26 @@ impl BetaState {
             acc.bits.as_buffer_arg(),
             self.partials.as_buffer_arg(),
         );
+        num_wgs
+    }
 
+    /// Analytic EIG for one candidate's responsibility map: returns Σ_i ΔH_i
+    /// — the blocking twin of [`BetaState::eig_async`], host-only because
+    /// cubecl's blocking reads poll once and panic on wasm.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn eig(&self, acc: &Accumulators) -> f32 {
+        let num_wgs = self.launch_eig(acc);
         // One f32 per workgroup: a few KB over PCIe, summed on the CPU.
         let partials: Vec<f32> = self.partials.read_vec();
+        partials[..num_wgs as usize].iter().sum()
+    }
+
+    /// Async twin of [`BetaState::eig`] — same kernel via `launch_eig`,
+    /// async readback (cubecl's blocking reads poll once and panic on wasm).
+    pub async fn eig_async(&self, acc: &Accumulators) -> f32 {
+        let num_wgs = self.launch_eig(acc);
+        // One f32 per workgroup: a few KB over PCIe, summed on the CPU.
+        let partials: Vec<f32> = self.partials.read_vec_async().await;
         partials[..num_wgs as usize].iter().sum()
     }
 
@@ -273,7 +298,7 @@ impl BetaState {
     pub(crate) fn update(&self, acc: &Accumulators) {
         let client = &self.a.client;
         let n = self.a.shape[0];
-        beta_update_kernel::launch::<WgpuRuntime>(
+        beta_update_kernel::launch(
             client,
             calculate_cube_count_elemwise(client, n, CubeDim::new_1d(256)),
             CubeDim::new_1d(256),
@@ -299,14 +324,11 @@ pub fn map_labels(a: &[f32], b: &[f32]) -> Vec<bool> {
 /// BetaState from CPU slices — the seg tests' synthetic posterior, shared by
 /// the beta and localize test suites.
 #[cfg(test)]
-pub(crate) fn state(client: &ComputeClient<WgpuRuntime>, a: &[f32], b: &[f32]) -> BetaState {
-    let table = entropy_table();
-    BetaState {
-        a: GpuTensor::from(client, [a.len()], a),
-        b: GpuTensor::from(client, [b.len()], b),
-        table: GpuTensor::from(client, [table.len()], table),
-        partials: GpuTensor::empty(client, [a.len().div_ceil(EIG_BLOCK as usize).max(1)]),
-    }
+pub(crate) fn state(client: &Client, a: &[f32], b: &[f32]) -> BetaState {
+    let s = BetaState::new_uniform(client, a.len());
+    s.a.write(a);
+    s.b.write(b);
+    s
 }
 
 #[cfg(test)]
@@ -348,7 +370,7 @@ mod tests {
     }
 
     /// Accumulator with per-Gaussian `eps` quantized at `scale` in `bits`.
-    fn eps_acc(client: &ComputeClient<WgpuRuntime>, eps: &[f32], scale: f32) -> Accumulators {
+    fn eps_acc(client: &Client, eps: &[f32], scale: f32) -> Accumulators {
         let bits: Vec<u32> = eps.iter().map(|&e| (e * scale) as u32).collect();
         Accumulators {
             bits: GpuTensor::from(client, [eps.len()], &bits[..]),
@@ -359,12 +381,12 @@ mod tests {
     }
 
     /// H(a_i, b_i) per pair, through the probe kernel.
-    fn probe(client: &ComputeClient<WgpuRuntime>, a: &[f32], b: &[f32]) -> Vec<f32> {
+    fn probe(client: &Client, a: &[f32], b: &[f32]) -> Vec<f32> {
         let table = GpuTensor::from(client, [entropy_table().len()], entropy_table());
         let a_t = GpuTensor::from(client, [a.len()], a);
         let b_t = GpuTensor::from(client, [b.len()], b);
         let out = GpuTensor::empty(client, [a.len()]);
-        probe_entropy::launch::<WgpuRuntime>(
+        probe_entropy::launch(
             client,
             calculate_cube_count_elemwise(client, a.len(), CubeDim::new_1d(64)),
             CubeDim::new_1d(64),

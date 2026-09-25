@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use cubecl::wgpu::{AutoCompiler, WgpuServer};
 use eframe::egui::{TextureId, epaint::mutex::RwLock};
 use eframe::egui_wgpu::Renderer;
 use eframe::wgpu;
@@ -75,7 +76,7 @@ impl GpuTexture {
     fn copy_to_texture(&self, img: &GpuTensor) {
         let resource = img
             .client
-            .get_resource(img.handle.clone())
+            .get_resource::<WgpuServer<AutoCompiler>>(img.handle.clone())
             .expect("bitmap buffer after flush");
 
         let mut encoder = self.device.create_command_encoder(&Default::default());

@@ -2,7 +2,6 @@
 //! plane constants parsers and kernels both agree on, and glam-mirroring vecs
 //! that cross the kernel-launch boundary.
 use cubecl::prelude::*;
-use cubecl::wgpu::WgpuRuntime;
 
 #[derive(CubeType, CubeLaunch, Clone, Copy)]
 #[expand(derive(Clone, Copy))]
@@ -11,7 +10,7 @@ pub(crate) struct Vec2F {
     pub y: f32,
 }
 
-impl From<glam::Vec2> for Vec2FLaunch<WgpuRuntime> {
+impl From<glam::Vec2> for Vec2FLaunch {
     fn from(v: glam::Vec2) -> Self {
         Self::new(v.x, v.y)
     }
@@ -25,14 +24,14 @@ pub(crate) struct Vec3F {
     pub z: f32,
 }
 
-impl From<glam::Vec3> for Vec3FLaunch<WgpuRuntime> {
+impl From<glam::Vec3> for Vec3FLaunch {
     fn from(v: glam::Vec3) -> Self {
         Self::new(v.x, v.y, v.z)
     }
 }
 
 // Affine3A's matrix3/translation are Vec3A.
-impl From<glam::Vec3A> for Vec3FLaunch<WgpuRuntime> {
+impl From<glam::Vec3A> for Vec3FLaunch {
     fn from(v: glam::Vec3A) -> Self {
         Self::new(v.x, v.y, v.z)
     }

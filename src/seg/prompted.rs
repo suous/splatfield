@@ -26,11 +26,14 @@ use super::active::Segmenter;
 use crate::camera::Camera;
 use glam::UVec2;
 
-/// The text-prompted pipeline both front-ends run: fetch the oracle models
-/// (the first call downloads them), bake the prompt into a detector+SAM2
-/// chain, run `cfg.iterations` active rounds. Returns the segmenter —
-/// `segmentation()` for labels, `state` for the posterior buffers.
-/// `on_round` returning false stops the run (see `Segmenter::run_with`).
+/// The text-prompted pipeline — uncalled on any target since the worker
+/// took over; kept as the pinned native-oracle parity reference with the
+/// host fetch front-end. Fetch the oracle models (the first call
+/// downloads them), bake the prompt into a detector+SAM2 chain, run
+/// `cfg.iterations` active rounds. Returns the segmenter — label via
+/// `posteriors_async` + `map_labels`, as the wasm loop does; `state` holds
+/// the posterior buffers. `on_round` returning false stops the run (see
+/// `Segmenter::run_with`).
 pub fn run_text(
     splats: std::sync::Arc<crate::render::Splats>,
     prompt: &str,
@@ -72,6 +75,21 @@ mod tests {
     /// exact numerics.
     const BUS_GOLDEN: std::ops::RangeInclusive<f64> = 0.09..=0.115;
 
+    /// Shared asset gate for the oracle smoke tests: true = go. Absent
+    /// models/assets fail loud unless the env var restores the skip.
+    fn gate_or_skip(cached: &[String]) -> bool {
+        if cached.iter().all(|f| std::path::Path::new(f).exists()) {
+            return true;
+        }
+        if std::env::var_os("SPLATFIELD_ALLOW_MISSING_ASSETS").is_none() {
+            panic!(
+                "missing model/asset files {cached:?} — set SPLATFIELD_ALLOW_MISSING_ASSETS=1 to skip"
+            );
+        }
+        eprintln!("skipping: models/asset not cached");
+        false
+    }
+
     /// A real SAM2 decode with an explicit box prompt against the bus
     /// asset — the decode stage the text chain feeds detector boxes into.
     /// Foreground fraction must land in [`BUS_GOLDEN`]. Fails loud when the
@@ -89,13 +107,7 @@ mod tests {
         .map(|p| p.display().to_string())
         .chain(std::iter::once(asset.to_string()))
         .collect();
-        if cached.iter().any(|f| !std::path::Path::new(f).exists()) {
-            if std::env::var_os("SPLATFIELD_ALLOW_MISSING_ASSETS").is_none() {
-                panic!(
-                    "missing model/asset files {cached:?} — set SPLATFIELD_ALLOW_MISSING_ASSETS=1 to skip"
-                );
-            }
-            eprintln!("skipping: models/asset not cached");
+        if !gate_or_skip(&cached) {
             return;
         }
 
@@ -123,5 +135,69 @@ mod tests {
             "golden band: {:.2}%",
             frac * 100.0
         );
+    }
+
+    /// The text chain end to end against the cached models and the bear
+    /// scene — the test leg the module doc promises for [`run_text`]: the
+    /// fetch-before-load ordering, the detector→SAM2 sensor closure, and one
+    /// active round through `run_with`. Structural assertions only (a round
+    /// ran, the posterior is splat-sized); decode numerics are pinned by
+    /// [`oracle_smoke_on_bus`], the loop math by the synthetic
+    /// `sphere_oracle` tests. Fails loud when the models/asset are absent
+    /// (the env var restores the skip).
+    #[test]
+    fn run_text_smoke_on_bear() {
+        let scene = "data/bear.3d71a266.sog";
+        let cached: Vec<String> = [
+            gsam::grounding_file(),
+            gsam::grounding_tokenizer(),
+            gsam::sam_file("vision_encoder"),
+            gsam::sam_file("prompt_encoder_mask_decoder"),
+        ]
+        .iter()
+        .filter_map(|p| p.as_deref().ok())
+        .map(|p| p.display().to_string())
+        .chain(std::iter::once(scene.to_string()))
+        .collect();
+        if !gate_or_skip(&cached) {
+            return;
+        }
+
+        let rounds = std::cell::Cell::new(0usize);
+        // The loop renders on the GPU: take the serialized test client so
+        // this run orders against the other GPU tests.
+        let (_lock, client) = crate::gpu_testing::test_client();
+        let splats = std::sync::Arc::new(
+            crate::load_scene(
+                std::path::Path::new(scene).extension().unwrap_or_default(),
+                std::fs::File::open(scene).unwrap(),
+            )
+            .unwrap()
+            .upload(&client),
+        );
+        let n = splats.attributes.shape[0];
+        let mut camera = crate::camera::Camera::default();
+        camera.frame_bounds(splats.bounds);
+        let seg = run_text(
+            splats,
+            "bear",
+            crate::seg::active::Config {
+                resolution: 128,
+                candidates: 3,
+                iterations: 1,
+            },
+            camera,
+            &mut |stage| eprintln!("{stage}"),
+            &mut |_round, _state| {
+                rounds.set(rounds.get() + 1);
+                false
+            },
+        )
+        .unwrap();
+        // The terminal posterior readback is splat-sized — the wasm loop's
+        // posteriors_async + map_labels spelling.
+        let (a, _b) = cubecl::future::block_on(seg.posteriors_async());
+        assert_eq!(a.len(), n);
+        assert_eq!(rounds.get(), 1);
     }
 }

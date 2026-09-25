@@ -3,15 +3,39 @@ name = "gsam"
 version.workspace = true
 edition.workspace = true
 
+# Both targets: the release data model (REQUIRED_FILES + ModelStore) is shared
+# verbatim by the host fetch path and the wasm OPFS cache, and the inference
+# pipeline above the session layer (tokenizer, prompt tensors, pre/post-
+# processing) is cfg-dual over the two backends.
 [dependencies]
+anyhow.workspace = true
+# f16 bit handling for the q4f16 graphs' tensor payloads.
+half = "2.7"
+# imageops resize only (Triangle); decode stays in the app layer.
+image = { version = "0.25", default-features = false }
+tokenizers = { version = "=0.23.2", default-features = false, features = ["fancy-regex"] }
+
+# Native-only: ort cannot target wasm32, and its support cast (the cache-root
+# helper) follows it. Web inference goes through ortweb instead.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 ort = { version = "=2.0.0-rc.11", default-features = false, features = [
     "download-binaries",
     "tls-rustls",
     "half",
     "std",
 ] }
-half = "2.7"
-anyhow.workspace = true
 dirs = "7"
-image = { version = "0.25", default-features = false }
-tokenizers = { version = "=0.23.2", default-features = false, features = ["fancy-regex"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+# 0.4 pairs with wasm-bindgen 0.2.127 / js-sys 0.3.104; the "0.2" line
+# resolves to the ancient locked 0.2.22 (js-sys 0.2 era) and explodes.
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+# Feature unification only: tokenizers' rand/ahash stack pulls getrandom 0.3,
+# which compile_errors on wasm32-unknown-unknown unless some crate in the
+# graph enables `wasm_js`. With the feature, the same backend compiles and
+# runs with no extra rustc cfg (verified against 0.3.4); the
+# `--cfg getrandom_backend="wasm_js"` flag in the docs is for explicit
+# backend selection, not a build requirement here.
+getrandom = { version = "0.3", features = ["wasm_js"] }

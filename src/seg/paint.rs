@@ -8,18 +8,19 @@ use crate::layout;
 use crate::render::{Finalize, RenderScratch, Splats};
 use cubecl::calculate_cube_count_elemwise;
 use cubecl::prelude::*;
-use cubecl::wgpu::WgpuRuntime;
 use splat_sort::tensor::GpuTensor;
 
 impl Splats {
     /// Render the scene with each Gaussian painted by its posterior mean
     /// m = a/(a+b) as grayscale — black = certain background, white = certain
     /// foreground — the paper's "render mean image of Beta dist.". Shares
-    /// the pipeline with `render_with` but overwrites the projected color
-    /// rows between projection and blending. A `posterior` sized for a
+    /// the pipeline with `render_with_async` but overwrites the projected
+    /// color rows between projection and blending. A `posterior` sized for a
     /// different splat count (model swapped mid-run) falls back to the
-    /// normal color render rather than painting out of bounds.
-    pub fn render_posterior(
+    /// normal color render rather than painting out of bounds. Async because
+    /// the pipeline syncs on the counters readback, and cubecl's blocking
+    /// reads poll once and panic on wasm.
+    pub async fn render_posterior_async(
         &self,
         scratch: &mut RenderScratch,
         a: &GpuTensor,
@@ -28,12 +29,12 @@ impl Splats {
         img_size: glam::UVec2,
     ) -> GpuTensor {
         if a.shape[0] != self.attributes.shape[0] || b.shape[0] != self.attributes.shape[0] {
-            return self.render_with(scratch, camera, img_size);
+            return self.render_with_async(scratch, camera, img_size).await;
         }
         let client = &self.attributes.client;
-        let isects = self.prepare_isects(scratch, camera, img_size);
+        let isects = self.prepare_isects_async(scratch, camera, img_size).await;
 
-        paint_posterior::launch::<WgpuRuntime>(
+        paint_posterior::launch(
             client,
             calculate_cube_count_elemwise(client, a.shape[0], CubeDim::new_1d(256)),
             CubeDim::new_1d(256),
@@ -46,12 +47,28 @@ impl Splats {
         scratch.bitmap.clone()
     }
 
+    /// Blocking [`Self::render_posterior_async`]: drives the readback future
+    /// on this thread, which is what cubecl's own sync reads do internally.
+    /// Test-only — the app drives the async body directly, so this survives
+    /// as the pin harness's sync seam.
+    #[cfg(test)]
+    pub(crate) fn render_posterior(
+        &self,
+        scratch: &mut RenderScratch,
+        a: &GpuTensor,
+        b: &GpuTensor,
+        camera: &Camera,
+        img_size: glam::UVec2,
+    ) -> GpuTensor {
+        cubecl::future::block_on(self.render_posterior_async(scratch, a, b, camera, img_size))
+    }
+
     /// Overwrite the SH DC planes of foreground splats (a_i > b_i) with
     /// `color`, in place on the GPU.
     pub fn tint(&self, a: &GpuTensor, b: &GpuTensor, color: [f32; 3]) {
         let client = &self.attributes.client;
         let total = a.shape[0];
-        tint_colors::launch::<WgpuRuntime>(
+        tint_colors::launch(
             client,
             calculate_cube_count_elemwise(client, total, CubeDim::new_1d(256)),
             CubeDim::new_1d(256),
@@ -83,7 +100,7 @@ impl Splats {
     fn copy_dc(&self, src: &GpuTensor, dst: &GpuTensor) {
         let client = &self.attributes.client;
         let total = 3 * self.attributes.shape[0];
-        copy_f32::launch::<WgpuRuntime>(
+        copy_f32::launch(
             client,
             calculate_cube_count_elemwise(client, total, CubeDim::new_1d(256)),
             CubeDim::new_1d(256),

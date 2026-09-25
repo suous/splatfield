@@ -8,10 +8,21 @@
 //! the shared tile pipeline (see `raster::rasterize_kernel`); this module
 //! adds the fixed-point accumulators, the mask packing, and the Bayesian
 //! state machinery the paper builds on it.
+//!
+//! The engine runs on both targets. Every GPU readback has an async twin
+//! (`*_async`, modeled on `render.rs`'s `prepare_isects` pair) because
+//! cubecl's blocking reads poll once and panic on wasm — the sync paths are
+//! host-only and drive the same futures with `cubecl::future::block_on`,
+//! which is what keeps the host GPU tests on the same bodies the wasm app
+//! runs. Only
+//! `prompted` (the host ort session glue that loads the oracle models)
+//! stays host-only: the web app's oracle is the pipeline worker's
+//! detect→encode→decode, reached over the app's own async loop.
 
 pub mod active;
 pub mod beta;
 pub(crate) mod paint;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod prompted;
 pub(crate) mod views;
 
@@ -19,7 +30,6 @@ use crate::camera::Camera;
 use crate::render::{Finalize, RenderScratch, Splats, TileIsects};
 use cubecl::calculate_cube_count_elemwise;
 use cubecl::prelude::*;
-use cubecl::wgpu::WgpuRuntime;
 use splat_sort::tensor::GpuTensor;
 
 /// Fractional fixed-point bits for per-Gaussian accumulators rendered at
@@ -59,7 +69,7 @@ pub struct Accumulators {
 }
 
 impl Accumulators {
-    pub fn new(client: &ComputeClient<WgpuRuntime>, total: usize) -> Self {
+    pub fn new(client: &Client, total: usize) -> Self {
         Self {
             bits: GpuTensor::empty(client, [total]),
             fg: GpuTensor::empty(client, [total]),
@@ -93,8 +103,8 @@ fn zero_u32(buf: &mut [Atomic<u32>]) {
 }
 
 /// Clear a u32 accumulator buffer in one 256-thread elementwise pass.
-fn zero_buf(client: &ComputeClient<WgpuRuntime>, buf: &GpuTensor) {
-    zero_u32::launch::<WgpuRuntime>(
+fn zero_buf(client: &Client, buf: &GpuTensor) {
+    zero_u32::launch(
         client,
         calculate_cube_count_elemwise(client, buf.shape[0], CubeDim::new_1d(256)),
         CubeDim::new_1d(256),
@@ -115,11 +125,7 @@ pub(crate) struct Mask {
 impl Mask {
     /// Pack a CPU-side mask (`bytes`: row-major, nonzero = inside) for a
     /// `size` frame.
-    pub(crate) fn from_bytes(
-        client: &ComputeClient<WgpuRuntime>,
-        size: glam::UVec2,
-        bytes: &[u8],
-    ) -> Self {
+    pub(crate) fn from_bytes(client: &Client, size: glam::UVec2, bytes: &[u8]) -> Self {
         assert_eq!(
             bytes.len(),
             (size.x * size.y) as usize,
@@ -146,7 +152,24 @@ impl Mask {
 impl Splats {
     /// Accumulate every Gaussian's rendering responsibility ε_i for `camera`
     /// into `acc` (cleared first). Shares the projection/sort pipeline with
-    /// the RGB path; only the finalize mode differs.
+    /// the RGB path; only the finalize mode differs. Async twin of
+    /// [`Self::render_responsibility`] — the pipeline syncs on the counters
+    /// readback, and cubecl's blocking reads poll once and panic on wasm.
+    pub async fn render_responsibility_async(
+        &self,
+        scratch: &mut RenderScratch,
+        acc: &mut Accumulators,
+        camera: &Camera,
+        img_size: glam::UVec2,
+    ) {
+        let isects = self.prepare_isects_async(scratch, camera, img_size).await;
+        self.accumulate_prepared(scratch, &isects, img_size, acc, None);
+    }
+
+    /// Blocking [`Self::render_responsibility_async`] for host callers:
+    /// drives the readback future on this thread, which is what cubecl's own
+    /// sync reads do internally.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn render_responsibility(
         &self,
         scratch: &mut RenderScratch,
@@ -154,8 +177,7 @@ impl Splats {
         camera: &Camera,
         img_size: glam::UVec2,
     ) {
-        let isects = self.prepare_isects(scratch, camera, img_size);
-        self.accumulate_prepared(scratch, &isects, img_size, acc, None);
+        cubecl::future::block_on(self.render_responsibility_async(scratch, acc, camera, img_size))
     }
 
     /// ε finalize over intersections already prepared for this exact camera

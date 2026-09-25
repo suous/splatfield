@@ -14,27 +14,9 @@ fn row_attributes(n: usize, z: f32, spacing: f32) -> Vec<f32> {
     })
 }
 
-/// Build `Splats` from raw CPU attribute and SH buffers — the shape the
-/// parsers hand to `CpuSplats::upload`. Shared by the tint/color tests
-/// and the cross-thread test.
-fn splats_with_sh(
-    client: &ComputeClient<WgpuRuntime>,
-    attributes: Vec<f32>,
-    sh: Vec<f32>,
-) -> Splats {
-    crate::render::CpuSplats {
-        attributes,
-        sh_coeffs: sh,
-    }
-    .upload(client)
-}
-
 /// Render `attributes` at 64×64 from the default camera; return
 /// (Σ_p alpha/255 from the RGB bitmap, Σ_i ε_i, per-Gaussian ε).
-fn alpha_sum_and_eps(
-    client: &ComputeClient<WgpuRuntime>,
-    attributes: Vec<f32>,
-) -> (f32, f32, Vec<f32>) {
+fn alpha_sum_and_eps(client: &Client, attributes: Vec<f32>) -> (f32, f32, Vec<f32>) {
     let n = attributes.len() / crate::layout::ATTR_PLANES;
     let splats = opaque_splats(client, attributes);
     let mut scratch = RenderScratch::new(client, n, glam::uvec2(64, 64));
@@ -64,7 +46,7 @@ fn center_rgb(splats: &Splats, scratch: &mut RenderScratch) -> [u8; 3] {
 }
 
 /// Left-half mask over a `size` frame: pixels with x < size.x/2.
-fn left_half_mask(client: &ComputeClient<WgpuRuntime>, size: glam::UVec2) -> Mask {
+fn left_half_mask(client: &Client, size: glam::UVec2) -> Mask {
     let bytes: Vec<u8> = (0..size.x * size.y)
         .map(|p| ((p % size.x) < size.x / 2) as u8)
         .collect();
@@ -75,7 +57,7 @@ fn left_half_mask(client: &ComputeClient<WgpuRuntime>, size: glam::UVec2) -> Mas
 /// tile at 70×70 — pixels saturate (whole-tile early exit), 70 not being
 /// a multiple of the 16-wide tile keeps out-of-bounds units in the edge
 /// tiles, and the staggered depths make the sort total.
-fn overdraw_scene(client: &ComputeClient<WgpuRuntime>) -> (Splats, RenderScratch, Accumulators) {
+fn overdraw_scene(client: &Client) -> (Splats, RenderScratch, Accumulators) {
     let n = 40usize;
     let attributes = sample_opaque_attributes(n, |i| {
         let x = (i % 4) as f32 - 1.5;
@@ -92,7 +74,7 @@ fn overdraw_scene(client: &ComputeClient<WgpuRuntime>) -> (Splats, RenderScratch
 /// left-half mask (covers splat 0 only): the shared scene of the
 /// evidence-split and Beta-update tests, both renders already done —
 /// total ε in `bits`, the mask split in `fg`/`bg` of one accumulator.
-fn split_scene(client: &ComputeClient<WgpuRuntime>) -> (Splats, RenderScratch, Accumulators) {
+fn split_scene(client: &Client) -> (Splats, RenderScratch, Accumulators) {
     let size = glam::uvec2(64, 64);
     let n = 2usize;
     let attributes = row_attributes(n, 2.0, 1.0);
@@ -196,7 +178,7 @@ fn test_eps_bits_match_golden() {
     // Golden from the current kernel on this device; splats past the
     // last visible one collect nothing.
     const GOLDEN: [u32; 40] = [
-        411225574, 64983936, 17882252, 5200864, 773093, 333408, 108187, 61572, 12526, 2462, 1466,
+        411225576, 64983932, 17882249, 5200864, 773093, 333408, 108187, 61572, 12526, 2462, 1466,
         1461, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
     ];
     assert_eq!(bits, GOLDEN, "ε fixed-point words drifted");
@@ -416,7 +398,11 @@ fn test_save_colors_roundtrips_dc_of_high_degree_sh() {
             sh[c * n + i] = 1.0 + (c * n + i) as f32;
         }
     }
-    let splats = splats_with_sh(&client, attributes, sh.clone());
+    let splats = crate::render::CpuSplats {
+        attributes,
+        sh_coeffs: sh.clone(),
+    }
+    .upload(&client);
 
     let early = splats.save_colors();
     assert_eq!(early.shape.as_slice(), &[3, n], "DC snapshot shape");

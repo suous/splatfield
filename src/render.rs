@@ -4,7 +4,6 @@ use crate::project::{CameraViewLaunch, project_splats};
 use crate::raster::{map_isects, rasterize_kernel};
 use cubecl::calculate_cube_count_elemwise;
 use cubecl::prelude::*;
-use cubecl::wgpu::WgpuRuntime;
 use splat_sort::scan::{ScanScratch, exclusive_scan_gather};
 use splat_sort::sort::{RadixScratch, bits_for};
 use splat_sort::tensor::GpuTensor;
@@ -28,7 +27,7 @@ pub struct CpuSplats {
 }
 
 impl CpuSplats {
-    pub fn upload(self, client: &ComputeClient<WgpuRuntime>) -> Splats {
+    pub fn upload(self, client: &Client) -> Splats {
         Splats::new(self.attributes, self.sh_coeffs, client)
     }
 
@@ -73,28 +72,19 @@ impl CpuSplats {
         removed: &[usize],
     ) -> Vec<usize> {
         let n = self.count();
-        let mut selected = Vec::new();
-        let mut d = 0usize;
-        for i in 0..n {
-            if removed.binary_search(&i).is_err() {
-                let inside = crate::camera::guide_point(
-                    camera,
-                    splat_position(&self.attributes, n, i),
-                    pixel,
-                )
-                .is_some_and(|uv| {
-                    // guide_point yields pixel-index space; the drag rect is
-                    // continuous, where pixel i spans [i, i+1).
-                    let q = uv * pixel.as_vec2() + 0.5;
-                    q.x >= min.x && q.x <= max.x && q.y >= min.y && q.y <= max.y
-                });
-                if inside {
-                    selected.push(d);
-                }
-                d += 1;
-            }
-        }
-        selected
+        self.kept(removed)
+            .into_iter()
+            .enumerate()
+            .filter_map(|(d, i)| {
+                crate::camera::guide_point(camera, splat_position(&self.attributes, n, i), pixel)
+                    .and_then(|uv| {
+                        // guide_point yields pixel-index space; the drag rect is
+                        // continuous, where pixel i spans [i, i+1).
+                        let q = uv * pixel.as_vec2() + 0.5;
+                        (q.x >= min.x && q.x <= max.x && q.y >= min.y && q.y <= max.y).then_some(d)
+                    })
+            })
+            .collect()
     }
 }
 
@@ -141,7 +131,7 @@ fn tile_grid(img_size: glam::UVec2) -> (glam::UVec2, usize) {
 }
 
 impl RenderScratch {
-    pub fn new(client: &ComputeClient<WgpuRuntime>, total: usize, img_size: glam::UVec2) -> Self {
+    pub fn new(client: &Client, total: usize, img_size: glam::UVec2) -> Self {
         let (_, num_tiles) = tile_grid(img_size);
         let isect_capacity =
             (num_tiles.saturating_mul(total).min(INITIAL_ISECTS_CAP)).next_power_of_two();
@@ -170,7 +160,7 @@ impl RenderScratch {
     /// last frame's emission. Returns the tile grid `(bounds, count)`.
     fn prepare(
         &mut self,
-        client: &ComputeClient<WgpuRuntime>,
+        client: &Client,
         total: usize,
         img_size: glam::UVec2,
     ) -> (glam::UVec2, usize) {
@@ -239,11 +229,7 @@ pub(crate) enum Finalize<'a> {
 }
 
 impl Splats {
-    pub(crate) fn new(
-        attributes: Vec<f32>,
-        sh_coeffs: Vec<f32>,
-        client: &ComputeClient<WgpuRuntime>,
-    ) -> Self {
+    pub(crate) fn new(attributes: Vec<f32>, sh_coeffs: Vec<f32>, client: &Client) -> Self {
         let n = attributes.len() / layout::ATTR_PLANES;
         assert!(n > 0, "Splats::new: zero splats");
         let n_coeffs = sh_coeffs.len() / n;
@@ -270,8 +256,11 @@ impl Splats {
 
     /// Shared front half of the render paths: project, depth-sort, emit and
     /// tile-sort the intersections. Returns everything a per-pixel finalize
-    /// kernel (RGB blending, responsibility accumulation, ...) needs.
-    pub(crate) fn prepare_isects(
+    /// kernel (RGB blending, responsibility accumulation, ...) needs. Async
+    /// because the pipeline syncs on the counters readback, and cubecl's
+    /// blocking reads poll once and panic on wasm; host callers go through
+    /// [`Self::prepare_isects`].
+    pub(crate) async fn prepare_isects_async(
         &self,
         scratch: &mut RenderScratch,
         camera: &Camera,
@@ -289,7 +278,7 @@ impl Splats {
         // Stream-ordered before the project launch; saves a kernel dispatch.
         scratch.counters.write([0u32, 0]);
 
-        project_splats::launch::<WgpuRuntime>(
+        project_splats::launch(
             client,
             calculate_cube_count_elemwise(client, total, cube_dim),
             cube_dim,
@@ -305,7 +294,8 @@ impl Splats {
             scratch.tile_bbox.as_buffer_arg(),
         );
 
-        let [num_isects_raw, num_visible] = scratch.counters.read_vec::<u32>().try_into().unwrap();
+        let counters = scratch.counters.read_vec_async::<u32>().await;
+        let [num_isects_raw, num_visible] = [counters[0], counters[1]];
         let num_isects = num_isects_raw.min(max_isects);
         let (_sorted_keys, depth_order) = scratch.sort_depth.argsort(
             &scratch.depth_keys,
@@ -325,7 +315,7 @@ impl Splats {
             &scratch.scan,
         );
 
-        map_isects::launch::<WgpuRuntime>(
+        map_isects::launch(
             client,
             calculate_cube_count_elemwise(client, num_visible as usize, cube_dim),
             cube_dim,
@@ -359,24 +349,52 @@ impl Splats {
             gaussian_ids,
             num_isects,
             tile_bounds,
-            row_stride: scratch.bitmap.shape[1] as u32,
         }
     }
 
+    /// Blocking [`Self::prepare_isects_async`]: drives the readback future
+    /// on this thread, which is what cubecl's own sync reads do internally.
+    /// Test-only — the seg loop runs the async body through `run_with`'s
+    /// `block_on` shim, so this survives as the pin harness's sync seam.
+    #[cfg(test)]
+    pub(crate) fn prepare_isects(
+        &self,
+        scratch: &mut RenderScratch,
+        camera: &Camera,
+        img_size: glam::UVec2,
+    ) -> TileIsects {
+        cubecl::future::block_on(self.prepare_isects_async(scratch, camera, img_size))
+    }
+
     /// Render one frame into `scratch`'s buffers; the returned bitmap aliases
-    /// `scratch.bitmap` and is valid until the next `render_with` on it.
+    /// `scratch.bitmap` and is valid until the next render on it.
     ///
     /// A `scratch` that doesn't match the splat count or image size is rebuilt
-    /// in place.
+    /// in place. Async because the pipeline syncs on the counters readback, and
+    /// cubecl's blocking reads poll once and panic on wasm; host callers go
+    /// through [`Self::render_with`].
+    pub async fn render_with_async(
+        &self,
+        scratch: &mut RenderScratch,
+        camera: &Camera,
+        img_size: glam::UVec2,
+    ) -> GpuTensor {
+        let isects = self.prepare_isects_async(scratch, camera, img_size).await;
+        self.finalize(scratch, &isects, img_size, Finalize::Rgb);
+        scratch.bitmap.clone()
+    }
+
+    /// Blocking [`Self::render_with_async`] for host callers: drives the
+    /// readback future on this thread, which is what cubecl's own sync reads
+    /// do internally.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn render_with(
         &self,
         scratch: &mut RenderScratch,
         camera: &Camera,
         img_size: glam::UVec2,
     ) -> GpuTensor {
-        let isects = self.prepare_isects(scratch, camera, img_size);
-        self.finalize(scratch, &isects, img_size, Finalize::Rgb);
-        scratch.bitmap.clone()
+        cubecl::future::block_on(self.render_with_async(scratch, camera, img_size))
     }
 
     /// The one `rasterize_kernel` finalize dispatch shared by the RGB and ε
@@ -397,7 +415,7 @@ impl Splats {
                 true,
                 false,
                 0.0,
-                isects.row_stride,
+                scratch.bitmap.shape[1] as u32,
                 dead(),
                 0,
                 scratch.bitmap.as_buffer_arg(),
@@ -436,7 +454,7 @@ impl Splats {
                 bg.as_buffer_arg(),
             ),
         };
-        rasterize_kernel::launch::<WgpuRuntime>(
+        rasterize_kernel::launch(
             &self.attributes.client,
             CubeCount::new_2d(isects.tile_bounds.x, isects.tile_bounds.y),
             CubeDim::new_2d(layout::TILE_WIDTH, layout::TILE_WIDTH),
@@ -467,14 +485,18 @@ pub(crate) struct TileIsects {
     pub(crate) gaussian_ids: GpuTensor,
     pub(crate) num_isects: u32,
     pub(crate) tile_bounds: glam::UVec2,
-    pub(crate) row_stride: u32,
 }
+
+// Test fixtures shared beyond cfg(test): the bench target links this lib
+// without cfg(test), so the shared scene builders gate on the test-utils
+// feature instead (enabled for test/bench builds by the self
+// dev-dependency).
 
 /// Field-major attributes for `n` opaque splats — `position(i)` places splat
 /// i; every other plane is inert-but-valid (identity rotation, tiny scale,
 /// high opacity) so tests vary geometry only. Test-only: shared by the
-/// render and seg tests.
-#[cfg(test)]
+/// render/seg tests and the seg bench.
+#[cfg(any(test, feature = "test-utils"))]
 pub fn sample_opaque_attributes(
     n: usize,
     mut position: impl FnMut(usize) -> glam::Vec3,
@@ -496,9 +518,69 @@ pub fn sample_opaque_attributes(
 /// Opaque-DC test fixture: [`sample_opaque_attributes`] + zero SH — tests
 /// vary geometry only.
 #[cfg(test)]
-pub(crate) fn opaque_splats(client: &ComputeClient<WgpuRuntime>, attributes: Vec<f32>) -> Splats {
+pub(crate) fn opaque_splats(client: &Client, attributes: Vec<f32>) -> Splats {
     let n = attributes.len() / layout::ATTR_PLANES;
     Splats::new(attributes, vec![0.0; n * 3], client)
+}
+
+/// Deterministic pseudo-random offset for splat `i`, in [-0.5, 0.5]³ — the
+/// shared scatter of the seg test fixtures.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn jitter(i: usize) -> glam::Vec3 {
+    glam::vec3(
+        ((i * 73) % 17) as f32 / 17.0 - 0.5,
+        ((i * 151) % 13) as f32 / 13.0 - 0.5,
+        ((i * 201) % 11) as f32 / 11.0 - 0.5,
+    )
+}
+
+/// A perfect oracle for tests, as the loop's sensor closure: the "object"
+/// is a set of spheres; a pixel is foreground iff its camera ray hits any
+/// sphere.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn sphere_oracle(
+    spheres: Vec<(glam::Vec3, f32)>,
+) -> impl FnMut(&[u8], glam::UVec2, &crate::camera::Camera) -> anyhow::Result<Vec<u8>> {
+    move |_rgb: &[u8], size: glam::UVec2, camera: &crate::camera::Camera| {
+        let focal = camera.focal(size);
+        let center = size.as_vec2() * 0.5;
+        let mut mask = vec![0u8; (size.x * size.y) as usize];
+        for y in 0..size.y {
+            for x in 0..size.x {
+                // The renderer's own pixel convention:
+                // screen = focal·cam.xy/cam.z + size/2.
+                let cam = glam::vec3(
+                    (x as f32 + 0.5 - center.x) / focal.x,
+                    (y as f32 + 0.5 - center.y) / focal.y,
+                    1.0,
+                );
+                let dir = camera.rotation * cam.normalize();
+                let hit = spheres.iter().any(|&(c, r)| {
+                    let oc = c - camera.position;
+                    let t = oc.dot(dir);
+                    // Center behind the camera: only a hit if the camera
+                    // sits inside the sphere.
+                    let d2 = if t < 0.0 {
+                        oc.length_squared()
+                    } else {
+                        oc.length_squared() - t * t
+                    };
+                    d2 <= r * r
+                });
+                mask[(y * size.x + x) as usize] = hit as u8;
+            }
+        }
+        Ok(mask)
+    }
+}
+
+/// A perfect oracle for one sphere — the tests' segmentation target.
+#[cfg(any(test, feature = "test-utils"))]
+pub fn target(
+    center: glam::Vec3,
+    radius: f32,
+) -> impl FnMut(&[u8], glam::UVec2, &crate::camera::Camera) -> anyhow::Result<Vec<u8>> {
+    sphere_oracle(vec![(center, radius)])
 }
 
 #[cfg(test)]
@@ -655,7 +737,7 @@ mod tests {
     /// Render `n` splats with `attributes` under `camera` into a 32×32 frame;
     /// returns (center pixel, corner pixel).
     fn render_corner_pixels(
-        client: &ComputeClient<WgpuRuntime>,
+        client: &Client,
         n: usize,
         attributes: Vec<f32>,
         camera: &Camera,
@@ -748,11 +830,11 @@ mod tests {
         // frees and pool reclaim land inside the measurement window and can
         // spike a single reading. Fail only on sustained growth — systematic
         // per-frame allocation trips every attempt.
-        let mut prev = client.memory_usage().unwrap().bytes_in_use;
+        let mut prev = client.memory_usage().bytes_in_use;
         let mut steady = false;
         for _ in 0..5 {
             splats.render_with(&mut scratch, &camera, glam::uvec2(64, 64));
-            let cur = client.memory_usage().unwrap().bytes_in_use;
+            let cur = client.memory_usage().bytes_in_use;
             if cur <= prev + 65_536 {
                 steady = true;
                 break;
@@ -834,7 +916,7 @@ mod tests {
 
         for tile in 0..8u32 {
             let range = GpuTensor::empty(&client, [2]);
-            probe_tile_range::launch::<WgpuRuntime>(
+            probe_tile_range::launch(
                 &client,
                 CubeCount::new_single(),
                 CubeDim::new_1d(layout::TILE_SIZE),

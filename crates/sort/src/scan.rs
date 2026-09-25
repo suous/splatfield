@@ -9,7 +9,6 @@
 use crate::tensor::GpuTensor;
 use cubecl::calculate_cube_count_elemwise;
 use cubecl::prelude::*;
-use cubecl::wgpu::WgpuRuntime;
 
 const SCAN_WG: u32 = 256;
 const SCAN_EPT: u32 = 4;
@@ -51,7 +50,7 @@ pub struct ScanScratch {
 }
 
 impl ScanScratch {
-    pub fn new(client: &ComputeClient<WgpuRuntime>, max_elems: usize) -> Self {
+    pub fn new(client: &Client, max_elems: usize) -> Self {
         let max_blocks = (max_elems as u32).div_ceil(SCAN_BLOCK);
         Self {
             totals: GpuTensor::empty(client, [max_blocks as usize]),
@@ -169,8 +168,8 @@ fn apply_block_offsets(n: u32, block_sums: &[u32], offsets: &mut [u32]) {
 }
 
 /// Single-workgroup serial scan launch — one dispatch.
-fn launch_serial_scan(client: &ComputeClient<WgpuRuntime>, n: u32, buf: &GpuTensor) {
-    scan_serial::launch::<WgpuRuntime>(
+fn launch_serial_scan(client: &Client, n: u32, buf: &GpuTensor) {
+    scan_serial::launch(
         client,
         CubeCount::new_single(),
         CubeDim::new_1d(SCAN_WG),
@@ -182,12 +181,7 @@ fn launch_serial_scan(client: &ComputeClient<WgpuRuntime>, n: u32, buf: &GpuTens
 /// Exclusive-scan the first `n` cells of `buf` in place — the radix sort's
 /// per-pass counter scan. Past `SERIAL_SCAN_CELLS`, the hierarchical path
 /// takes over.
-pub(crate) fn exclusive_scan_buf(
-    client: &ComputeClient<WgpuRuntime>,
-    buf: &GpuTensor,
-    n: u32,
-    scratch: &ScanScratch,
-) {
+pub(crate) fn exclusive_scan_buf(client: &Client, buf: &GpuTensor, n: u32, scratch: &ScanScratch) {
     if n <= SERIAL_SCAN_CELLS {
         launch_serial_scan(client, n, buf);
         return;
@@ -198,7 +192,7 @@ pub(crate) fn exclusive_scan_buf(
     // so the dead slot aliases the `counts` input (buffer arg 1: gids, counts,
     // …) instead of needing a real sink buffer — cubecl binds an alias to the
     // input's resource, it registers no extra wgpu binding.
-    block_sums_kernel::launch::<WgpuRuntime>(
+    block_sums_kernel::launch(
         client,
         cube_count,
         cube_dim,
@@ -235,7 +229,7 @@ pub fn exclusive_scan_gather(
     let cube_dim = CubeDim::new_1d(SCAN_WG);
     let cube_count =
         calculate_cube_count_elemwise(&client, n as usize, CubeDim::new_1d(SCAN_BLOCK));
-    block_sums_kernel::launch::<WgpuRuntime>(
+    block_sums_kernel::launch(
         &client,
         cube_count,
         cube_dim,
@@ -256,16 +250,11 @@ pub fn exclusive_scan_gather(
 
 /// Shared hierarchical tail: exclusive-scan the per-block totals, then add
 /// each block's offset into its cells.
-fn scan_and_apply(
-    client: &ComputeClient<WgpuRuntime>,
-    n: u32,
-    scratch: &ScanScratch,
-    buf: &GpuTensor,
-) {
+fn scan_and_apply(client: &Client, n: u32, scratch: &ScanScratch, buf: &GpuTensor) {
     let cube_dim = CubeDim::new_1d(SCAN_WG);
     let cube_count = calculate_cube_count_elemwise(client, n as usize, CubeDim::new_1d(SCAN_BLOCK));
     launch_serial_scan(client, n.div_ceil(SCAN_BLOCK), &scratch.totals);
-    apply_block_offsets::launch::<WgpuRuntime>(
+    apply_block_offsets::launch(
         client,
         cube_count,
         cube_dim,

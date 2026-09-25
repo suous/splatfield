@@ -1,9 +1,19 @@
 #![deny(unreachable_pub)]
 
 pub mod camera;
-pub mod cli;
-mod fetch;
+/// First-run model fetch (src/fetch.rs): the host half downloads the release
+/// zip into the gsam cache; the wasm half streams it, verifies the pins, and
+/// hands a [`gsam::ModelStore`] to the OPFS cache.
+pub mod fetch;
 pub mod layout;
+/// OPFS cache of the verified release (src/opfs.rs): persist the files once
+/// after a pinned download, then load straight from disk on later page
+/// loads. Manifest + checks are pure and host-tested; the I/O half is
+/// wasm-only and best-effort — any cache problem reads as a miss.
+pub mod opfs;
+/// Worker<->main-thread protocol: request/response enums + bincode wire
+/// codec, host-tested (src/pipeline.rs).
+pub mod pipeline;
 mod ply;
 mod project;
 mod raster;
@@ -30,20 +40,19 @@ pub fn use_single_stream() {
 /// below and the loader's dispatch so the two can't drift apart.
 pub(crate) const SOG_EXTENSION: &str = "sog";
 
-/// Scene file extensions the GUI's file picker accepts — `load_scene_file`
-/// dispatches on them. One list so a new format can't land in the parser
-/// while the picker still silently rejects it.
+/// Scene file extensions the GUI accepts — `load_scene` dispatches on them.
+/// One list so a new format can't land in the parser while the GUI still
+/// silently rejects it.
 pub const SCENE_EXTENSIONS: [&str; 2] = ["ply", SOG_EXTENSION];
 
-/// Open and parse a scene file by extension — `.sog` archive, anything else
-/// PLY. The loader rule shared by the GUI and the CLI.
-pub fn load_scene_file(path: &std::path::Path) -> anyhow::Result<render::CpuSplats> {
-    use anyhow::Context;
-    let file = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    if path
-        .extension()
-        .is_some_and(|e| e.eq_ignore_ascii_case(SOG_EXTENSION))
-    {
+/// Parse a scene file by extension — `.sog` archive, anything else PLY.
+/// The loader rule shared by the GUI and any future fetch loader; bytes
+/// arrive from drag-and-drop, so the reader (not a path) is the input.
+pub fn load_scene(
+    ext: &std::ffi::OsStr,
+    file: impl std::io::Read + std::io::Seek,
+) -> anyhow::Result<render::CpuSplats> {
+    if ext.eq_ignore_ascii_case(SOG_EXTENSION) {
         sog::parse_sog(file)
     } else {
         ply::parse_ply(std::io::BufReader::new(file))
@@ -56,10 +65,7 @@ pub fn load_scene_file(path: &std::path::Path) -> anyhow::Result<render::CpuSpla
 /// single-threaded test callers don't.
 #[cfg(test)]
 pub(crate) mod gpu_testing {
-    pub(crate) fn test_client() -> (
-        std::sync::MutexGuard<'static, ()>,
-        cubecl::prelude::ComputeClient<cubecl::wgpu::WgpuRuntime>,
-    ) {
+    pub(crate) fn test_client() -> (std::sync::MutexGuard<'static, ()>, cubecl::client::Client) {
         crate::use_single_stream();
         splat_sort::tensor::test_client()
     }
