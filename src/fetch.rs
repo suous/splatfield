@@ -42,10 +42,10 @@ fn models_zip_url() -> String {
     )
 }
 
-/// Zip byte ceiling — the streamed download aborts past it, so a sentinel
-/// or corrupt URL pointing at some huge file can't fill the disk (or, on
-/// the web, the tab's memory).
-const MAX_ZIP_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Streamed-download byte ceiling — the stream aborts past it, so a
+/// sentinel or corrupt URL pointing at some huge file can't fill the disk
+/// (or, on the web, the tab's memory).
+const MAX_DOWNLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// SHA-256 of the release zip. The wasm install checks the whole archive
 /// against it before unzipping — a corrupt or substituted download never
@@ -257,7 +257,7 @@ fn download(part: &Path, on_progress: &mut dyn FnMut(&str)) -> Result<()> {
     let mut reader = res
         .into_body()
         .into_with_config()
-        .limit(MAX_ZIP_BYTES)
+        .limit(MAX_DOWNLOAD_BYTES)
         .reader();
 
     let mut out = std::io::BufWriter::new(std::fs::File::create(part)?);
@@ -384,37 +384,33 @@ async fn fetch_ok(url: &str, cache: Option<web_sys::RequestCache>) -> Result<web
     Ok(response)
 }
 
-/// Stream the release zip off the network with fractional progress (0..1).
-/// Native builds never download: this is the browser branch.
+/// Read `response`'s body into one buffer, streaming: the progress callback
+/// fires per chunk with the fraction of content-length (never called when
+/// the header is absent). `max_bytes` holds per chunk, so a mislabeled or
+/// endless stream can't grow past it just because the header lied. The
+/// buffer is reserved up front — a >100 MB Vec growing by amortized
+/// doubling memcpy's the whole body several times inside the worker.
 #[cfg(target_arch = "wasm32")]
-pub async fn download_zip(on_progress: &mut dyn FnMut(f64)) -> Result<Vec<u8>> {
-    use wasm_bindgen::JsCast;
-    // JsValue is not a StdError, so JS rejections are mapped, not
-    // context-wrapped; opfs owns the one mapper.
+async fn stream_body(
+    response: web_sys::Response,
+    max_bytes: u64,
+    on_progress: &mut dyn FnMut(f64),
+) -> Result<Vec<u8>> {
     use crate::opfs::js_err;
+    use wasm_bindgen::JsCast;
 
-    // Revalidate before use: a same-origin cache entry from an earlier dev
-    // session (possibly behind a different server state) otherwise shadows
-    // the pinned release and the sha256 pin rejects bytes the user cannot
-    // fix except by clearing browser state. With `no-cache` a stale entry
-    // costs one conditional request; a fresh file answers 200 unchanged.
-    let response = fetch_ok(ZIP_URL, Some(web_sys::RequestCache::NoCache)).await?;
     let total = response
         .headers()
         .get("content-length")
         .map_err(|e| anyhow::anyhow!("reading content-length: {e:?}"))?
         .and_then(|v| v.parse::<u64>().ok());
-
     let reader = response
         .body()
-        .context("release response carries no body")?
+        .context("response carries no body")?
         .get_reader()
         .dyn_into::<web_sys::ReadableStreamDefaultReader>()
-        .map_err(|_| anyhow::anyhow!("release stream is not a default reader"))?;
-
-    // Reserve up front: a 158 MB Vec growing by amortized doubling memcpy's
-    // the whole body several times inside the worker.
-    let mut zip = Vec::with_capacity(total.map_or(0, |t| t.min(MAX_ZIP_BYTES) as usize));
+        .map_err(|_| anyhow::anyhow!("response stream is not a default reader"))?;
+    let mut buf = Vec::with_capacity(total.map_or(0, |t| t.min(max_bytes) as usize));
     loop {
         let chunk = wasm_bindgen_futures::JsFuture::from(reader.read())
             .await
@@ -423,27 +419,39 @@ pub async fn download_zip(on_progress: &mut dyn FnMut(f64)) -> Result<Vec<u8>> {
             .map_err(js_err)?
             .is_truthy()
         {
-            return Ok(zip);
+            return Ok(buf);
         }
         let value: js_sys::Uint8Array = js_sys::Reflect::get(&chunk, &"value".into())
             .map_err(js_err)?
             .dyn_into()
             .map_err(|_| anyhow::anyhow!("stream chunk is not a Uint8Array"))?;
-        // copy_to writes straight into the zip's tail: a to_vec+extend would
-        // copy every chunk twice and allocate a throwaway Vec per chunk.
-        let start = zip.len();
-        zip.resize(start + value.length() as usize, 0);
-        value.copy_to(&mut zip[start..]);
-        // The ceiling holds per chunk too: a mislabeled or endless stream
-        // can't grow past it just because content-length lied.
+        // copy_to writes straight into the buffer's tail: a to_vec+extend
+        // would copy every chunk twice and allocate a throwaway Vec per
+        // chunk.
+        let start = buf.len();
+        buf.resize(start + value.length() as usize, 0);
+        value.copy_to(&mut buf[start..]);
         ensure!(
-            zip.len() as u64 <= MAX_ZIP_BYTES,
-            "release zip exceeds the {MAX_ZIP_BYTES}-byte ceiling"
+            buf.len() as u64 <= max_bytes,
+            "stream exceeds the {max_bytes}-byte ceiling"
         );
         if let Some(total) = total {
-            on_progress((zip.len() as f64 / total as f64).min(1.0));
+            on_progress((buf.len() as f64 / total as f64).min(1.0));
         }
     }
+}
+
+/// Stream the release zip off the network with fractional progress (0..1).
+/// Native builds never download: this is the browser branch.
+#[cfg(target_arch = "wasm32")]
+pub async fn download_zip(on_progress: &mut dyn FnMut(f64)) -> Result<Vec<u8>> {
+    // Revalidate before use: a same-origin cache entry from an earlier dev
+    // session (possibly behind a different server state) otherwise shadows
+    // the pinned release and the sha256 pin rejects bytes the user cannot
+    // fix except by clearing browser state. With `no-cache` a stale entry
+    // costs one conditional request; a fresh file answers 200 unchanged.
+    let response = fetch_ok(ZIP_URL, Some(web_sys::RequestCache::NoCache)).await?;
+    stream_body(response, MAX_DOWNLOAD_BYTES, on_progress).await
 }
 
 /// The demo scene the help panel's button loads — the SH1 bear on the
@@ -457,15 +465,21 @@ pub async fn download_zip(on_progress: &mut dyn FnMut(f64)) -> Result<Vec<u8>> {
 #[cfg(target_arch = "wasm32")]
 pub const DEMO_SCENE_URL: &str = "bear.3d71a266_sh1.sog";
 
-/// Fetch the demo scene bytes. One buffer, no streaming progress: the asset
-/// is 14 MB and the status pill covers the wait. Same origin, so plain
-/// CORS rules apply and no cache override is needed (unlike the models
-/// zip): the content-hashed name is immutable — new fixture bytes get a
-/// new name, so default HTTP caching can never serve a stale scene.
+/// The demo scene's byte length — content-pinned by the fixtures-v1 tag
+/// (the file name embeds the source hash), so this is a display constant
+/// (the status pill's MB figures), never load-bearing. Same release
+/// contract as `ZIP_BYTES`.
 #[cfg(target_arch = "wasm32")]
-pub async fn fetch_demo_scene() -> Result<Vec<u8>> {
-    use crate::opfs::js_err;
+pub const DEMO_SCENE_BYTES: u64 = 14_222_631;
 
+/// Fetch the demo scene bytes, streaming fractional progress (0..1) to
+/// `on_progress` — the status pill narrates the wait the way the models
+/// download does. One buffer, no decoding. Same origin, so plain CORS
+/// rules apply and no cache override is needed (unlike the models zip):
+/// the content-hashed name is immutable — new fixture bytes get a new
+/// name, so default HTTP caching can never serve a stale scene.
+#[cfg(target_arch = "wasm32")]
+pub async fn fetch_demo_scene(mut on_progress: impl FnMut(f64)) -> Result<Vec<u8>> {
     let response = fetch_ok(DEMO_SCENE_URL, None).await?;
     // A dev server that answers unknown paths with index.html (trunk
     // serve's SPA fallback) reports 200 + text/html — name that failure
@@ -481,14 +495,7 @@ pub async fn fetch_demo_scene() -> Result<Vec<u8>> {
          deployed next to the app; local development must serve it via \
          scripts/dev_server.py"
     );
-    let buffer = wasm_bindgen_futures::JsFuture::from(
-        response
-            .array_buffer()
-            .map_err(|e| js_err(e).context("reading the demo scene body"))?,
-    )
-    .await
-    .map_err(|e| js_err(e).context("reading the demo scene body"))?;
-    Ok(js_sys::Uint8Array::new(&buffer).to_vec())
+    stream_body(response, MAX_DOWNLOAD_BYTES, &mut on_progress).await
 }
 
 /// Verify the zip's sha256, unzip in memory, keep exactly the required

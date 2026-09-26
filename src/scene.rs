@@ -49,6 +49,12 @@ pub(crate) struct Loaded {
     /// Load failures (drag-drop), surfaced in the status pill — a GUI
     /// launch has no stderr to read.
     pub(crate) load_error: Option<String>,
+    /// A load was requested and has not landed: the status pill must hold
+    /// (not self-dismiss) until it does — a slow fetch outlives the
+    /// status lifetime. Set by `load_bytes`, cleared when its generation
+    /// lands; a stale finish leaves the flag to the newer load that
+    /// superseded it.
+    pub(crate) load_in_flight: bool,
     /// Finished saves report (message, error) here — the async save task
     /// can't borrow `self`, so the next frame drains it into the status
     /// pill, mirroring `load_error`.
@@ -129,10 +135,13 @@ impl App {
         let splats = Arc::clone(&self.splats);
 
         // Claim the next generation up front: of two racing loads, the one
-        // requested LAST wins and a stale late finish is discarded.
+        // requested LAST wins and a stale late finish is discarded. The
+        // claim also raises the in-flight flag so the pill holds until the
+        // load lands.
         let load_id = {
             let mut slot = splats.lock().unwrap();
             slot.load_gen += 1;
+            slot.load_in_flight = true;
             slot.load_gen
         };
 
@@ -156,6 +165,7 @@ impl App {
                     if slot.load_gen != load_id {
                         return; // superseded by a newer load request
                     }
+                    slot.load_in_flight = false;
                     let n = data.attributes.shape[0];
                     slot.scene = Some(Scene {
                         splats: data,
@@ -173,6 +183,7 @@ impl App {
                     if slot.load_gen != load_id {
                         return;
                     }
+                    slot.load_in_flight = false;
                     slot.load_error = Some(format!("{e:#}"));
                     drop(slot);
                 }
@@ -223,7 +234,23 @@ impl App {
             // The URL's file name: the save button derives
             // `<name>.edited.ply` from it, exactly like a dropped file.
             let name = fetch::DEMO_SCENE_URL.rsplit('/').next().unwrap().to_owned();
-            self.load_bytes(name, ui.ctx().clone(), fetch::fetch_demo_scene());
+            // The fetch future can't borrow `self`, so its progress stages
+            // through the loop task's channel — the pill drains it like any
+            // other engine message, and the repaint request wakes the UI
+            // between chunks.
+            use super::worker::SegMsg;
+            let msgs = Rc::clone(&self.seg.msgs);
+            let progress_ctx = ui.ctx().clone();
+            let on_progress = move |p: f64| {
+                let mb = fetch::DEMO_SCENE_BYTES as f64 / 1e6;
+                msgs.borrow_mut().push(SegMsg::Status(format!(
+                    "fetching demo scene {:.0}% ({:.0}/{mb:.0} MB)",
+                    p * 100.0,
+                    p * mb
+                )));
+                progress_ctx.request_repaint();
+            };
+            self.load_bytes(name, ui.ctx().clone(), fetch::fetch_demo_scene(on_progress));
         }
     }
 

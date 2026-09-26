@@ -278,14 +278,17 @@ impl eframe::App for App {
         // progress while a run is active, idle outcomes self-dismissing.
         // Failures get a longer window (and red text) instead of living
         // forever. The app repaints only when dirty, so the dismissal
-        // deadline schedules its own wake-up.
+        // deadline schedules its own wake-up. A load in flight holds the
+        // pill past any lifetime: a slow fetch can stall longer than the
+        // failure window, and a vanished progress line reads as a crash.
         let busy = self.seg.busy;
+        let loading = self.splats.lock().unwrap().load_in_flight;
         let lifetime = if self.seg.status_error {
             ERROR_STATUS_LIFETIME
         } else {
             STATUS_LIFETIME
         };
-        if !busy {
+        if !busy && !loading {
             match lifetime.checked_sub(self.seg.status_at.elapsed()) {
                 None => self.seg.status.clear(),
                 Some(left) => ui.ctx().request_repaint_after(left),
@@ -333,6 +336,9 @@ impl eframe::App for App {
         {
             self.controller.frame_bounds(s.splats.bounds);
             slot.reframe = false;
+            // The landed scene ends its fetch narrative: drop the pill now
+            // instead of letting "fetching … 100%" linger out the lifetime.
+            self.seg.status.clear();
             // A fresh model resets the edit state staged against the old one.
             self.sel.clear();
             self.removed.clear();
