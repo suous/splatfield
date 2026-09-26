@@ -206,6 +206,12 @@ impl Detector {
         let (ids, content) = encode_prompt(&tokenizer, prompt)?;
         let session = session::build(&grounding_file()?, GraphOptimizationLevel::Level1)?;
         let dtypes = input_dtypes(&session)?;
+        // Mirror of the wasm load's guard: dtypes[1..=4] are indexed below.
+        anyhow::ensure!(
+            dtypes.len() >= 5,
+            "grounding-dino graph declares {} inputs, expected 5",
+            dtypes.len()
+        );
         let ntok = ids.len() as i64;
         let [ids_t, types_t, attn_t, mask_t] = prompt_fills(&ids);
         let consts = [
@@ -221,7 +227,11 @@ impl Detector {
         })
     }
 
-    pub fn detect(&mut self, rgb: &[u8], width: u32, height: u32) -> Result<Vec<[f32; 4]>> {
+    /// Detect the prompt's object; detections come back best-confidence
+    /// first, empty when nothing passed the gate. The wasm twin returns
+    /// the same `Vec<Detection>` (async there), so consumers need no cfg
+    /// split.
+    pub fn detect(&mut self, rgb: &[u8], width: u32, height: u32) -> Result<Vec<Detection>> {
         let pixel_values = encoder_input(&self.session, rgb, (width, height), NET)?;
         let (logits_dims, logits, boxes) = {
             let [ids, types, attention, pixels] = &self.consts;
@@ -232,16 +242,17 @@ impl Detector {
                 SessionInputValue::from(attention),
                 SessionInputValue::from(pixels),
             ])?;
+            // Mirror of the wasm arm's fixed_outputs::<2>.
+            anyhow::ensure!(
+                outputs.len() == 2,
+                "grounding-dino returned {} outputs, expected 2",
+                outputs.len()
+            );
             let (logits_dims, logits) = extract_f32(&outputs[0])?;
             let (_, boxes) = extract_f32(&outputs[1])?;
             (logits_dims, logits, boxes)
         };
-        Ok(
-            decode_outputs(&logits_dims, &logits, &boxes, &self.content, width, height)?
-                .into_iter()
-                .map(|d| d.xyxy)
-                .collect(),
-        )
+        decode_outputs(&logits_dims, &logits, &boxes, &self.content, width, height)
     }
 }
 

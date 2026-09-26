@@ -412,8 +412,8 @@ mod tests {
 
         project_splats::launch(
             &client,
-            calculate_cube_count_elemwise(&client, 1, CubeDim::new_1d(256)),
-            CubeDim::new_1d(256),
+            calculate_cube_count_elemwise(&client, 1, CubeDim::new_1d(crate::layout::ELEM_WG)),
+            CubeDim::new_1d(crate::layout::ELEM_WG),
             CameraViewLaunch::for_camera(
                 &crate::camera::Camera::default(),
                 glam::uvec2(64, 64),

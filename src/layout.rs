@@ -40,6 +40,12 @@ impl From<glam::Vec3A> for Vec3FLaunch {
 pub(crate) const TILE_WIDTH: u32 = 16;
 pub(crate) const TILE_SIZE: u32 = TILE_WIDTH * TILE_WIDTH;
 
+/// Workgroup size for the plain elementwise launches (project, map, tint,
+/// copy, zero, beta update): 256 threads over N items. Named apart from
+/// TILE_* on purpose — the render path used to alias TILE_SIZE here, which
+/// made a tile-geometry change silently rewrite unrelated launch configs.
+pub(crate) const ELEM_WG: u32 = 256;
+
 // Splat attribute planes, field-major: plane k of splat i lives at
 // attributes[k * n + i] so a warp's loads coalesce. The PLY reader and
 // writer honor this same contract (see `ply::parse_ply` and `CpuSplats::write_ply`).

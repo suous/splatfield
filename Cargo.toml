@@ -105,6 +105,7 @@ web-sys = { version = "0.3", features = [
     "Response",
     "ReadableStream",
     "ReadableStreamDefaultReader",
+    "ReadableStreamReadResult",
     "console",
     "Worker",
     "MessageEvent",

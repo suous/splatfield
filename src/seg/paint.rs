@@ -36,8 +36,8 @@ impl Splats {
 
         paint_posterior::launch(
             client,
-            calculate_cube_count_elemwise(client, a.shape[0], CubeDim::new_1d(256)),
-            CubeDim::new_1d(256),
+            calculate_cube_count_elemwise(client, a.shape[0], CubeDim::new_1d(layout::ELEM_WG)),
+            CubeDim::new_1d(layout::ELEM_WG),
             scratch.projected.as_buffer_arg(),
             a.as_buffer_arg(),
             b.as_buffer_arg(),
@@ -70,8 +70,8 @@ impl Splats {
         let total = a.shape[0];
         tint_colors::launch(
             client,
-            calculate_cube_count_elemwise(client, total, CubeDim::new_1d(256)),
-            CubeDim::new_1d(256),
+            calculate_cube_count_elemwise(client, total, CubeDim::new_1d(layout::ELEM_WG)),
+            CubeDim::new_1d(layout::ELEM_WG),
             self.sh_coeffs.as_buffer_arg(),
             a.as_buffer_arg(),
             b.as_buffer_arg(),
@@ -102,8 +102,8 @@ impl Splats {
         let total = 3 * self.attributes.shape[0];
         copy_f32::launch(
             client,
-            calculate_cube_count_elemwise(client, total, CubeDim::new_1d(256)),
-            CubeDim::new_1d(256),
+            calculate_cube_count_elemwise(client, total, CubeDim::new_1d(layout::ELEM_WG)),
+            CubeDim::new_1d(layout::ELEM_WG),
             src.as_buffer_arg(),
             dst.as_buffer_arg(),
         );

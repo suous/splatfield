@@ -42,6 +42,10 @@ mod wasm {
     const ORT_WASM_ASYNCIFY_MJS: &str = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/ort-wasm-simd-threaded.asyncify.mjs";
     const ORT_WASM_ASYNCIFY_WASM: &str = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.30.0/dist/ort-wasm-simd-threaded.asyncify.wasm";
 
+    /// The single-flight busy rejection — one wording for both reply
+    /// variants, so they cannot drift.
+    const BUSY_REPLY: &str = "worker busy — another request is running";
+
     /// Everything the pipeline owns: the verified release, the loaded SAM2
     /// sessions, and the detector cache (one prompt — a different prompt
     /// replaces the cached detector outright).
@@ -126,12 +130,7 @@ mod wasm {
                                 return;
                             }
                             if !acquire() {
-                                reply(
-                                    &scope,
-                                    Response::ModelsFailed(
-                                        "worker busy — another request is running".into(),
-                                    ),
-                                );
+                                reply(&scope, Response::ModelsFailed(BUSY_REPLY.into()));
                                 return;
                             }
                             let resp = load_models(&scope).await;
@@ -148,12 +147,7 @@ mod wasm {
                         let scope = scope.clone();
                         spawn_local(async move {
                             if !acquire() {
-                                reply(
-                                    &scope,
-                                    Response::SegmentFailed(
-                                        "worker busy — another request is running".into(),
-                                    ),
-                                );
+                                reply(&scope, Response::SegmentFailed(BUSY_REPLY.into()));
                                 return;
                             }
                             let resp = segment(&scope, rgb, width, height, prompt).await;

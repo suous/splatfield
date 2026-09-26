@@ -211,30 +211,31 @@ pub(crate) fn make_input(shape: &[i64], data: Vec<f32>, want: TE) -> Result<DynV
 /// Extract a tensor as f32 (f16 widened), returning (dims, data).
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn extract_f32(v: &DynValue) -> Result<(Vec<i64>, Vec<f32>)> {
-    extract_f32_with(v, |_, len| 0..len)
+    extract_f32_with(v, |_, len| Ok(0..len))
 }
 
 /// [`extract_f32`] with the flat range picked from the dims/len before any
 /// widening: a [.., C, H, W] output whose one used channel is `chan` (SAM2's
-/// argmax-IoU mask) widens len/C elements instead of all of them.
+/// argmax-IoU mask) widens len/C elements instead of all of them. Host twin
+/// of ortweb's `into_f32_slice`; the fallible-range contract is its docs.
 #[cfg(not(target_arch = "wasm32"))]
 fn extract_f32_with(
     v: &DynValue,
-    take: impl FnOnce(&[i64], usize) -> std::ops::Range<usize>,
+    take: impl FnOnce(&[i64], usize) -> Result<std::ops::Range<usize>>,
 ) -> Result<(Vec<i64>, Vec<f32>)> {
     match v.dtype() {
         ValueType::Tensor {
             ty: TE::Float32, ..
         } => {
             let (shape, data) = v.try_extract_tensor::<f32>()?;
-            let range = take(shape, data.len());
+            let range = take(shape, data.len())?;
             Ok((shape.to_vec(), data[range].to_vec()))
         }
         ValueType::Tensor {
             ty: TE::Float16, ..
         } => {
             let (shape, data) = v.try_extract_tensor::<f16>()?;
-            let range = take(shape, data.len());
+            let range = take(shape, data.len())?;
             Ok((shape.to_vec(), data[range].to_f32_vec()))
         }
         t => bail!("unsupported output dtype {t:?}"),

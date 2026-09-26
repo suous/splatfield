@@ -110,23 +110,25 @@ impl OrtTensor {
     /// (dims, data) widened to f32 — f16 bit patterns widen, i64 is an
     /// error (no postprocess path consumes integer outputs).
     pub fn into_f32(self) -> Result<(Vec<i64>, Vec<f32>)> {
-        self.into_f32_slice(|_, len| 0..len)
+        self.into_f32_slice(|_, len| Ok(0..len))
     }
 
-    /// [`into_f32`] with the flat range picked from the dims/len before any
+    /// [`Self::into_f32`] with the flat range picked from the dims/len before any
     /// widening: a [.., C, H, W] output whose one used channel is `chan`
     /// widens one H·W channel instead of all C (SAM2's argmax-IoU mask).
+    /// The closure is fallible — its checks guard the range they produce,
+    /// and an error aborts the extract before any widening runs.
     pub fn into_f32_slice(
         self,
-        take: impl FnOnce(&[i64], usize) -> std::ops::Range<usize>,
+        take: impl FnOnce(&[i64], usize) -> Result<std::ops::Range<usize>>,
     ) -> Result<(Vec<i64>, Vec<f32>)> {
         match self {
             Self::F32(d, dims) => {
-                let range = take(&dims, d.len());
+                let range = take(&dims, d.len())?;
                 Ok((dims, d[range].to_vec()))
             }
             Self::F16(bits, dims) => {
-                let range = take(&dims, bits.len());
+                let range = take(&dims, bits.len())?;
                 let data = bits[range].reinterpret_cast::<half::f16>().to_f32_vec();
                 Ok((dims, data))
             }
@@ -533,7 +535,7 @@ mod tests {
             .unwrap()
             .into_f32_slice(|shape, len| {
                 let px = len / shape[2] as usize;
-                px..2 * px
+                Ok(px..2 * px)
             })
             .unwrap();
         assert_eq!(dims, vec![1, 1, 2, 2]);

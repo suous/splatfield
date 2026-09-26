@@ -410,12 +410,6 @@ impl eframe::App for App {
                 self.request_segmentation(prompt);
             }
 
-            let posterior = self
-                .seg
-                .posterior
-                .as_ref()
-                .filter(|_| self.seg.heatmap)
-                .cloned();
             // A camera-neutral event (e.g. a bare click) would re-run the
             // whole ~30-launch pipeline only to repaint an identical bitmap —
             // skip it. Any load brings a fresh Arc, so pointer inequality
@@ -438,6 +432,14 @@ impl eframe::App for App {
                 // controller state, which may drift further while it runs.
                 let camera = self.controller.camera;
                 let gpu = Rc::clone(&self.gpu);
+                // Only a stale frame consumes the posterior — cloning the
+                // tensor-pair handles every frame would be pure waste.
+                let posterior = self
+                    .seg
+                    .posterior
+                    .as_ref()
+                    .filter(|_| self.seg.heatmap)
+                    .cloned();
 
                 // Single-flight on wasm: the slot holds `None` while a render
                 // is in flight, so back-to-back stale frames coalesce, and the

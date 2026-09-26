@@ -158,7 +158,7 @@ async fn open_cache_dir(create: bool) -> Result<web_sys::FileSystemDirectoryHand
 /// cache directory. Never panics, never returns a partial store: the caller
 /// redownloads and repins a cache that fails any check.
 ///
-/// The fast path does NOT re-hash file bytes — a full 186 MB sha256 would
+/// The fast path does NOT re-hash file bytes — a full 158 MB sha256 would
 /// eat the very seconds the cache exists to save. Integrity rests on three
 /// legs instead: the bytes entered OPFS fully pinned (zip sha256 +
 /// per-file `FILE_SHA256` at install time), the manifest lands last as the

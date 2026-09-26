@@ -284,15 +284,26 @@ fn download(part: &Path, on_progress: &mut dyn FnMut(&str)) -> Result<()> {
     Ok(())
 }
 
+/// The zip-entry name's pin slot: strip one optional top-level `models/`
+/// component (whole-component only — `models_x/…` does not strip), then
+/// match a pin exactly, so strays and zip-slip paths never qualify. Both
+/// install walks (host fs, wasm store) share this one matcher so their
+/// matching rules cannot drift.
+fn pin_slot(entry_name: &str, pins: &[(&str, &str)]) -> Option<usize> {
+    let name = entry_name.strip_prefix("models/").unwrap_or(entry_name);
+    pins.iter().position(|(p, _)| *p == name)
+}
+
 /// Unpack exactly the manifest entries into `dest`: a zip path qualifies
 /// only after the single top-level wrapper folder is stripped and it equals
-/// a manifest path, so `..` escapes (rejected by `enclosed_name`),
-/// `__MACOSX` cruft, strays, and unlisted files inside allowed roots are
-/// all skipped. Each entry lands on a `.part` sibling and is renamed into
-/// place only after its hash passes; a mismatch wipes every file this call
-/// wrote, and a wipe that itself fails is loud — a leftover file would pass
-/// the launch-time presence check and feed corrupt weights to the oracle
-/// forever.
+/// a manifest path, so `..` escapes, `__MACOSX` cruft, strays, and
+/// unlisted files inside allowed roots are all skipped (a `..` escape
+/// never matches a pin, and the written path is the pin's own relative
+/// path, never an archive string). Each entry lands on a `.part` sibling
+/// and is renamed into place only after its hash passes; a mismatch wipes
+/// every file this call wrote, and a wipe that itself fails is loud — a
+/// leftover file would pass the launch-time presence check and feed
+/// corrupt weights to the oracle forever.
 #[cfg(not(target_arch = "wasm32"))]
 fn extract_into(
     archive: &mut zip::ZipArchive<impl Read + Seek>,
@@ -303,16 +314,11 @@ fn extract_into(
     let mut installed: Vec<PathBuf> = Vec::new();
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
-        let Some(rel) = entry.enclosed_name() else {
+        let Some(slot) = pin_slot(entry.name(), manifest) else {
             continue;
         };
-        // `strip_prefix` removes whole components only, so `models_x/…`
-        // stays; a bare `models` reduces to an empty path, matching no
-        // manifest key.
-        let rel = rel.strip_prefix("models").unwrap_or(&rel);
-        let Some((_, want)) = manifest.iter().find(|(p, _)| Path::new(p) == rel) else {
-            continue;
-        };
+        let (rel, want) = manifest[slot];
+        let rel = Path::new(rel);
         if entry.is_dir() {
             continue;
         }
@@ -412,17 +418,20 @@ async fn stream_body(
         .map_err(|_| anyhow::anyhow!("response stream is not a default reader"))?;
     let mut buf = Vec::with_capacity(total.map_or(0, |t| t.min(max_bytes) as usize));
     loop {
-        let chunk = wasm_bindgen_futures::JsFuture::from(reader.read())
-            .await
-            .map_err(|e| js_err(e).context("stream chunk unreadable"))?;
-        if js_sys::Reflect::get(&chunk, &"done".into())
-            .map_err(js_err)?
-            .is_truthy()
-        {
+        // The read result is a spec dictionary, not a JS class — dyn_into
+        // would `instanceof` against a nonexistent global and fail the cast
+        // on every chunk — so the cast from the resolved promise value is
+        // unchecked; the getters below are plain property reads either way.
+        let chunk: web_sys::ReadableStreamReadResult =
+            wasm_bindgen_futures::JsFuture::from(reader.read())
+                .await
+                .map_err(|e| js_err(e).context("stream chunk unreadable"))?
+                .unchecked_into();
+        if chunk.get_done() == Some(true) {
             return Ok(buf);
         }
-        let value: js_sys::Uint8Array = js_sys::Reflect::get(&chunk, &"value".into())
-            .map_err(js_err)?
+        let value: js_sys::Uint8Array = chunk
+            .get_value()
             .dyn_into()
             .map_err(|_| anyhow::anyhow!("stream chunk is not a Uint8Array"))?;
         // copy_to writes straight into the buffer's tail: a to_vec+extend
@@ -534,16 +543,21 @@ pub fn install_zip_with(
 ) -> Result<()> {
     let mut archive =
         zip::ZipArchive::new(std::io::Cursor::new(zip_bytes)).context("not a zip file")?;
+    // The memory peak here is intrinsic, not a lifetime bug: the archive
+    // reads lazily from `zip_bytes`, so the whole zip stays alive through
+    // the loop while `slots` accumulates every extracted file (~zip +
+    // extracted, a ~490 MB transient on the 158 MB release), and the
+    // store-fills-only-after-every-pin-passes invariant needs the
+    // bytes to coexist until the last hash passes. `insert` then MOVES them
+    // out of `slots` — there is no copy to remove. Shrinking this peak
+    // means a redesign (streaming zip reader, OPFS spill), not a reorder.
     let mut slots: Vec<Option<(&'static str, Vec<u8>)>> = vec![None; pins.len()];
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
         if entry.is_dir() {
             continue;
         }
-        // Whole-component strip: `models_x/…` keeps its prefix; a bare
-        // `models` entry matches nothing.
-        let name = entry.name().strip_prefix("models/").unwrap_or(entry.name());
-        let Some(slot) = pins.iter().position(|(p, _)| *p == name) else {
+        let Some(slot) = pin_slot(entry.name(), pins) else {
             continue;
         };
         // `position` bounds `slot` below `pins.len()`.
@@ -679,6 +693,51 @@ mod tests {
 
     fn pin_refs<'a>(pins: &'a [(&'static str, String)]) -> Vec<(&'a str, &'a str)> {
         pins.iter().map(|(p, s)| (*p, s.as_str())).collect()
+    }
+
+    /// The six release files' fixture payloads, in REQUIRED_FILES order —
+    /// every install test's store contents (the hash-mismatch test's
+    /// `tampered` array is the deliberate counterexample).
+    const CONTENTS: [&[u8]; 6] = [b"dino", b"{}", b"enc", b"enc-data", b"dec", b"dec-data"];
+
+    /// Those names behind one `models/` wrapper directory level.
+    fn wrapped_names() -> Vec<String> {
+        REQUIRED_FILES
+            .iter()
+            .map(|f| format!("models/{f}"))
+            .collect()
+    }
+
+    /// A legacy flat install at `root` — the pre-release-versioning cache
+    /// shape — with `weights` as the third file's on-disk bytes; the
+    /// manifest pins stay honest either way. Shared setup for the two
+    /// migration tests.
+    fn legacy_install(
+        tag: &str,
+        weights: &[u8],
+    ) -> (PathBuf, PathBuf, Vec<PathBuf>, Vec<(&'static str, String)>) {
+        let manifest: Vec<(&'static str, String)> = [
+            ("grounding_dino_tiny/onnx/model.onnx", zip_sha256(b"onnx")),
+            ("grounding_dino_tiny/tokenizer.json", zip_sha256(b"{}")),
+            (
+                "sam2_tiny/onnx/vision_encoder.onnx_data",
+                zip_sha256(b"weights"),
+            ),
+        ]
+        .into();
+        let root = scratch(tag);
+        let leaf = root.join(gsam::RELEASE_TAG);
+        std::fs::create_dir_all(root.join("grounding_dino_tiny/onnx")).unwrap();
+        std::fs::create_dir_all(root.join("sam2_tiny/onnx")).unwrap();
+        std::fs::write(root.join("grounding_dino_tiny/onnx/model.onnx"), b"onnx").unwrap();
+        std::fs::write(root.join("grounding_dino_tiny/tokenizer.json"), b"{}").unwrap();
+        std::fs::write(
+            root.join("sam2_tiny/onnx/vision_encoder.onnx_data"),
+            weights,
+        )
+        .unwrap();
+        let files: Vec<_> = manifest.iter().map(|(rel, _)| leaf.join(rel)).collect();
+        (root, leaf, files, manifest)
     }
 
     /// Extraction installs exactly the manifest entries — through a
@@ -837,31 +896,9 @@ mod tests {
     /// whole-dir renames instead of a 2 GB re-download.
     #[test]
     fn test_migration_moves_flat_cache_into_release_leaf() {
-        let onnx_sum = zip_sha256(b"onnx");
-        let tok_sum = zip_sha256(b"{}");
-        let weights_sum = zip_sha256(b"weights");
-        let manifest = [
-            ("grounding_dino_tiny/onnx/model.onnx", onnx_sum.as_str()),
-            ("grounding_dino_tiny/tokenizer.json", tok_sum.as_str()),
-            (
-                "sam2_tiny/onnx/vision_encoder.onnx_data",
-                weights_sum.as_str(),
-            ),
-        ];
-        let root = scratch("migrate");
-        let leaf = root.join(gsam::RELEASE_TAG);
-        std::fs::create_dir_all(root.join("grounding_dino_tiny/onnx")).unwrap();
-        std::fs::create_dir_all(root.join("sam2_tiny/onnx")).unwrap();
-        std::fs::write(root.join("grounding_dino_tiny/onnx/model.onnx"), b"onnx").unwrap();
-        std::fs::write(root.join("grounding_dino_tiny/tokenizer.json"), b"{}").unwrap();
-        std::fs::write(
-            root.join("sam2_tiny/onnx/vision_encoder.onnx_data"),
-            b"weights",
-        )
-        .unwrap();
-        let files: Vec<_> = manifest.iter().map(|(rel, _)| leaf.join(rel)).collect();
+        let (root, leaf, files, manifest) = legacy_install("migrate", b"weights");
 
-        ensure_release(&root, &leaf, &files, &manifest, &mut |_| {}).unwrap();
+        ensure_release(&root, &leaf, &files, &pin_refs(&manifest), &mut |_| {}).unwrap();
 
         assert_eq!(
             std::fs::read(leaf.join("grounding_dino_tiny/onnx/model.onnx")).unwrap(),
@@ -885,31 +922,10 @@ mod tests {
     /// says how to recover.
     #[test]
     fn test_migration_corrupt_legacy_fails_loud() {
-        let onnx_sum = zip_sha256(b"onnx");
-        let tok_sum = zip_sha256(b"{}");
-        let weights_sum = zip_sha256(b"weights");
-        let manifest = [
-            ("grounding_dino_tiny/onnx/model.onnx", onnx_sum.as_str()),
-            ("grounding_dino_tiny/tokenizer.json", tok_sum.as_str()),
-            (
-                "sam2_tiny/onnx/vision_encoder.onnx_data",
-                weights_sum.as_str(),
-            ),
-        ];
-        let root = scratch("migrate-corrupt");
-        let leaf = root.join(gsam::RELEASE_TAG);
-        std::fs::create_dir_all(root.join("grounding_dino_tiny/onnx")).unwrap();
-        std::fs::create_dir_all(root.join("sam2_tiny/onnx")).unwrap();
-        std::fs::write(root.join("grounding_dino_tiny/onnx/model.onnx"), b"onnx").unwrap();
-        std::fs::write(root.join("grounding_dino_tiny/tokenizer.json"), b"{}").unwrap();
-        std::fs::write(
-            root.join("sam2_tiny/onnx/vision_encoder.onnx_data"),
-            b"tampered",
-        )
-        .unwrap();
-        let files: Vec<_> = manifest.iter().map(|(rel, _)| leaf.join(rel)).collect();
+        let (root, leaf, files, manifest) = legacy_install("migrate-corrupt", b"tampered");
 
-        let err = ensure_release(&root, &leaf, &files, &manifest, &mut |_| {}).unwrap_err();
+        let err =
+            ensure_release(&root, &leaf, &files, &pin_refs(&manifest), &mut |_| {}).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("vision_encoder.onnx_data"), "{msg}");
         assert!(msg.contains("delete"), "{msg}");
@@ -959,15 +975,11 @@ mod tests {
     /// Six files through the `models/` wrapper, hashes checked byte-for-byte.
     #[test]
     fn test_install_installs_all_required_files_through_the_models_wrapper() {
-        let contents: [&[u8]; 6] = [b"dino", b"{}", b"enc", b"enc-data", b"dec", b"dec-data"];
-        let pins = pins_for(&contents);
-        let names: Vec<String> = REQUIRED_FILES
-            .iter()
-            .map(|f| format!("models/{f}"))
-            .collect();
+        let pins = pins_for(&CONTENTS);
+        let names = wrapped_names();
         let entries: Vec<(&str, &[u8])> = names
             .iter()
-            .zip(&contents)
+            .zip(&CONTENTS)
             .map(|(name, bytes)| (name.as_str(), *bytes))
             .collect();
         let zip = build_zip(&entries);
@@ -975,7 +987,7 @@ mod tests {
         let mut store = ModelStore::new();
         install_zip_with(&pin_refs(&pins), &zip, &mut store).unwrap();
         assert!(store.is_complete());
-        for (file, bytes) in REQUIRED_FILES.iter().zip(&contents) {
+        for (file, bytes) in REQUIRED_FILES.iter().zip(&CONTENTS) {
             assert_eq!(*store.get(file).unwrap(), *bytes);
         }
     }
@@ -983,11 +995,10 @@ mod tests {
     /// The `models/` wrapper is optional: a flat zip installs identically.
     #[test]
     fn test_install_accepts_the_zip_without_the_models_wrapper() {
-        let contents: [&[u8]; 6] = [b"dino", b"{}", b"enc", b"enc-data", b"dec", b"dec-data"];
-        let pins = pins_for(&contents);
+        let pins = pins_for(&CONTENTS);
         let entries: Vec<(&str, &[u8])> = REQUIRED_FILES
             .iter()
-            .zip(&contents)
+            .zip(&CONTENTS)
             .map(|(file, bytes)| (*file, *bytes))
             .collect();
         let zip = build_zip(&entries);
@@ -1001,15 +1012,11 @@ mod tests {
     /// directory stubs are ignored — only pinned paths reach the store.
     #[test]
     fn test_install_ignores_junk_entries() {
-        let contents: [&[u8]; 6] = [b"dino", b"{}", b"enc", b"enc-data", b"dec", b"dec-data"];
-        let pins = pins_for(&contents);
-        let names: Vec<String> = REQUIRED_FILES
-            .iter()
-            .map(|f| format!("models/{f}"))
-            .collect();
+        let pins = pins_for(&CONTENTS);
+        let names = wrapped_names();
         let mut entries: Vec<(String, &[u8])> = names
             .iter()
-            .zip(&contents)
+            .zip(&CONTENTS)
             .map(|(name, bytes)| (name.clone(), *bytes))
             .collect();
         entries.push(("__MACOSX/models/x".into(), b"cruft".as_slice()));
@@ -1032,8 +1039,7 @@ mod tests {
     /// weights to the sessions forever.
     #[test]
     fn test_install_hash_mismatch_names_the_file_and_leaves_the_store_empty() {
-        let contents: [&[u8]; 6] = [b"dino", b"{}", b"enc", b"enc-data", b"dec", b"dec-data"];
-        let pins = pins_for(&contents);
+        let pins = pins_for(&CONTENTS);
         let tampered: [&[u8]; 6] = [
             b"dino",
             b"{}",
@@ -1042,10 +1048,7 @@ mod tests {
             b"dec",
             b"dec-data",
         ];
-        let names: Vec<String> = REQUIRED_FILES
-            .iter()
-            .map(|f| format!("models/{f}"))
-            .collect();
+        let names = wrapped_names();
         let entries: Vec<(&str, &[u8])> = names
             .iter()
             .zip(&tampered)
@@ -1062,10 +1065,9 @@ mod tests {
     /// A zip lacking a required file errors naming it, store untouched.
     #[test]
     fn test_install_missing_required_file_names_it_and_leaves_the_store_empty() {
-        let contents: [&[u8]; 6] = [b"dino", b"{}", b"enc", b"enc-data", b"dec", b"dec-data"];
-        let pins = pins_for(&contents);
+        let pins = pins_for(&CONTENTS);
         let mut kept: Vec<(&'static str, &[u8])> =
-            REQUIRED_FILES.iter().copied().zip(contents).collect();
+            REQUIRED_FILES.iter().copied().zip(CONTENTS).collect();
         let (dropped_file, _) = kept.pop().unwrap();
         assert_eq!(dropped_file, REQUIRED_FILES[5]);
         let zip = build_zip(&kept);
@@ -1084,6 +1086,24 @@ mod tests {
             zip_sha256(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    /// The one matcher behind both install walks (host fs, wasm store):
+    /// one optional `models/` wrapper, then an exact pin match. `models_x`
+    /// keeps its prefix, a bare `models` matches nothing, and a second
+    /// wrapper never unwraps — the two spellings this replaced (host
+    /// component-wise `Path::strip_prefix("models")`, wasm string
+    /// `strip_prefix("models/")`) agreed on every one of these.
+    #[test]
+    fn pin_slot_strips_one_wrapper_and_matches_exactly() {
+        let pins = [("a/b.onnx", "h1"), ("top.onnx", "h2")];
+        assert_eq!(pin_slot("models/a/b.onnx", &pins), Some(0));
+        assert_eq!(pin_slot("a/b.onnx", &pins), Some(0));
+        assert_eq!(pin_slot("top.onnx", &pins), Some(1));
+        assert_eq!(pin_slot("models_x/a.onnx", &pins), None);
+        assert_eq!(pin_slot("models", &pins), None);
+        assert_eq!(pin_slot("models/models/a/b.onnx", &pins), None);
+        assert_eq!(pin_slot("__MACOSX/a", &pins), None);
     }
 
     /// The production wrapper first checks the whole zip against

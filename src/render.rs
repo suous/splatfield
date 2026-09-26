@@ -270,7 +270,7 @@ impl Splats {
         let total = self.attributes.shape[0];
         let (tile_bounds, num_tiles) = scratch.prepare(client, total, img_size);
         let max_isects = scratch.tile_ids.shape[0] as u32;
-        let cube_dim = CubeDim::new_1d(layout::TILE_SIZE);
+        let cube_dim = CubeDim::new_1d(layout::ELEM_WG);
 
         let sh_per_ch = self.sh_coeffs.shape[1] as u32;
         let view = CameraViewLaunch::for_camera(camera, img_size, tile_bounds);
@@ -919,7 +919,7 @@ mod tests {
             probe_tile_range::launch(
                 &client,
                 CubeCount::new_single(),
-                CubeDim::new_1d(layout::TILE_SIZE),
+                CubeDim::new_1d(layout::ELEM_WG),
                 ids_t.as_buffer_arg(),
                 ids.len() as u32,
                 tile,

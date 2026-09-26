@@ -58,6 +58,25 @@ pub(crate) fn scale_box(box_prompt: [f32; 4], width: u32, height: u32) -> [f32; 
     ]
 }
 
+/// The decoder-output tail both backends share: the mask tensor's
+/// argmax-IoU channel range. The checks run BEFORE the range is used —
+/// they guard it: a rank or count mismatch, or a zero channel count,
+/// must error rather than slice or divide blind. mh/mw live at
+/// dims[3]/[4], so anything but [1, 1, C, mh, mw] is a mismatch.
+fn iou_channel(ious: &[f32], shape: &[i64], len: usize) -> Result<std::ops::Range<usize>> {
+    anyhow::ensure!(
+        shape.len() == 5,
+        "SAM2 mask dims {shape:?} not [1, 1, C, mh, mw]"
+    );
+    anyhow::ensure!(
+        shape[2] > 0 && ious.len() == shape[2] as usize,
+        "iou shape mismatch"
+    );
+    let px = len / shape[2] as usize;
+    let chan = argmax(ious);
+    Ok(chan * px..(chan + 1) * px)
+}
+
 /// Widen the argmax-IoU channel's `mask_h × mask_w` logits, bilinear-resize
 /// to source dims, threshold at 0.5 → 255/0 mask bytes (row-major).
 ///
@@ -132,16 +151,11 @@ impl Sam2 {
             SessionInputValue::from(&embeddings[2]),
         ])?;
         // ious first: only the argmax-IoU mask channel is used, so the
-        // [1, C, 1, mh, mw] output widens one mh·mw channel, not all C.
+        // [1, 1, C, mh, mw] output widens one mh·mw channel, not all C.
         let (_, ious) = extract_f32(&decoded[0])?;
-        let chan = argmax(&ious);
-        let (mask_dims, soft) = extract_f32_with(&decoded[1], |shape, len| {
-            let px = len / shape[2] as usize;
-            chan * px..(chan + 1) * px
-        })?;
-
+        let (mask_dims, soft) =
+            extract_f32_with(&decoded[1], |shape, len| iou_channel(&ious, shape, len))?;
         let (mh, mw) = (mask_dims[3] as u32, mask_dims[4] as u32);
-        anyhow::ensure!(ious.len() == mask_dims[2] as usize, "iou shape mismatch");
         Ok(mask_bytes(&soft, mw as usize, mh as usize, width, height))
     }
 }
@@ -249,19 +263,10 @@ impl Sam2 {
         let [ious_t, masks_t, _object_score] = ortweb::fixed_outputs::<3>(outputs, "SAM2 decoder")?;
         // ious first: only the argmax-IoU mask channel is used, so the
         // [1, 1, C, mh, mw] output widens one mh·mw channel, not all C.
-        anyhow::ensure!(
-            masks_t.dims().len() == 5,
-            "SAM2 mask dims {:?} not [1, 1, C, mh, mw]",
-            masks_t.dims()
-        );
         let (_, ious) = ious_t.into_f32()?;
-        let chan = argmax(&ious);
-        let (mask_dims, soft) = masks_t.into_f32_slice(|shape, len| {
-            let px = len / shape[2] as usize;
-            chan * px..(chan + 1) * px
-        })?;
+        let (mask_dims, soft) =
+            masks_t.into_f32_slice(|shape, len| iou_channel(&ious, shape, len))?;
         let (mh, mw) = (mask_dims[3] as u32, mask_dims[4] as u32);
-        anyhow::ensure!(ious.len() == mask_dims[2] as usize, "iou shape mismatch");
         Ok(mask_bytes(&soft, mw as usize, mh as usize, width, height))
     }
 }
@@ -269,6 +274,33 @@ impl Sam2 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The count check guards the range it produces: a mismatch must Err,
+    /// never slice or divide blind.
+    #[test]
+    fn iou_channel_checks_count_before_slicing() {
+        let shape = [1i64, 1, 3, 16, 16];
+        // argmax = 1 → the second channel's 256-element plane.
+        assert_eq!(
+            iou_channel(&[0.1, 0.9, 0.5], &shape, 3 * 256).unwrap(),
+            256..512
+        );
+        let err = iou_channel(&[0.1, 0.9, 0.5, 0.3], &shape, 3 * 256)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("iou shape mismatch"), "{err}");
+        // The rank gate folds in here: mh/mw live at dims[3]/[4].
+        let err = iou_channel(&[0.9], &[1, 1, 1, 16], 16)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not [1, 1, C, mh, mw]"), "{err}");
+        // Zero channels passes the count check (0 == 0) but must not
+        // reach the `len / channels` division.
+        let err = iou_channel(&[], &[1, 1, 0, 16, 16], 0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("iou shape mismatch"), "{err}");
+    }
 
     /// The store lookups in `load` must address REQUIRED_FILES entries; the
     /// bare proto-ref names must never. A rename in either table fails here

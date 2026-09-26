@@ -36,6 +36,7 @@
 //! cubecl's blocking reads poll once and panic on wasm.
 
 use super::Accumulators;
+use crate::layout::ELEM_WG;
 use cubecl::{calculate_cube_count_elemwise, prelude::*};
 use splat_sort::tensor::GpuTensor;
 use std::sync::OnceLock;
@@ -300,8 +301,8 @@ impl BetaState {
         let n = self.a.shape[0];
         beta_update_kernel::launch(
             client,
-            calculate_cube_count_elemwise(client, n, CubeDim::new_1d(256)),
-            CubeDim::new_1d(256),
+            calculate_cube_count_elemwise(client, n, CubeDim::new_1d(ELEM_WG)),
+            CubeDim::new_1d(ELEM_WG),
             acc.scale,
             acc.fg.as_buffer_arg(),
             acc.bg.as_buffer_arg(),

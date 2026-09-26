@@ -27,6 +27,7 @@ pub mod prompted;
 pub(crate) mod views;
 
 use crate::camera::Camera;
+use crate::layout::ELEM_WG;
 use crate::render::{Finalize, RenderScratch, Splats, TileIsects};
 use cubecl::calculate_cube_count_elemwise;
 use cubecl::prelude::*;
@@ -106,8 +107,8 @@ fn zero_u32(buf: &mut [Atomic<u32>]) {
 fn zero_buf(client: &Client, buf: &GpuTensor) {
     zero_u32::launch(
         client,
-        calculate_cube_count_elemwise(client, buf.shape[0], CubeDim::new_1d(256)),
-        CubeDim::new_1d(256),
+        calculate_cube_count_elemwise(client, buf.shape[0], CubeDim::new_1d(ELEM_WG)),
+        CubeDim::new_1d(ELEM_WG),
         buf.as_buffer_arg(),
     );
 }

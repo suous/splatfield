@@ -55,11 +55,11 @@ pub fn run_text(
     // and no decode — the loop's stop rule reads the zero count, so the two
     // cases need not be distinguished.
     let oracle = move |rgb: &[u8], size: UVec2, _camera: &Camera| {
-        let boxes = detector.detect(rgb, size.x, size.y)?;
-        let Some(best) = boxes.first() else {
+        let detections = detector.detect(rgb, size.x, size.y)?;
+        let Some(best) = detections.first() else {
             return Ok(vec![0; (size.x * size.y) as usize]);
         };
-        sam.segment(rgb, size.x, size.y, best)
+        sam.segment(rgb, size.x, size.y, &best.xyxy)
     };
     let mut seg = Segmenter::new(splats, cfg, camera)?;
     seg.run_with(oracle, on_round)?;
