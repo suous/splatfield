@@ -147,6 +147,13 @@ impl App {
             if self.seg.busy {
                 return;
             }
+            if !alive() {
+                // A dead link would latch busy forever: every request is
+                // answered by the worker or not at all, and "not at all"
+                // must report here instead of in a stuck pill.
+                self.set_status("worker unavailable — reload the page", true);
+                return;
+            }
             // The worker paints its own tint on top of pristine colors; drop
             // the selection highlight so it can't half-survive the run.
             self.sel.clear();
@@ -449,7 +456,8 @@ mod web {
 
     thread_local! {
         /// One worker per page; `None` means the spawn failed (logged) and
-        /// requests are dropped with a console error instead of hanging.
+        /// [`alive`] reports false, so clicks report the dead link instead
+        /// of latching `busy` onto a request nothing will ever answer.
         static WORKER: Option<Worker> = spawn_worker();
         /// wasm-bindgen closures are dropped when unreferenced; the thread_local
         /// keeps the handlers alive for the page's lifetime.
@@ -457,6 +465,10 @@ mod web {
         /// The app's response sink. Set once from `App::new`; replies arriving
         /// before registration only hit the console.
         static SINK: RefCell<Option<ResponseSink>> = const { RefCell::new(None) };
+        /// Sticky link-death flag, set by [`kill_link`] from the worker's
+        /// `error` event. Every later ticket resolves with the failure frame
+        /// instead of parking into a void.
+        static LINK_DEAD: RefCell<bool> = const { RefCell::new(false) };
     }
 
     /// Message handling is registered once: every reply feeds the app sink.
@@ -510,6 +522,10 @@ mod web {
             });
             let on_error = Closure::<dyn FnMut(JsValue)>::new(|e: JsValue| {
                 console::error_1(&format!("[worker] worker error: {e:?}").into());
+                // The worker aborted (any wasm trap in it): the in-flight
+                // request must be answered by the link's death, not strand
+                // busy on a promise nobody will complete.
+                kill_link("worker error event");
             });
             Self {
                 on_message,
@@ -545,7 +561,15 @@ mod web {
     /// completes. The resolver parks here; the on_message sink takes it
     /// when the SegmentDone/SegmentFailed frame arrives. The reply crosses
     /// as the raw wire bytes — the awaiting oracle bincode-decodes them.
+    /// On a dead link the promise resolves immediately with the failure
+    /// frame: parking into a void would strand the loop task's await even
+    /// though [`kill_link`] already retired the UI's busy flag.
     pub(crate) fn segment_ticket(request: splatfield::pipeline::Request) -> js_sys::Promise {
+        if !alive() {
+            return js_sys::Promise::new(&mut |resolve, _| {
+                resolve_failed(&resolve, "worker link is dead");
+            });
+        }
         js_sys::Promise::new(&mut |resolve, _reject| {
             SEGMENT_RESOLVE.with_borrow_mut(|slot| *slot = Some(resolve));
             send(&request);
@@ -562,6 +586,54 @@ mod web {
                 let _ = resolve.call1(&js_sys::global(), &js_sys::Uint8Array::from(bytes));
             }
         });
+    }
+
+    /// Resolve a ticket with a `SegmentFailed` wire frame — the same frame
+    /// a real worker failure travels as, so the awaiting oracle unwinds
+    /// through its ordinary error path. An encode failure is loud —
+    /// resolving nothing would strand the await.
+    fn resolve_failed(resolve: &js_sys::Function, reason: &str) {
+        match encode(&Response::SegmentFailed(reason.to_owned())) {
+            Ok(bytes) => {
+                let _ = resolve.call1(
+                    &js_sys::global(),
+                    &js_sys::Uint8Array::from(bytes.as_slice()),
+                );
+            }
+            Err(e) => console::error_1(
+                &format!("[worker] cannot encode failure frame ({reason}): {e}").into(),
+            ),
+        }
+    }
+
+    /// Mark the worker link dead (sticky) and answer whatever was in
+    /// flight — the one failure class the "every request is answered"
+    /// contract (see the worker_main docs) can't route through the worker
+    /// itself: a parked Segment ticket resolves with the failure frame,
+    /// otherwise the sink folds `ModelsFailed`, the path a fetch failure
+    /// takes.
+    fn kill_link(reason: &str) {
+        if LINK_DEAD.with_borrow_mut(|d| core::mem::replace(d, true)) {
+            return;
+        }
+        console::error_1(&format!("[worker] link dead: {reason}").into());
+        let parked = SEGMENT_RESOLVE.with_borrow_mut(|slot| slot.take());
+        if let Some(resolve) = parked {
+            resolve_failed(&resolve, reason);
+        } else {
+            SINK.with_borrow_mut(|sink| {
+                if let Some(sink) = sink.as_mut() {
+                    sink(Response::ModelsFailed(reason.to_owned()));
+                }
+            });
+        }
+    }
+
+    /// Whether the worker link can carry a request: a failed spawn or a
+    /// fired `error` event ends it. Callers check before setting `busy` —
+    /// a request fired into a dead link would latch the UI forever.
+    pub(crate) fn alive() -> bool {
+        LINK_DEAD.with(|d| !*d.borrow()) && WORKER.with(|w| w.is_some())
     }
 
     /// Fire a request at the worker. Failure to post (worker absent or the
@@ -609,4 +681,4 @@ mod web {
 /// Page-side worker link (wasm only): `App::new` installs the worker and
 /// registers the inbox sink.
 #[cfg(target_arch = "wasm32")]
-pub(crate) use web::{install, on_response, send};
+pub(crate) use web::{alive, install, on_response, send};

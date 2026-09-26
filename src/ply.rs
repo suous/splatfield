@@ -6,6 +6,12 @@ use crate::render::CpuSplats;
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use std::io::{BufRead, BufWriter, Write};
 
+/// Ceiling on the decoded output planes: a lying `element vertex` header
+/// must bail before the `vec![0f32; …]`s, not abort the wasm32 heap with an
+/// allocation failure (alloc errors abort under `panic = "abort"`). Real
+/// scenes peak near 250 MiB of planes, so this leaves ~4× headroom.
+const MAX_PLANE_BYTES: u64 = 1024 * 1024 * 1024;
+
 pub(crate) fn parse_ply(mut reader: impl BufRead) -> Result<CpuSplats> {
     let mut vertex_count: usize = 0;
     let mut properties = Vec::new();
@@ -65,10 +71,18 @@ pub(crate) fn parse_ply(mut reader: impl BufRead) -> Result<CpuSplats> {
 
     let stride = properties.len();
 
-    // Guard absurd headers before allocating the output planes.
+    // Guard absurd headers before allocating the output planes: the stride
+    // product must not overflow the address space, and the planes' combined
+    // byte size must fit the budget — vertex_count comes straight from the
+    // header, and on wasm32 an unchecked vec![0f32; …] of that size is an
+    // alloc-failure abort before the first read_exact can fail.
     vertex_count
         .checked_mul(stride)
         .context("PLY vertex count overflows address space")?;
+    ensure!(
+        vertex_count as u64 * (ATTR_PLANES + rest_keys.len() + 3) as u64 * 4 <= MAX_PLANE_BYTES,
+        "PLY vertex count {vertex_count} exceeds the {MAX_PLANE_BYTES}-byte output-plane budget"
+    );
 
     let n = rest_keys.len() / 3;
     let mut attributes = vec![0f32; vertex_count * ATTR_PLANES];
@@ -81,8 +95,15 @@ pub(crate) fn parse_ply(mut reader: impl BufRead) -> Result<CpuSplats> {
             .read_exact(bytemuck::cast_slice_mut(&mut row))
             .with_context(|| format!("failed to read vertex {i} of {vertex_count}"))?;
 
-        let q =
-            glam::Quat::from_xyzw(row[idx_r1], row[idx_r2], row[idx_r3], row[idx_r0]).normalize();
+        // A zero rotation can't be normalized (NaN poisons the covariances,
+        // and the kernel's min resolves the NaN alpha to 0.999 — an opaque
+        // smear), so it's malformed input, not a degenerate case to repair.
+        let q = glam::Quat::from_xyzw(row[idx_r1], row[idx_r2], row[idx_r3], row[idx_r0]);
+        ensure!(
+            q.length_squared() > 0.0,
+            "vertex {i}: zero rotation quaternion"
+        );
+        let q = q.normalize();
         attributes[PLANE_X * vertex_count + i] = row[idx_x];
         attributes[PLANE_Y * vertex_count + i] = row[idx_y];
         attributes[PLANE_Z * vertex_count + i] = row[idx_z];
@@ -285,6 +306,41 @@ mod tests {
             .into_bytes();
         let err = parse_ply(&bytes[..]).unwrap_err().to_string();
         assert!(err.contains("Unsupported property type"), "{err}");
+    }
+
+    /// The 14 required properties in parse order — the minimal header the
+    /// per-vertex checks (plane budget, rotation validity) are reached
+    /// through.
+    fn ply_header(n: usize) -> String {
+        "ply\nformat binary_little_endian 1.0\n".to_string()
+            + &format!("element vertex {n}\n")
+            + "property float x\nproperty float y\nproperty float z\n\
+               property float scale_0\nproperty float scale_1\nproperty float scale_2\n\
+               property float opacity\nproperty float rot_0\nproperty float rot_1\n\
+               property float rot_2\nproperty float rot_3\nproperty float f_dc_0\n\
+               property float f_dc_1\nproperty float f_dc_2\nend_header\n"
+    }
+
+    #[test]
+    fn test_parse_ply_huge_vertex_count_bails() {
+        // 1e8 vertices × 14 floats × 4 B = 5.6 GB of planes: the budget must
+        // reject the header before any allocation (on wasm32 the unchecked
+        // path is an alloc-failure abort, not a clean error).
+        let err = parse_ply(ply_header(100_000_000).as_bytes())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("output-plane budget"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_ply_zero_rotation_bails() {
+        // glam normalizes a zero quaternion to NaN; the kernel's min then
+        // resolves the NaN alpha to 0.999 — an opaque smear instead of an
+        // error. Malformed input, not a degenerate case to repair.
+        let mut bytes = ply_header(1).into_bytes();
+        bytes.extend_from_slice(&[0f32; 14].map(f32::to_le_bytes).concat());
+        let err = parse_ply(&bytes[..]).unwrap_err().to_string();
+        assert!(err.contains("zero rotation"), "{err}");
     }
 
     /// Writer→parser roundtrip: a written file parses back to the exact

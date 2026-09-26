@@ -120,6 +120,19 @@ impl Loaded {
 pub(crate) type FrameSlot = Rc<RefCell<Option<FrameGpu>>>;
 
 impl App {
+    /// Claim the next load generation: of two racing loads, the one
+    /// requested LAST wins. The claim also raises the in-flight flag so
+    /// the pill holds until the load lands. Callers claim BEFORE building
+    /// their progress closures, which compare against the returned id —
+    /// a superseded load's stale chunks must not narrate over the winner.
+    #[cfg(target_arch = "wasm32")]
+    fn claim_load(&self) -> u64 {
+        let mut slot = self.splats.lock().unwrap();
+        slot.load_gen += 1;
+        slot.load_in_flight = true;
+        slot.load_gen
+    }
+
     /// Parse and upload scene bytes off the UI thread; of two racing loads
     /// the one requested LAST wins. The `bytes` future is the only
     /// difference between callers: the drop path reads a browser file
@@ -127,23 +140,13 @@ impl App {
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn load_bytes(
         &self,
+        load_id: u64,
         name: String,
         ctx: egui::Context,
         bytes: impl std::future::Future<Output = anyhow::Result<Vec<u8>>> + 'static,
     ) {
         let client = self.client.clone();
         let splats = Arc::clone(&self.splats);
-
-        // Claim the next generation up front: of two racing loads, the one
-        // requested LAST wins and a stale late finish is discarded. The
-        // claim also raises the in-flight flag so the pill holds until the
-        // load lands.
-        let load_id = {
-            let mut slot = splats.lock().unwrap();
-            slot.load_gen += 1;
-            slot.load_in_flight = true;
-            slot.load_gen
-        };
 
         // The source FILE NAME (web has no directories) — the save button
         // derives `<name>.edited.ply` from it — and the extension
@@ -208,7 +211,8 @@ impl App {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "scene".into());
-        self.load_bytes(name, ctx, async move {
+        let load_id = self.claim_load();
+        self.load_bytes(load_id, name, ctx, async move {
             file.bytes_async()
                 .await
                 .map_err(|e| anyhow::anyhow!("Failed to read dropped file: {e}"))
@@ -237,11 +241,19 @@ impl App {
             // The fetch future can't borrow `self`, so its progress stages
             // through the loop task's channel — the pill drains it like any
             // other engine message, and the repaint request wakes the UI
-            // between chunks.
+            // between chunks. The narration is generation-guarded: a drop
+            // that supersedes this fetch mid-download owns the pill, and
+            // the uncancelable fetch's remaining chunks must not narrate
+            // over it.
             use super::worker::SegMsg;
+            let load_id = self.claim_load();
+            let splats = Arc::clone(&self.splats);
             let msgs = Rc::clone(&self.seg.msgs);
             let progress_ctx = ui.ctx().clone();
             let on_progress = move |p: f64| {
+                if splats.lock().unwrap().load_gen != load_id {
+                    return;
+                }
                 let mb = fetch::DEMO_SCENE_BYTES as f64 / 1e6;
                 msgs.borrow_mut().push(SegMsg::Status(format!(
                     "fetching demo scene {:.0}% ({:.0}/{mb:.0} MB)",
@@ -250,7 +262,12 @@ impl App {
                 )));
                 progress_ctx.request_repaint();
             };
-            self.load_bytes(name, ui.ctx().clone(), fetch::fetch_demo_scene(on_progress));
+            self.load_bytes(
+                load_id,
+                name,
+                ui.ctx().clone(),
+                fetch::fetch_demo_scene(on_progress),
+            );
         }
     }
 
@@ -471,8 +488,10 @@ impl App {
         let splats = Arc::clone(&self.splats);
         wasm_bindgen_futures::spawn_local(async move {
             let saved = async {
-                // The pill must paint before the main thread blocks on the
-                // readback/write/copy pipeline, so yield one macrotask first.
+                // The pill must paint "saving models…" before the main
+                // thread blocks on the readback/write/copy pipeline, so
+                // hold the block off ~50 ms — a macrotask yield alone can
+                // lose the race to the synchronous save that follows.
                 let delay = js_sys::eval("new Promise((resolve) => setTimeout(resolve, 50))")
                     .map_err(|e| anyhow::anyhow!("scheduling the save: {e:?}"))?;
                 wasm_bindgen_futures::JsFuture::from(delay.unchecked_into::<js_sys::Promise>())

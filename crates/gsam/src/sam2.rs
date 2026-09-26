@@ -121,6 +121,13 @@ impl Sam2 {
             GraphOptimizationLevel::Level3,
         )?;
         let decoder_dtypes = input_dtypes(&decoder)?;
+        // Mirror of the wasm load's guard: decoder_dtypes[0..=2] are indexed
+        // in `segment`.
+        anyhow::ensure!(
+            decoder_dtypes.len() >= 3,
+            "SAM2 decoder declares {} inputs, expected at least 3",
+            decoder_dtypes.len()
+        );
         Ok(Self {
             encoder: session::build(&sam_file("vision_encoder")?, GraphOptimizationLevel::Level3)?,
             decoder,
@@ -142,6 +149,13 @@ impl Sam2 {
         let labels = make_input(&[1, 1, 1], vec![-1.0], self.decoder_dtypes[1])?;
         let boxes_in = make_input(&[1, 1, 4], coords.to_vec(), self.decoder_dtypes[2])?;
         let embeddings = self.encoder.run([SessionInputValue::from(&image)])?;
+        // Mirrors of the wasm arms' fixed_outputs: the positional indexing
+        // below must not index blind.
+        anyhow::ensure!(
+            embeddings.len() == 3,
+            "SAM2 encoder returned {} outputs, expected 3",
+            embeddings.len()
+        );
         let decoded = self.decoder.run([
             SessionInputValue::from(&points),
             SessionInputValue::from(&labels),
@@ -150,6 +164,11 @@ impl Sam2 {
             SessionInputValue::from(&embeddings[1]),
             SessionInputValue::from(&embeddings[2]),
         ])?;
+        anyhow::ensure!(
+            decoded.len() == 3,
+            "SAM2 decoder returned {} outputs, expected 3",
+            decoded.len()
+        );
         // ious first: only the argmax-IoU mask channel is used, so the
         // [1, 1, C, mh, mw] output widens one mh·mw channel, not all C.
         let (_, ious) = extract_f32(&decoded[0])?;

@@ -47,6 +47,16 @@ fn models_zip_url() -> String {
 /// (or, on the web, the tab's memory).
 const MAX_DOWNLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
+/// The stream buffer's reserve ceiling: content-length is untrusted, and
+/// reserving a lying 2 GiB header aborts the wasm32 heap before the first
+/// byte arrives. The pinned releases are known-sized (models.zip, demo
+/// scene — both well under this), so they keep their up-front reserve;
+/// anything larger grows honestly while the `MAX_DOWNLOAD_BYTES` check
+/// still bounds the real bytes. Wasm-only: the host downloader streams
+/// through ureq's own `.limit` instead of `stream_body`.
+#[cfg(target_arch = "wasm32")]
+const MAX_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
+
 /// SHA-256 of the release zip. The wasm install checks the whole archive
 /// against it before unzipping — a corrupt or substituted download never
 /// reaches the per-file pins with a confusing error.
@@ -416,7 +426,8 @@ async fn stream_body(
         .get_reader()
         .dyn_into::<web_sys::ReadableStreamDefaultReader>()
         .map_err(|_| anyhow::anyhow!("response stream is not a default reader"))?;
-    let mut buf = Vec::with_capacity(total.map_or(0, |t| t.min(max_bytes) as usize));
+    let mut buf =
+        Vec::with_capacity(total.map_or(0, |t| t.min(max_bytes).min(MAX_RESERVE_BYTES) as usize));
     loop {
         // The read result is a spec dictionary, not a JS class — dyn_into
         // would `instanceof` against a nonexistent global and fail the cast

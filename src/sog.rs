@@ -49,8 +49,11 @@ fn decode_rgba<R: Read + Seek>(
     let mut file = zip
         .by_name(name)
         .with_context(|| format!("missing {name}"))?;
-    // Zip entries aren't Seek but the WebP decoder needs it — buffer the entry.
-    let mut buf = Vec::with_capacity(file.size() as usize);
+    // Zip entries aren't Seek but the WebP decoder needs it — buffer the
+    // entry. No capacity hint: the central-directory size is attacker-
+    // controlled in a crafted archive, and reserving it unchecked aborts
+    // the wasm32 heap on a lie; read_to_end grows to the real bytes.
+    let mut buf = Vec::new();
     file.read_to_end(&mut buf)?;
     let img = image::load_from_memory_with_format(&buf, image::ImageFormat::WebP)
         .with_context(|| format!("decode {name}"))?;
@@ -166,11 +169,20 @@ pub fn parse_sog(reader: impl Read + Seek) -> Result<CpuSplats> {
     if let Some(ref sh_n) = meta.sh_n {
         // (bands+1)^2 channels incl. DC; the palette sheet holds the rest.
         let sh_coeffs_per_ch = sh_per_ch - 1;
-        // The centroid sheet is a palette, not per-splat data: any size is valid.
+        // The centroid sheet is a palette, not per-splat data: its pixel
+        // count is unbounded, but its geometry is checked once decoded.
         let centroids = decode_rgba(&mut zip, &sh_n.files[0], 1)?;
         let labels = decode_rgba(&mut zip, &sh_n.files[1], n)?;
         let shn_cb = codebook(&sh_n.codebook, "shN")?;
         let cw = centroids.width() as usize;
+        // Rows hold whole palettes, so the sheet width must tile the coeffs
+        // exactly: a remainder either floors palette_offset's per-row count
+        // to zero (`label % 0` panic) or walks row tails past the sheet
+        // (index panic) — a crafted file must bail, not abort the wasm module.
+        anyhow::ensure!(
+            cw.is_multiple_of(sh_coeffs_per_ch),
+            "shN centroid sheet: width {cw} not a multiple of {sh_coeffs_per_ch}"
+        );
         let centroids = centroids.as_raw();
         // Rows hold whole palettes: total palettes is just pixels / coeffs.
         let palette_count = centroids.len() / 4 / sh_coeffs_per_ch;
@@ -206,12 +218,127 @@ fn palette_offset(label: usize, cw: usize, sh_coeffs_per_ch: usize) -> (usize, u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Cursor, Write};
+
+    /// Lossless-encode an RGBA8 buffer as WebP — the parser's strict input
+    /// format — so palette-walk fixtures need no data/ assets.
+    fn webp_bytes(img: &image::RgbaImage) -> Vec<u8> {
+        let mut out = Vec::new();
+        image::codecs::webp::WebPEncoder::new_lossless(&mut out)
+            .encode(
+                img.as_raw(),
+                img.width(),
+                img.height(),
+                image::ExtendedColorType::Rgba8,
+            )
+            .unwrap();
+        out
+    }
+
+    /// A minimal SOG archive over `n` all-zero splats with identity
+    /// codebooks (coefficient == byte value), so shN palette reads are
+    /// assertable byte-for-byte. `sh_bands` adds the shN half with a
+    /// `sheet_w`×`sheet_h` centroid sheet — malformed geometry is the
+    /// point of some callers. Labels address palette 0 by default;
+    /// `labels` overrides the per-splat label values.
+    fn fixture_sog(
+        n: u32,
+        sh_bands: Option<usize>,
+        sheet_w: u32,
+        sheet_h: u32,
+        labels: &dyn Fn(u32) -> [u8; 4],
+    ) -> Vec<u8> {
+        let solid = |rgba: [u8; 4], w: u32, h: u32| {
+            image::RgbaImage::from_fn(w, h, |_, _| image::Rgba(rgba))
+        };
+        let codebook: Vec<f32> = (0..256).map(|i| i as f32).collect();
+        let mut meta = serde_json::json!({
+            "count": n,
+            "means": {
+                "mins": [0.0, 0.0, 0.0],
+                "maxs": [0.0, 0.0, 0.0],
+                "files": ["means_lo.webp", "means_hi.webp"],
+            },
+            "scales": {"codebook": codebook.clone(), "files": ["scales.webp"]},
+            "quats": {"files": ["quats.webp"]},
+            "sh0": {"codebook": codebook.clone(), "files": ["sh0.webp"]},
+        });
+        if let Some(bands) = sh_bands {
+            meta["shN"] = serde_json::json!({
+                "bands": bands,
+                "codebook": codebook,
+                "files": ["shN_cent.webp", "shN_lab.webp"],
+            });
+        }
+
+        // Quats carry tag 255 (z omitted) → the quaternion [0,0,0,1].
+        let quats = solid([0, 0, 0, 255], n, 1);
+        let label_img = image::RgbaImage::from_fn(n, 1, |x, _| image::Rgba(labels(x)));
+        let mut zw = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        fn entry(zw: &mut zip::ZipWriter<Cursor<Vec<u8>>>, name: &str, bytes: &[u8]) {
+            zw.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(bytes).unwrap();
+        }
+        entry(&mut zw, "meta.json", meta.to_string().as_bytes());
+        entry(&mut zw, "means_lo.webp", &webp_bytes(&solid([0; 4], n, 1)));
+        entry(&mut zw, "means_hi.webp", &webp_bytes(&solid([0; 4], n, 1)));
+        entry(&mut zw, "scales.webp", &webp_bytes(&solid([0; 4], n, 1)));
+        entry(&mut zw, "quats.webp", &webp_bytes(&quats));
+        entry(&mut zw, "sh0.webp", &webp_bytes(&solid([0; 4], n, 1)));
+        if sh_bands.is_some() {
+            // Palette row p holds pixel bytes (p*10 + j*3 + k) for entry
+            // j's channel k — distinct per (palette, entry, channel).
+            let sheet = image::RgbaImage::from_fn(sheet_w, sheet_h, |j, p| {
+                let b = |k: u8| p as u8 * 10 + j as u8 * 3 + k;
+                image::Rgba([b(0), b(1), b(2), 255])
+            });
+            entry(&mut zw, "shN_cent.webp", &webp_bytes(&sheet));
+            entry(&mut zw, "shN_lab.webp", &webp_bytes(&label_img));
+        }
+        zw.finish().unwrap().into_inner()
+    }
 
     #[test]
     fn test_palette_offset_derives_row_width() {
         // 128px-wide centroid sheet, 8 coeffs per channel → 16 palettes per row.
         let (col, row) = palette_offset(20, 128, 8);
         assert_eq!((col, row), (4 * 8, 1)); // col in pixels, not palette index
+    }
+
+    #[test]
+    fn test_shn_narrow_sheet_bails_not_panics() {
+        // bands=3 → 15 coeffs; a 4px-wide sheet floors per_row to 0, so the
+        // walk would `label % 0` — the file must be rejected, not abort.
+        let bytes = fixture_sog(1, Some(3), 4, 10, &|_| [0, 0, 0, 255]);
+        let err = parse_sog(Cursor::new(bytes)).unwrap_err().to_string();
+        assert!(err.contains("centroid sheet"), "{err}");
+    }
+
+    #[test]
+    fn test_shn_untiled_sheet_bails_not_panics() {
+        // bands=1 → 3 coeffs; a 7px sheet has one row-tail pixel, so label 6
+        // (still < palette_count) would index one row past the sheet.
+        let bytes = fixture_sog(1, Some(1), 7, 3, &|_| [6, 0, 0, 255]);
+        let err = parse_sog(Cursor::new(bytes)).unwrap_err().to_string();
+        assert!(err.contains("centroid sheet"), "{err}");
+    }
+
+    #[test]
+    fn test_shn_palette_walk_reads_named_palettes() {
+        // Valid geometry: 2 palettes (3px rows), two splats pointing at
+        // different palettes — the coeffs must equal the sheet's byte values.
+        let bytes = fixture_sog(2, Some(1), 3, 2, &|i| [i as u8, 0, 0, 255]);
+        let parsed = parse_sog(Cursor::new(bytes)).unwrap();
+        assert_eq!(parsed.sh_coeffs.len(), 2 * 4 * 3);
+        let b = |p: u8, j: u8, k: u8| (p * 10 + j * 3 + k) as f32;
+        for j in 0..3u8 {
+            for k in 0..3u8 {
+                let base = ((j as usize + 1) * 3 + k as usize) * 2;
+                assert_eq!(parsed.sh_coeffs[base], b(0, j, k));
+                assert_eq!(parsed.sh_coeffs[base + 1], b(1, j, k));
+            }
+        }
     }
 
     #[test]
