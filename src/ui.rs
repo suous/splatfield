@@ -20,6 +20,13 @@ const STATUS_LIFETIME: std::time::Duration = std::time::Duration::from_secs(4);
 /// stay bounded: an error that never dismisses reads as a stuck state.
 const ERROR_STATUS_LIFETIME: std::time::Duration = std::time::Duration::from_secs(16);
 
+/// Panel width below which the bar stacks: the single row's widgets measure
+/// ≈630 px with egui's default fonts (≈600 idle, +31 for the busy label), so
+/// the gate keeps a margin for font/platform variance instead of clipping a
+/// trailing button — below it the prompt takes the full first row and the
+/// controls wrap to a second.
+const NARROW_PANEL_WIDTH: f32 = 720.0;
+
 /// Whether a drag-and-dropped file is a loadable scene.
 #[cfg(target_arch = "wasm32")]
 fn is_scene(path: &std::path::Path) -> bool {
@@ -35,10 +42,10 @@ fn is_scene(path: &std::path::Path) -> bool {
 fn draw_selection_box(painter: &egui::Painter, rect: egui::Rect) {
     let [r, g, b] = SELECT_GREEN;
     let color = Color32::from_rgb(r, g, b);
-    painter.rect_filled(rect, 4.0, color.gamma_multiply(0.15));
-    painter.rect_stroke(
+    painter.rect(
         rect,
         4.0,
+        color.gamma_multiply(0.15),
         egui::Stroke::new(2.5, color),
         egui::StrokeKind::Middle,
     );
@@ -88,57 +95,28 @@ impl App {
         has_model: bool,
         locked: bool,
     ) -> (bool, bool, bool, bool, bool) {
-        let mut run = false;
-        let mut reset_clicked = false;
-        let mut cut_clicked = false;
-        let mut save_clicked = false;
-        let mut cancel_clicked = false;
         let mut editing = false;
-
-        egui::Panel::bottom("b3seg").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let btn = |ui: &mut egui::Ui, label: &str, enabled: bool| {
-                    ui.add_enabled(enabled, egui::Button::new(label)).clicked()
-                };
-                let edit = ui.add(
-                    egui::TextEdit::singleline(&mut self.seg.prompt)
-                        .hint_text("text prompt, e.g. “bear”")
-                        .desired_width(220.0),
-                );
-                editing = edit.has_focus();
-                if edit.lost_focus()
-                    && ui.input(|i| i.key_pressed(egui::Key::Enter))
-                    && !self.seg.prompt.trim().is_empty()
-                {
-                    run = true;
-                }
-                ui.add(
-                    egui::DragValue::new(&mut self.seg.iters)
-                        .range(1..=20)
-                        .suffix(" iters"),
-                );
-                ui.checkbox(&mut self.seg.heatmap, "heatmap");
-                run |= btn(
-                    ui,
-                    if busy { "segmenting…" } else { "segment" },
-                    has_model && !busy && !self.seg.prompt.trim().is_empty(),
-                );
-                cancel_clicked |= btn(ui, "stop", busy);
-                reset_clicked |= btn(ui, "reset", has_model && !locked);
-                cut_clicked |= btn(ui, "cut", has_model && !locked && self.seg.result.is_some());
-                save_clicked |= btn(ui, "save", has_model && !locked);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let help = ui.add(egui::Button::new("?").small());
-                    let help = help.on_hover_ui(|ui| self.help_panel(ui));
-                    // The tooltip only appears after egui's hover delay, and
-                    // new users click instead — so a click pins the same
-                    // panel open; clicking anywhere else dismisses it.
-                    egui::Popup::from_toggle_button_response(&help)
-                        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-                        .show(|ui| self.help_panel(ui));
-                });
-            });
-        });
+        let (run, reset_clicked, cut_clicked, save_clicked, cancel_clicked) =
+            egui::Panel::bottom("b3seg")
+                .show(ui, |ui| {
+                    // Narrow screens (phones) stack the bar: the prompt
+                    // takes the full first row and the controls wrap to a
+                    // second; wider keeps the original single row.
+                    if ui.available_width() < NARROW_PANEL_WIDTH {
+                        let enter = self.prompt_row(ui, f32::INFINITY, &mut editing);
+                        ui.horizontal_wrapped(|ui| {
+                            self.seg_controls(ui, busy, has_model, locked, enter)
+                        })
+                        .inner
+                    } else {
+                        ui.horizontal(|ui| {
+                            let enter = self.prompt_row(ui, 220.0, &mut editing);
+                            self.seg_controls(ui, busy, has_model, locked, enter)
+                        })
+                        .inner
+                    }
+                })
+                .inner;
         // Delete removes the selected splats and Cmd/Ctrl+Z undoes the last
         // delete — but never while the user is typing in the prompt. The
         // Mac's delete key is Backspace; accept both.
@@ -152,6 +130,76 @@ impl App {
                 self.undo_delete();
             }
         }
+        (
+            run,
+            reset_clicked,
+            cut_clicked,
+            save_clicked,
+            cancel_clicked,
+        )
+    }
+
+    /// The prompt row: the text edit plus Enter-to-run. `width` is
+    /// `f32::INFINITY` on stacked phones (fill the row) and the desktop's
+    /// 220 px in the single-row layout. Writes the field's focus into
+    /// `*editing` — the caller's delete/undo key guard — and returns
+    /// whether Enter submitted the prompt.
+    fn prompt_row(&mut self, ui: &mut egui::Ui, width: f32, editing: &mut bool) -> bool {
+        let edit = ui.add(
+            egui::TextEdit::singleline(&mut self.seg.prompt)
+                .hint_text("text prompt, e.g. “bear”")
+                .desired_width(width),
+        );
+        *editing = edit.has_focus();
+        edit.lost_focus()
+            && ui.input(|i| i.key_pressed(egui::Key::Enter))
+            && !self.seg.prompt.trim().is_empty()
+    }
+
+    /// The controls after the prompt, in one row: iteration count, heatmap
+    /// toggle, run/stop, the edit buttons, help — shared by the desktop
+    /// single row and the stacked phone's second row. `enter` is the prompt
+    /// row's Enter trigger, folded into the run trigger. Returns (run,
+    /// reset, cut, save, cancel).
+    fn seg_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        busy: bool,
+        has_model: bool,
+        locked: bool,
+        enter: bool,
+    ) -> (bool, bool, bool, bool, bool) {
+        let btn = |ui: &mut egui::Ui, label: &str, enabled: bool| {
+            ui.add_enabled(enabled, egui::Button::new(label)).clicked()
+        };
+        ui.add(
+            egui::DragValue::new(&mut self.seg.iters)
+                .range(1..=20)
+                .suffix(" iters"),
+        );
+        ui.checkbox(&mut self.seg.heatmap, "heatmap");
+        // Non-short-circuiting `|`: the segment button must be drawn (and
+        // its own click seen) even on frames where Enter already fired.
+        let run = enter
+            | btn(
+                ui,
+                if busy { "segmenting…" } else { "segment" },
+                has_model && !busy && !self.seg.prompt.trim().is_empty(),
+            );
+        let cancel_clicked = btn(ui, "stop", busy);
+        let reset_clicked = btn(ui, "reset", has_model && !locked);
+        let cut_clicked = btn(ui, "cut", has_model && !locked && self.seg.result.is_some());
+        let save_clicked = btn(ui, "save", has_model && !locked);
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let help = ui.add(egui::Button::new("?").small());
+            let help = help.on_hover_ui(|ui| self.help_panel(ui));
+            // The tooltip only appears after egui's hover delay, and
+            // new users click instead — so a click pins the same
+            // panel open; clicking anywhere else dismisses it.
+            egui::Popup::from_toggle_button_response(&help)
+                .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+                .show(|ui| self.help_panel(ui));
+        });
         (
             run,
             reset_clicked,
