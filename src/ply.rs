@@ -9,8 +9,9 @@ use std::io::{BufRead, BufWriter, Write};
 /// Ceiling on the decoded output planes: a lying `element vertex` header
 /// must bail before the `vec![0f32; …]`s, not abort the wasm32 heap with an
 /// allocation failure (alloc errors abort under `panic = "abort"`). Real
-/// scenes peak near 250 MiB of planes, so this leaves ~4× headroom.
-const MAX_PLANE_BYTES: u64 = 1024 * 1024 * 1024;
+/// scenes peak near 250 MiB of planes, so this leaves ~4× headroom. Shared
+/// with `parse_sog`, whose `count` carries the identical hazard.
+pub(crate) const MAX_PLANE_BYTES: u64 = 1024 * 1024 * 1024;
 
 pub(crate) fn parse_ply(mut reader: impl BufRead) -> Result<CpuSplats> {
     let mut vertex_count: usize = 0;
@@ -68,6 +69,13 @@ pub(crate) fn parse_ply(mut reader: impl BufRead) -> Result<CpuSplats> {
         })
         .collect();
     rest_keys.sort_by_key(|&(_, n)| n);
+    // The SH block is whole xyz triples: a partial degree floors the channel
+    // count and the planes' stride no longer matches what the renderer reads.
+    ensure!(
+        rest_keys.len().is_multiple_of(3),
+        "f_rest_ count {} is not a multiple of 3",
+        rest_keys.len()
+    );
 
     let stride = properties.len();
 
@@ -276,6 +284,18 @@ mod tests {
             .into_bytes();
         let err = parse_ply(&bytes[..]).unwrap_err().to_string();
         assert!(err.contains("Missing property"), "{err}");
+    }
+
+    #[test]
+    fn test_parse_ply_rejects_partial_rest_triple() {
+        // A lone f_rest_0 floors the channel count and misdescribes the SH
+        // stride to the renderer — the header must bail, not truncate.
+        let bytes = synthetic_ply(1, &["f_rest_0"]);
+        let err = parse_ply(&bytes[..]).unwrap_err().to_string();
+        assert!(err.contains("f_rest_"), "{err}");
+        // Whole triples of any degree stay accepted.
+        let whole = synthetic_ply(1, &["f_rest_0", "f_rest_1", "f_rest_2"]);
+        assert!(parse_ply(&whole[..]).is_ok());
     }
 
     #[test]

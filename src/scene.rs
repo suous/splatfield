@@ -7,9 +7,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 #[cfg(target_arch = "wasm32")]
+use super::worker::SegMsg;
+#[cfg(target_arch = "wasm32")]
 use eframe::egui;
 #[cfg(target_arch = "wasm32")]
-use eframe::wasm_bindgen::JsCast;
+use eframe::wasm_bindgen::{JsCast, JsValue};
 use splat_sort::tensor::GpuTensor;
 #[cfg(target_arch = "wasm32")]
 use splatfield::fetch;
@@ -46,12 +48,12 @@ pub(crate) struct Loaded {
     pub(crate) scene: Option<Scene>,
     pub(crate) reframe: bool,
     pub(crate) load_gen: u64,
-    /// Load failures (drag-drop), surfaced in the status pill — a GUI
-    /// launch has no stderr to read.
+    /// Load failures, surfaced in the status pill — a GUI launch has no
+    /// stderr to read.
     pub(crate) load_error: Option<String>,
     /// A load was requested and has not landed: the status pill must hold
     /// (not self-dismiss) until it does — a slow fetch outlives the
-    /// status lifetime. Set by `load_bytes`, cleared when its generation
+    /// status lifetime. Set by `claim_load`, cleared when its generation
     /// lands; a stale finish leaves the flag to the newer load that
     /// superseded it.
     pub(crate) load_in_flight: bool,
@@ -119,6 +121,51 @@ impl Loaded {
 /// no borrow is held across its await; `None` means a render is in flight.
 pub(crate) type FrameSlot = Rc<RefCell<Option<FrameGpu>>>;
 
+/// A file picked through the hidden `<input type=file>` (src/picker.rs),
+/// dressed as an egui drop so the picked path IS the drag-and-drop path:
+/// same `load_file`, same name derivation, same bytes read, same errors.
+#[cfg(target_arch = "wasm32")]
+#[derive(Debug)]
+pub(crate) struct Picked {
+    file: web_sys::File,
+    path: std::path::PathBuf,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl Picked {
+    pub(crate) fn new(file: web_sys::File) -> Self {
+        let path = std::path::PathBuf::from(file.name());
+        Self { file, path }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl egui::DroppedFile for Picked {
+    fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+
+    fn bytes_async(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<u8>, String>> + '_>> {
+        Box::pin(async {
+            // The same read shape eframe uses for drops: array buffer, one
+            // JS→wasm copy. The raw JsValue goes back unwrapped —
+            // [`App::load_file`] is the one funnel that formats the read
+            // error, so picked and dropped share the wording instead of
+            // stacking prefixes.
+            wasm_bindgen_futures::JsFuture::from(self.file.array_buffer())
+                .await
+                .map(|buf| js_sys::Uint8Array::new(&buf).to_vec())
+                .map_err(|e| format!("{e:?}"))
+        })
+    }
+
+    fn web_file(&self) -> Option<&web_sys::File> {
+        Some(&self.file)
+    }
+}
+
 impl App {
     /// Claim the next load generation: of two racing loads, the one
     /// requested LAST wins. The claim also raises the in-flight flag so
@@ -133,10 +180,33 @@ impl App {
         slot.load_gen
     }
 
+    /// Build a progress closure that narrates `fmt(p)` into the status
+    /// pill while the load identified by `load_id` is still current. A
+    /// superseded load's stale chunks must not narrate over the winner,
+    /// and a repaint request wakes the UI between chunks so the spinner
+    /// ticks. Shared by the URL and demo fetchers; the drop path skips
+    /// it (a single `bytes_async` call has no progress stages).
+    #[cfg(target_arch = "wasm32")]
+    fn progress_for(
+        &self,
+        load_id: u64,
+        ctx: egui::Context,
+        fmt: impl Fn(f64) -> String + 'static,
+    ) -> impl FnMut(f64) + 'static {
+        let splats = Arc::clone(&self.splats);
+        let msgs = Rc::clone(&self.seg.msgs);
+        move |p: f64| {
+            if splats.lock().unwrap().load_gen != load_id {
+                return;
+            }
+            msgs.borrow_mut().push(SegMsg::Status(fmt(p)));
+            ctx.request_repaint();
+        }
+    }
+
     /// Parse and upload scene bytes off the UI thread; of two racing loads
-    /// the one requested LAST wins. The `bytes` future is the only
-    /// difference between callers: the drop path reads a browser file
-    /// handle, the demo button fetches the same-origin demo scene.
+    /// the one requested LAST wins. The `bytes` future carries everything
+    /// caller-specific.
     #[cfg(target_arch = "wasm32")]
     pub(crate) fn load_bytes(
         &self,
@@ -148,15 +218,20 @@ impl App {
         let client = self.client.clone();
         let splats = Arc::clone(&self.splats);
 
-        // The source FILE NAME (web has no directories) — the save button
-        // derives `<name>.edited.ply` from it — and the extension
-        // `load_scene` dispatches on.
         let ext = std::path::Path::new(&name)
             .extension()
             .unwrap_or_default()
             .to_owned();
 
         let on_loaded = move |result: anyhow::Result<render::CpuSplats>| {
+            // Superseded before the GPU half — the CPU clone, upload, and
+            // color snapshot nothing consumes. Sound because this closure
+            // is synchronous on the UI thread: `spawn_local`, no await
+            // between check and write (an await inside `payload` would
+            // race `claim_load`).
+            if splats.lock().unwrap().load_gen != load_id {
+                return;
+            }
             let payload = result.map(|cpu| {
                 let data = Arc::new(cpu.clone().upload(&client));
                 let colors = data.save_colors();
@@ -165,9 +240,6 @@ impl App {
             match payload {
                 Ok((cpu, data, colors)) => {
                     let mut slot = splats.lock().unwrap();
-                    if slot.load_gen != load_id {
-                        return; // superseded by a newer load request
-                    }
                     slot.load_in_flight = false;
                     let n = data.attributes.shape[0];
                     slot.scene = Some(Scene {
@@ -183,9 +255,6 @@ impl App {
                 }
                 Err(e) => {
                     let mut slot = splats.lock().unwrap();
-                    if slot.load_gen != load_id {
-                        return;
-                    }
                     slot.load_in_flight = false;
                     slot.load_error = Some(format!("{e:#}"));
                     drop(slot);
@@ -202,15 +271,16 @@ impl App {
         });
     }
 
-    /// A drag-and-dropped file: read its bytes through the browser handle.
-    /// `file.path()` on wasm is the file NAME (eframe sets it from
-    /// File::name) — extension detection still works.
+    /// A preflighted load from a browser file handle — the one funnel every
+    /// local-file source (drag-and-drop, the picked file) shares. `name` is
+    /// derived by the caller, which has already run the preflight on it.
     #[cfg(target_arch = "wasm32")]
-    pub(crate) fn load_file(&self, file: egui::DroppedFileHandle, ctx: egui::Context) {
-        let name = std::path::Path::new(file.path())
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "scene".into());
+    pub(crate) fn load_file(
+        &self,
+        file: egui::DroppedFileHandle,
+        name: String,
+        ctx: egui::Context,
+    ) {
         let load_id = self.claim_load();
         self.load_bytes(load_id, name, ctx, async move {
             file.bytes_async()
@@ -219,56 +289,47 @@ impl App {
         });
     }
 
-    /// The help panel's demo row — fetch the fixtures-release bear and load
-    /// it like a drop — shared by the hover tooltip and the click-pinned
-    /// panel: egui keeps tooltips containing interactive widgets
-    /// interactable, so the button is clickable in both. Disabled like a
-    /// drop is guarded: loading during a run would leave the worker tinting
-    /// a stale model.
+    /// A user-supplied URL download — the demo button's wiring with the
+    /// endpoint from the landing card: type preflighted by the caller
+    /// before any byte moves (the fetch re-checks size on content-length),
+    /// narrated through the pill, generation-guarded like every load.
     #[cfg(target_arch = "wasm32")]
-    pub(crate) fn demo_button(&mut self, ui: &mut egui::Ui) {
-        ui.separator();
-        if ui
-            .add_enabled(!self.locked(), egui::Button::new("load demo scene (bear)"))
-            .clicked()
-        {
-            self.set_status("fetching demo scene…", false);
-            // Dismiss the pinned panel; the status pill narrates from here.
-            egui::Popup::close_all(ui.ctx());
-            // The URL's file name: the save button derives
-            // `<name>.edited.ply` from it, exactly like a dropped file.
-            let name = fetch::DEMO_SCENE_URL.rsplit('/').next().unwrap().to_owned();
-            // The fetch future can't borrow `self`, so its progress stages
-            // through the loop task's channel — the pill drains it like any
-            // other engine message, and the repaint request wakes the UI
-            // between chunks. The narration is generation-guarded: a drop
-            // that supersedes this fetch mid-download owns the pill, and
-            // the uncancelable fetch's remaining chunks must not narrate
-            // over it.
-            use super::worker::SegMsg;
-            let load_id = self.claim_load();
-            let splats = Arc::clone(&self.splats);
-            let msgs = Rc::clone(&self.seg.msgs);
-            let progress_ctx = ui.ctx().clone();
-            let on_progress = move |p: f64| {
-                if splats.lock().unwrap().load_gen != load_id {
-                    return;
-                }
-                let mb = fetch::DEMO_SCENE_BYTES as f64 / 1e6;
-                msgs.borrow_mut().push(SegMsg::Status(format!(
-                    "fetching demo scene {:.0}% ({:.0}/{mb:.0} MB)",
-                    p * 100.0,
-                    p * mb
-                )));
-                progress_ctx.request_repaint();
-            };
-            self.load_bytes(
-                load_id,
-                name,
-                ui.ctx().clone(),
-                fetch::fetch_demo_scene(on_progress),
-            );
-        }
+    pub(crate) fn load_url(&mut self, url: String, name: String, ctx: egui::Context) {
+        self.set_status(format!("downloading {name}…"), false);
+        let load_id = self.claim_load();
+        // The percent rides content-length; an absent header simply never
+        // narrates — the in-flight flag holds the pill for the whole wait.
+        let progress_name = name.clone();
+        let on_progress = self.progress_for(load_id, ctx.clone(), move |p| {
+            format!("downloading {progress_name} {:.0}%", p * 100.0)
+        });
+        self.load_bytes(
+            load_id,
+            name.clone(),
+            ctx,
+            fetch::fetch_scene_url(url, name, on_progress),
+        );
+    }
+
+    /// Start the demo-scene fetch — the landing card's Bear button. The
+    /// load is guarded like a drop: fetching during a run would leave the
+    /// worker tinting a stale model.
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn load_demo(&mut self, ctx: egui::Context) {
+        self.set_status("fetching demo scene…", false);
+        // Dismiss any pinned panel; the status pill narrates from here.
+        egui::Popup::close_all(&ctx);
+        let name = fetch::DEMO_SCENE_URL.to_owned();
+        let load_id = self.claim_load();
+        let on_progress = self.progress_for(load_id, ctx.clone(), move |p| {
+            let mb = fetch::DEMO_SCENE_BYTES as f64 / 1e6;
+            format!(
+                "fetching demo scene {:.0}% ({:.0}/{mb:.0} MB)",
+                p * 100.0,
+                p * mb
+            )
+        });
+        self.load_bytes(load_id, name, ctx, fetch::fetch_demo_scene(on_progress));
     }
 
     /// Box-select: keep the splats whose projected centers fall in the
@@ -492,9 +553,24 @@ impl App {
                 // thread blocks on the readback/write/copy pipeline, so
                 // hold the block off ~50 ms — a macrotask yield alone can
                 // lose the race to the synchronous save that follows.
-                let delay = js_sys::eval("new Promise((resolve) => setTimeout(resolve, 50))")
-                    .map_err(|e| anyhow::anyhow!("scheduling the save: {e:?}"))?;
-                wasm_bindgen_futures::JsFuture::from(delay.unchecked_into::<js_sys::Promise>())
+                // Window::set_timeout, not js_sys::eval: a 50 ms timer is
+                // not worth an unsafe-eval CSP requirement.
+                let window = web_sys::window()
+                    .ok_or_else(|| anyhow::anyhow!("scheduling the save: no window"))?;
+                let promise = js_sys::Promise::new(&mut |resolve, reject| {
+                    let fire = eframe::wasm_bindgen::closure::Closure::once_into_js(move || {
+                        let _ = resolve.call0(&JsValue::NULL);
+                    });
+                    // A scheduling failure rejects the promise — the await
+                    // must not hang on an unresolvable timer.
+                    if let Err(e) = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                        fire.unchecked_ref(),
+                        50,
+                    ) {
+                        let _ = reject.call1(&JsValue::NULL, &e);
+                    }
+                });
+                wasm_bindgen_futures::JsFuture::from(promise)
                     .await
                     .map_err(|e| anyhow::anyhow!("save interrupted: {e:?}"))?;
                 let dc = colors.read_vec_async::<f32>().await;

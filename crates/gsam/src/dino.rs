@@ -15,11 +15,11 @@ use anyhow::Result;
 use tokenizers::Tokenizer;
 
 #[cfg(target_arch = "wasm32")]
-use crate::{ModelStore, REQUIRED_FILES, ortweb, preprocess};
+use crate::{ModelStore, REQUIRED_FILES, ensure_graph_inputs, ortweb, preprocess};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{
-    encoder_input, extract_f32, grounding_file, grounding_tokenizer, input_dtypes, make_input,
-    session,
+    encoder_input, ensure_graph_inputs, expect_outputs, extract_f32, grounding_file,
+    grounding_tokenizer, input_dtypes, make_input, session,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use ort::session::{Session, SessionInputValue, builder::GraphOptimizationLevel};
@@ -68,17 +68,16 @@ pub(crate) fn sigmoid(x: f32) -> f32 {
 ///
 /// `logits` is `[nq × vocab]` — the export pads the text axis to
 /// max_text_len (256), so `vocab` is the real row stride while only the
-/// first `ntok = content.len()` positions carry this prompt's tokens.
-/// `boxes_cxcywh` is `[nq × 4]` normalized, `content` is `[ntok]`. Argmax
+/// first `content.len()` positions carry this prompt's tokens.
+/// `boxes_cxcywh` is `[nq × 4]` normalized, `content` is one flag per
+/// prompt token. Argmax
 /// is taken over content positions only: a stray high [CLS]/[SEP]/period
 /// logit must not veto (or fabricate) a detection.
-#[allow(clippy::too_many_arguments)] // a pure decode over one tensor's parts
 pub(crate) fn decode_detections(
     logits: &[f32],
     boxes_cxcywh: &[f32],
     nq: usize,
     vocab: usize,
-    ntok: usize,
     content: &[bool],
     width: u32,
     height: u32,
@@ -90,7 +89,7 @@ pub(crate) fn decode_detections(
         // NaN never wins the scan (a `>` against it is always false), so
         // all-pad rows fall through to the gate and are dropped.
         let mut best_logit = f32::NEG_INFINITY;
-        for t in 0..ntok.min(vocab) {
+        for t in 0..content.len().min(vocab) {
             if content[t] && row[t] > best_logit {
                 best_logit = row[t];
             }
@@ -124,11 +123,11 @@ fn encode_prompt(tokenizer: &Tokenizer, prompt: &str) -> Result<(Vec<u32>, Vec<b
     let label = prompt.trim().to_ascii_lowercase();
     anyhow::ensure!(!label.is_empty(), "at least one text label is required");
     let prompt = format!("{label}.");
-    // tokenizers errors are Box<dyn Error + Send + Sync>, not Sized, so
-    // they need an explicit lift into anyhow.
+    // tokenizers errors are Box<dyn Error + Send + Sync>, not Sized:
+    // from_boxed lifts them while keeping the source() chain anyhow! would flatten.
     let encoding = tokenizer
         .encode(prompt, true)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .map_err(anyhow::Error::from_boxed)?;
     let ids = encoding.get_ids().to_vec();
     // Token strings, not id literals: the content flags derive from what
     // actually encoded, so vocab drift cannot silently reclassify a
@@ -158,12 +157,24 @@ fn decode_outputs(
         .get(2)
         .ok_or_else(|| anyhow::anyhow!("logits dims {logits_dims:?} lack a token axis"))?
         as usize;
+    // The slices below stride by these dims — a buffer that disagrees is a
+    // graph/export drift and must error, not slice blind (abort on wasm).
+    // Same contract as sam2's `iou_channel`.
+    anyhow::ensure!(
+        logits.len() == nq * vocab,
+        "logits hold {} floats, want {nq}×{vocab}",
+        logits.len()
+    );
+    anyhow::ensure!(
+        boxes_cxcywh.len() == nq * 4,
+        "boxes hold {} floats, want {nq}×4",
+        boxes_cxcywh.len()
+    );
     Ok(decode_detections(
         logits,
         boxes_cxcywh,
         nq,
         vocab,
-        content.len(),
         content,
         width,
         height,
@@ -199,19 +210,15 @@ pub struct Detector {
 #[cfg(not(target_arch = "wasm32"))]
 impl Detector {
     pub fn load(prompt: &str) -> Result<Self> {
-        // tokenizers errors are Box<dyn Error + Send + Sync>, not Sized, so
-        // they need an explicit lift into anyhow.
+        // tokenizers errors are Box<dyn Error + Send + Sync>, not Sized:
+        // from_boxed lifts them while keeping the source() chain anyhow! would flatten.
         let tokenizer =
-            Tokenizer::from_file(grounding_tokenizer()?).map_err(|e| anyhow::anyhow!("{e}"))?;
+            Tokenizer::from_file(grounding_tokenizer()?).map_err(anyhow::Error::from_boxed)?;
         let (ids, content) = encode_prompt(&tokenizer, prompt)?;
         let session = session::build(&grounding_file()?, GraphOptimizationLevel::Level1)?;
         let dtypes = input_dtypes(&session)?;
         // Mirror of the wasm load's guard: dtypes[1..=4] are indexed below.
-        anyhow::ensure!(
-            dtypes.len() >= 5,
-            "grounding-dino graph declares {} inputs, expected 5",
-            dtypes.len()
-        );
+        ensure_graph_inputs(dtypes.len(), 5, "grounding-dino")?;
         let ntok = ids.len() as i64;
         let [ids_t, types_t, attn_t, mask_t] = prompt_fills(&ids);
         let consts = [
@@ -243,11 +250,7 @@ impl Detector {
                 SessionInputValue::from(pixels),
             ])?;
             // Mirror of the wasm arm's fixed_outputs::<2>.
-            anyhow::ensure!(
-                outputs.len() == 2,
-                "grounding-dino returned {} outputs, expected 2",
-                outputs.len()
-            );
+            expect_outputs(&outputs, 2, "grounding-dino")?;
             let (logits_dims, logits) = extract_f32(&outputs[0])?;
             let (_, boxes) = extract_f32(&outputs[1])?;
             (logits_dims, logits, boxes)
@@ -279,18 +282,14 @@ impl Detector {
     /// provider — the worker probes once, before any detector create, and
     /// passes it here (see [`ortweb::Ep`]).
     pub async fn load(store: &ModelStore, prompt: &str, ep: ortweb::Ep) -> Result<Self> {
-        // tokenizers errors are Box<dyn Error + Send + Sync>, not Sized, so
-        // they need an explicit lift into anyhow.
+        // tokenizers errors are Box<dyn Error + Send + Sync>, not Sized:
+        // from_boxed lifts them while keeping the source() chain anyhow! would flatten.
         let json = std::str::from_utf8(store.get(DINO_TOKENIZER)?)?;
-        let tokenizer = Tokenizer::from_bytes(json).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let tokenizer = Tokenizer::from_bytes(json).map_err(anyhow::Error::from_boxed)?;
         let (ids, content) = encode_prompt(&tokenizer, prompt)?;
         let session = ortweb::Session::load(store.get(DINO_ONNX)?, &[], ep).await?;
-        let dtypes = session.input_dtypes().await?;
-        anyhow::ensure!(
-            dtypes.len() >= 5,
-            "grounding-dino graph declares {} inputs, expected 5",
-            dtypes.len()
-        );
+        let dtypes = session.input_dtypes()?;
+        ensure_graph_inputs(dtypes.len(), 5, "grounding-dino")?;
         let ntok = ids.len() as i64;
         let [ids_t, types_t, attn_t, mask_t] = prompt_fills(&ids);
         let consts = [
@@ -462,7 +461,7 @@ mod tests {
             // 1.25 and 0.8×frame are exact in f32, keeping the box math bit-exact.
             1.25, -0.2, 0.8, 0.4,
         ];
-        let got = decode_detections(&logits, &boxes, 4, 2, 2, &content, 100, 50);
+        let got = decode_detections(&logits, &boxes, 4, 2, &content, 100, 50);
         assert_eq!(got.len(), 3, "q0/q1/q3 survive, q2 gated: {got:?}");
         // q3: x=125-40=85 stays, y=-10-10 clamps to 0; x2=x+w=165 runs past
         // the frame — the desktop contract clamps only the box origin.
@@ -493,17 +492,17 @@ mod tests {
     /// A fully off-frame box keeps its size: only the origin clamps.
     #[test]
     fn decode_clamps_off_frame_box_origin_into_frame() {
-        let got = decode_detections(&[4.0], &[-1.0, -1.0, 0.1, 0.1], 1, 1, 1, &[true], 100, 100);
+        let got = decode_detections(&[4.0], &[-1.0, -1.0, 0.1, 0.1], 1, 1, &[true], 100, 100);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].xyxy, [0.0, 0.0, 10.0, 10.0]);
     }
 
     /// The onnx-community export pads logits to [nq × 256] while the prompt
-    /// fills only the first ntok columns; decoding at ntok stride reads
-    /// cross-query garbage (the "bear" regression: a huge +6.9 [CLS] logit
-    /// at the row-0 argmax vetoed a real 0.80 detection). The stride must
-    /// be the padded vocab, pads (nonfinite) never win, and a high
-    /// non-content logit must not veto.
+    /// fills only the first content columns; decoding at the unpadded
+    /// stride reads cross-query garbage (the "bear" regression: a huge
+    /// +6.9 [CLS] logit at the row-0 argmax vetoed a real 0.80 detection).
+    /// The stride must be the padded vocab, pads (nonfinite) never win, and
+    /// a high non-content logit must not veto.
     #[test]
     fn decode_strides_by_padded_vocab_ignoring_pads_and_noncontent() {
         let content = [false, true, false, false]; // "bear." → only token 1
@@ -512,9 +511,24 @@ mod tests {
         logits[1] = 4.0; // q0 "bear" — the real detection
         logits[256 + 1] = 3.0; // q1 "bear" also above the gate
         let boxes = [0.1, 0.1, 0.5, 0.5, 0.2, 0.2, 0.5, 0.5];
-        let got = decode_detections(&logits, &boxes, 2, 256, 4, &content, 100, 100);
+        let got = decode_detections(&logits, &boxes, 2, 256, &content, 100, 100);
         assert_eq!(got.len(), 2, "both queries pass the gate: {got:?}");
         assert_eq!(got[0].conf, sigmoid(4.0));
         assert_eq!(got[1].conf, sigmoid(3.0));
+    }
+
+    /// The dims say [nq × vocab] but the buffer disagrees — the row slices
+    /// stride by those dims, so a blind slice would panic (abort on wasm)
+    /// instead of erroring like sam2's `iou_channel` does.
+    #[test]
+    fn decode_outputs_rejects_dim_buffer_mismatch() {
+        let err = decode_outputs(&[1, 2, 256], &[0.0; 100], &[0.0; 8], &[true; 4], 100, 100)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("logits"), "{err}");
+        let err = decode_outputs(&[1, 2, 256], &[0.0; 512], &[0.0; 3], &[true; 4], 100, 100)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("boxes"), "{err}");
     }
 }

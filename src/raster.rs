@@ -148,7 +148,9 @@ pub(crate) fn rasterize_kernel(
     // `in_bounds` guards edge tiles.
     let mut inside = 0u32;
     if evidence && in_bounds {
-        inside = (mask[(px / 32 + py * mask_words_per_row) as usize] >> (px % 32)) & 1u32;
+        inside = (mask[(px / layout::MASK_BITS + py * mask_words_per_row) as usize]
+            >> (px % layout::MASK_BITS))
+            & 1u32;
     }
 
     let num_chunks = (range_end - range_start).div_ceil(layout::TILE_SIZE);

@@ -58,9 +58,37 @@ pub(crate) fn encoder_input(
 }
 
 #[cfg(test)]
-mod encoder_input_tests {
+mod tests {
     use super::*;
     use crate::ortweb::{DType, OrtTensor};
+
+    #[test]
+    fn resize_is_identity_at_same_size() {
+        let src: Vec<u8> = (0..5 * 3 * 3).map(|i| (i * 13 % 251) as u8).collect();
+        assert_eq!(resize_rgb8(&src, (5, 3), (5, 3)), src);
+    }
+
+    #[test]
+    fn squash_resize_geometry() {
+        let src = vec![7u8; 4 * 2 * 3];
+        let out = resize_rgb8(&src, (4, 2), (8, 8));
+        assert_eq!(out.len(), 8 * 8 * 3);
+        assert!(out.iter().all(|&x| x == 7));
+    }
+
+    #[test]
+    fn normalize_layout_is_chw() {
+        let canvas = [0u8, 255, 128, 0, 255, 128];
+        let out: Vec<f32> = normalize_chw(&canvas, |x| x);
+        let want = |c: usize, v: u8| (v as f32 / 255.0 - MEAN[c]) / STD[c];
+        assert_eq!(out.len(), 6);
+        assert_eq!(out[0], want(0, 0));
+        assert_eq!(out[1], want(0, 0));
+        assert_eq!(out[2], want(1, 255));
+        assert_eq!(out[3], want(1, 255));
+        assert_eq!(out[4], want(2, 128));
+        assert_eq!(out[5], want(2, 128));
+    }
 
     /// Same-size squash is the identity canvas, so the tensor is exactly
     /// `normalize_chw` of the source pixels, plane-major C-H-W.
@@ -109,38 +137,5 @@ mod encoder_input_tests {
     #[test]
     fn encoder_input_rejects_i64_pixel_values() {
         assert!(encoder_input(&[0u8; 3], 1, 1, 1, DType::I64).is_err());
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resize_is_identity_at_same_size() {
-        let src: Vec<u8> = (0..5 * 3 * 3).map(|i| (i * 13 % 251) as u8).collect();
-        assert_eq!(resize_rgb8(&src, (5, 3), (5, 3)), src);
-    }
-
-    #[test]
-    fn squash_resize_geometry() {
-        let src = vec![7u8; 4 * 2 * 3];
-        let out = resize_rgb8(&src, (4, 2), (8, 8));
-        assert_eq!(out.len(), 8 * 8 * 3);
-        assert!(out.iter().all(|&x| x == 7));
-    }
-
-    #[test]
-    fn normalize_layout_is_chw() {
-        let canvas = [0u8, 255, 128, 0, 255, 128];
-        let out: Vec<f32> = normalize_chw(&canvas, |x| x);
-        let want = |c: usize, v: u8| (v as f32 / 255.0 - MEAN[c]) / STD[c];
-        assert_eq!(out.len(), 6);
-        assert_eq!(out[0], want(0, 0));
-        assert_eq!(out[1], want(0, 0));
-        assert_eq!(out[2], want(1, 255));
-        assert_eq!(out[3], want(1, 255));
-        assert_eq!(out[4], want(2, 128));
-        assert_eq!(out[5], want(2, 128));
     }
 }

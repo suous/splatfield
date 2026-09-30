@@ -48,10 +48,10 @@ pub enum Response {
     /// the decode). Empty detection (the prompt matched nothing) is a DONE
     /// with an all-zero w*h mask, confidence 0, box [0; 4], and both
     /// `encode_ms` and `decode_ms` exactly 0.0 — no encode/decode ran on
-    /// that path, and 0.0 is impossible for a real one, so the consumer can
-    /// distinguish it without a mask scan. It mirrors the native oracle:
-    /// "nothing found" feeds the loop an all-background mask (its stop rule
-    /// reads the zero count) instead of an error.
+    /// that path. The operative consumer contract is the mask itself: the
+    /// loop's stop rule reads the zero count, and the native oracle mirrors
+    /// it ("nothing found" is an all-background observation, not an error);
+    /// the 0.0 timings are parity/diagnostics markers no consumer reads.
     SegmentDone {
         box_px: [f32; 4],
         confidence: f32,
@@ -75,6 +75,14 @@ pub fn decode_request(bytes: &[u8]) -> Result<Request> {
 
 pub fn decode_response(bytes: &[u8]) -> Result<Response> {
     Ok(bincode::deserialize(bytes)?)
+}
+
+/// Decode an inbound frame's payload to raw wire bytes (the shared
+/// Uint8Array-or-nothing decode); `None` leaves narration to the caller.
+#[cfg(target_arch = "wasm32")]
+pub fn frame_bytes(v: wasm_bindgen::JsValue) -> Option<Vec<u8>> {
+    use wasm_bindgen::JsCast;
+    v.dyn_into::<js_sys::Uint8Array>().ok().map(|a| a.to_vec())
 }
 
 /// bincode deserializes every `Vec` with a read-as-u64 length; a corrupt or

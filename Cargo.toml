@@ -47,6 +47,9 @@ cubecl.workspace = true
 cubecl-environment = "=0.11.0-pre.4"
 bytemuck.workspace = true
 glam = "0.33"
+# beta.rs's ln Γ — the entropy table's generator and the tests' f64 oracle.
+# Pure-Rust no_std: compiles unchanged on both targets.
+libm = "0.2"
 anyhow.workspace = true
 image = { version = "0.25", default-features = false, features = ["webp"] }
 zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
@@ -92,6 +95,10 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 web-sys = { version = "0.3", features = [
     "Url",
     "HtmlAnchorElement",
+    # The landing card's file picker: picker.rs clicks the hidden input and
+    # polls its FileList (click() itself rides HtmlElement, transitively on).
+    "HtmlInputElement",
+    "FileList",
     # main.rs dyn_into's the page canvas; without this the wasm build only
     # compiles while eframe happens to enable the feature transitively.
     "HtmlCanvasElement",
@@ -120,6 +127,13 @@ web-sys = { version = "0.3", features = [
     "FileSystemGetDirectoryOptions",
     "FileSystemGetFileOptions",
     "FileSystemRemoveOptions",
+    # settings.rs: the two sidebar settings persist in the page's
+    # localStorage (load once at startup, save on change).
+    "Storage",
+    # picker.rs: the change listener on the hidden input — a file dialog
+    # fires no canvas event, so the listener's only job is a repaint
+    # request (add_event_listener_with_callback lives on EventTarget).
+    "EventTarget",
 ] }
 js-sys = "0.3"
 # A worker panic aborts the wasm module; the hook routes the message to the

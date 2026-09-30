@@ -40,10 +40,16 @@ impl From<glam::Vec3A> for Vec3FLaunch {
 pub(crate) const TILE_WIDTH: u32 = 16;
 pub(crate) const TILE_SIZE: u32 = TILE_WIDTH * TILE_WIDTH;
 
+/// Mask word bit-width — the packed evidence mask's wire format (LSB-first
+/// within each u32 word): `seg/mod.rs` packs it on the host, the rasterize
+/// kernel unpacks it on the GPU. One const so both sides of that wire move
+/// together.
+pub(crate) const MASK_BITS: u32 = 32;
+
 /// Workgroup size for the plain elementwise launches (project, map, tint,
 /// copy, zero, beta update): 256 threads over N items. Named apart from
-/// TILE_* on purpose — the render path used to alias TILE_SIZE here, which
-/// made a tile-geometry change silently rewrite unrelated launch configs.
+/// TILE_*: aliasing tile geometry here would silently rewrite unrelated
+/// launch configs whenever a tile size moves.
 pub(crate) const ELEM_WG: u32 = 256;
 
 // Splat attribute planes, field-major: plane k of splat i lives at

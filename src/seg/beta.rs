@@ -38,6 +38,7 @@
 use super::Accumulators;
 use crate::layout::ELEM_WG;
 use cubecl::{calculate_cube_count_elemwise, prelude::*};
+use libm::lgamma;
 use splat_sort::tensor::GpuTensor;
 use std::sync::OnceLock;
 
@@ -53,29 +54,6 @@ const GRID_PTS: u32 = 445;
 /// ln(1024)/(GRID_PTS−1) as f32. A literal because f64::ln is not
 /// const-callable; `test_table_grid_geometry_matches_b_max` pins it.
 const LN_STEP: f32 = 0.015_611_423;
-
-/// ln Γ(x), Lanczos g = 7, in f64 — the single reference for the H table
-/// and the parity tests. No reflection branch: Beta parameters only grow
-/// from 1, so x ≥ 1 always.
-fn lgamma(x: f64) -> f64 {
-    let z = x - 1.0;
-    let c = [
-        676.520_368_121_885_1,
-        -1_259.139_216_722_402_8,
-        771.323_428_777_653_1,
-        -176.615_029_162_140_6,
-        12.507_343_278_686_905,
-        -0.138_571_095_265_720_12,
-        9.984_369_578_019_572e-6,
-        1.505_632_735_149_311_6e-7,
-    ];
-    let mut series = 0.999_999_999_999_809_9;
-    for (k, ck) in c.iter().enumerate() {
-        series += ck / (z + k as f64 + 1.0);
-    }
-    let t = z + 7.5;
-    0.5 * (2.0 * std::f64::consts::PI).ln() + (z + 0.5) * t.ln() - t + series.ln()
-}
 
 /// ψ(x): recurrence up the ladder into the asymptotic regime, then
 /// ln x − 1/(2x) − 1/(12x²) + 1/(120x⁴) − 1/(252x⁶).

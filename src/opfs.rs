@@ -196,7 +196,7 @@ async fn load_cached_inner() -> Result<ModelStore> {
         .collect::<Vec<_>>();
     check_sizes(&manifest, &lengths).context("cached release rejected")?;
 
-    let mut store = ModelStore::new();
+    let mut store = ModelStore::default();
     for (file, bytes) in files {
         store
             .insert(file, bytes)
@@ -348,7 +348,7 @@ mod tests {
     /// A complete store with one distinguishable byte length per file
     /// position: file `i` holds `i + 1` bytes.
     fn populated_store() -> ModelStore {
-        let mut store = ModelStore::new();
+        let mut store = ModelStore::default();
         for (i, file) in REQUIRED_FILES.iter().enumerate() {
             store.insert(file, vec![i as u8; i + 1]).unwrap();
         }
@@ -460,7 +460,7 @@ mod tests {
     /// committed as if whole.
     #[test]
     fn build_manifest_rejects_an_incomplete_store() {
-        let mut store = ModelStore::new();
+        let mut store = ModelStore::default();
         for file in &REQUIRED_FILES[..5] {
             store.insert(file, vec![0; 1]).unwrap();
         }

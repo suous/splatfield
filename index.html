@@ -48,5 +48,15 @@
     <div class="centered" id="loading_text">
         <p>Loading SplatField...</p>
     </div>
+    <!-- The landing card's file dialog: browsers only expose a picker as a
+         DOM input; src/picker.rs programmatic-clicks it and polls the
+         FileList each frame. -->
+    <input type="file" id="scene_picker" accept=".ply,.sog" hidden>
+    <!-- The canvas is opaque to screen readers (eframe-web ships no
+         accesskit tree), so src/worker.rs mirrors every status line into
+         this live region — the one channel announcements reach AT through.
+         Visually hidden but NOT display:none / hidden: those remove it from
+         the accessibility tree and silence it. -->
+    <div id="sr_status" role="status" aria-live="polite" style="position:absolute;width:1px;height:1px;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;"></div>
 </body>
 </html>

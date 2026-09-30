@@ -3,12 +3,11 @@
 //! the per-file pins, and hand back a [`gsam::ModelStore`].
 //!
 //! Split by target. The host half downloads the zip into the gsam on-disk
-//! cache for the native oracle path (`seg::prompted`). The wasm half streams
-//! it off a same-origin file server with the browser `fetch` API — only
-//! `download_zip` and `fetch_demo_scene` touch the network there, and no
-//! test reaches either; the
-//! install logic is shared verbatim between the halves and host-tested, so
-//! both targets verify the identical pin tables.
+//! cache for the native oracle path (`seg::prompted`). The wasm half does
+//! the network (release zip, demo scene, user scene URLs) with the browser
+//! `fetch` API — no test reaches the network half — while the install
+//! logic is shared verbatim between the halves and host-tested, so both
+//! targets verify the identical pin tables.
 
 use anyhow::{Context, Result, bail, ensure};
 use gsam::{ModelStore, REQUIRED_FILES};
@@ -51,8 +50,9 @@ const MAX_DOWNLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// reserving a lying 2 GiB header aborts the wasm32 heap before the first
 /// byte arrives. The pinned releases are known-sized (models.zip, demo
 /// scene — both well under this), so they keep their up-front reserve;
-/// anything larger grows honestly while the `MAX_DOWNLOAD_BYTES` check
-/// still bounds the real bytes. Wasm-only: the host downloader streams
+/// anything larger grows honestly while the caller's ceiling
+/// (`MAX_DOWNLOAD_BYTES` for the zip, `MAX_SCENE_BYTES` for scenes) still
+/// bounds the real bytes. Wasm-only: the host downloader streams
 /// through ureq's own `.limit` instead of `stream_body`.
 #[cfg(target_arch = "wasm32")]
 const MAX_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
@@ -142,7 +142,7 @@ pub async fn ensure_models(on_progress: &mut dyn FnMut(f64)) -> Result<(ModelSto
     if let Some(store) = crate::opfs::load_cached().await {
         return Ok((store, true));
     }
-    let mut store = ModelStore::new();
+    let mut store = ModelStore::default();
     let zip = download_zip(on_progress).await?;
     install_zip(&zip, &mut store).context("installing release zip")?;
     Ok((store, false))
@@ -374,7 +374,10 @@ fn extract_into(
 /// `Response`. `cache`, when given, rides the request's `RequestInit`;
 /// `None` leaves every field at its default (wire-identical to no init).
 #[cfg(target_arch = "wasm32")]
-async fn fetch_ok(url: &str, cache: Option<web_sys::RequestCache>) -> Result<web_sys::Response> {
+pub(crate) async fn fetch_ok(
+    url: &str,
+    cache: Option<web_sys::RequestCache>,
+) -> Result<web_sys::Response> {
     use crate::opfs::js_err;
     use wasm_bindgen::JsCast;
 
@@ -400,6 +403,17 @@ async fn fetch_ok(url: &str, cache: Option<web_sys::RequestCache>) -> Result<web
     Ok(response)
 }
 
+/// Read a response header — the only JsValue error from `Headers::get`
+/// surfaces; absent returns `Ok(None)`. One site so every header read
+/// shares the `reading {name}: …` wording.
+#[cfg(target_arch = "wasm32")]
+fn header_raw(response: &web_sys::Response, name: &str) -> Result<Option<String>> {
+    response
+        .headers()
+        .get(name)
+        .map_err(|e| anyhow::anyhow!("reading {name}: {e:?}"))
+}
+
 /// Read `response`'s body into one buffer, streaming: the progress callback
 /// fires per chunk with the fraction of content-length (never called when
 /// the header is absent). `max_bytes` holds per chunk, so a mislabeled or
@@ -407,7 +421,7 @@ async fn fetch_ok(url: &str, cache: Option<web_sys::RequestCache>) -> Result<web
 /// buffer is reserved up front — a >100 MB Vec growing by amortized
 /// doubling memcpy's the whole body several times inside the worker.
 #[cfg(target_arch = "wasm32")]
-async fn stream_body(
+pub(crate) async fn stream_body(
     response: web_sys::Response,
     max_bytes: u64,
     on_progress: &mut dyn FnMut(f64),
@@ -415,11 +429,7 @@ async fn stream_body(
     use crate::opfs::js_err;
     use wasm_bindgen::JsCast;
 
-    let total = response
-        .headers()
-        .get("content-length")
-        .map_err(|e| anyhow::anyhow!("reading content-length: {e:?}"))?
-        .and_then(|v| v.parse::<u64>().ok());
+    let total = header_raw(&response, "content-length")?.and_then(|v| v.parse::<u64>().ok());
     let reader = response
         .body()
         .context("response carries no body")?
@@ -447,14 +457,16 @@ async fn stream_body(
             .map_err(|_| anyhow::anyhow!("stream chunk is not a Uint8Array"))?;
         // copy_to writes straight into the buffer's tail: a to_vec+extend
         // would copy every chunk twice and allocate a throwaway Vec per
-        // chunk.
+        // chunk. The ceiling check precedes the resize — one attacker-
+        // sized chunk must not allocate past it (u64 sum: usize wraps).
         let start = buf.len();
-        buf.resize(start + value.length() as usize, 0);
-        value.copy_to(&mut buf[start..]);
+        let chunk_len = value.length() as u64;
         ensure!(
-            buf.len() as u64 <= max_bytes,
+            buf.len() as u64 + chunk_len <= max_bytes,
             "stream exceeds the {max_bytes}-byte ceiling"
         );
+        buf.resize(start + chunk_len as usize, 0);
+        value.copy_to(&mut buf[start..]);
         if let Some(total) = total {
             on_progress((buf.len() as f64 / total as f64).min(1.0));
         }
@@ -474,7 +486,7 @@ pub async fn download_zip(on_progress: &mut dyn FnMut(f64)) -> Result<Vec<u8>> {
     stream_body(response, MAX_DOWNLOAD_BYTES, on_progress).await
 }
 
-/// The demo scene the help panel's button loads — the SH1 bear on the
+/// The demo scene the landing card's Bear button loads — the SH1 bear on the
 /// fixtures release, same assets CI tests against. Relative on purpose,
 /// like `ZIP_URL`: the page's `<base>` (trunk's public URL) resolves it
 /// next to index.html, where `scripts/dev_server.py` serves the durable
@@ -504,18 +516,53 @@ pub async fn fetch_demo_scene(mut on_progress: impl FnMut(f64)) -> Result<Vec<u8
     // A dev server that answers unknown paths with index.html (trunk
     // serve's SPA fallback) reports 200 + text/html — name that failure
     // instead of letting HTML surface as a cryptic zip error in parse.
-    let content_type = response
-        .headers()
-        .get("content-type")
-        .map_err(|e| anyhow::anyhow!("reading content-type: {e:?}"))?
-        .unwrap_or_default();
+    let content_type = header_raw(&response, "content-type")?.unwrap_or_default();
     ensure!(
         !content_type.starts_with("text/"),
         "the demo scene endpoint answered {content_type:?} — the asset is not \
          deployed next to the app; local development must serve it via \
          scripts/dev_server.py"
     );
-    stream_body(response, MAX_DOWNLOAD_BYTES, &mut on_progress).await
+    stream_body(response, crate::MAX_SCENE_BYTES, &mut on_progress).await
+}
+
+// The demo streams under the scene ceiling like every other scene source
+// (lib.rs): a release asset larger than the ceiling must move the ceiling
+// consciously, not silently stream 2 GiB into a wasm32 tab.
+#[cfg(target_arch = "wasm32")]
+const _: () = assert!(DEMO_SCENE_BYTES <= crate::MAX_SCENE_BYTES);
+
+/// Fetch a user-supplied scene URL — the demo-scene pattern minus the fixed
+/// endpoint: cross-origin only works when the server sends CORS headers (a
+/// refusal surfaces as the JS TypeError inside `fetch_ok`'s "fetching {url}"
+/// context). The URL was preflighted by `validate_scene_url` before this
+/// runs; the size holds HERE too: a content-length over the scene ceiling
+/// fails on the header, before the first chunk, and `stream_body`'s
+/// per-chunk ceiling catches a lying header mid-stream.
+#[cfg(target_arch = "wasm32")]
+pub async fn fetch_scene_url(
+    url: String,
+    name: String,
+    mut on_progress: impl FnMut(f64),
+) -> Result<Vec<u8>> {
+    let response = fetch_ok(&url, None).await?;
+    // The lie the demo endpoint's guard (fetch_demo_scene) catches, narrowed
+    // for user URLs: only text/html — a same-path SPA fallback — is
+    // certainly not a model. PLY is legitimately text/plain (a plain file
+    // host serves it so), so the broader text/ rejection would fail real
+    // models with a wrong explanation; a mislabeled non-HTML body fails
+    // loudly in parse instead.
+    let content_type = header_raw(&response, "content-type")?.unwrap_or_default();
+    ensure!(
+        !content_type.starts_with("text/html"),
+        "{url} answered {content_type:?} — that is a web page, not a model file"
+    );
+    let total = header_raw(&response, "content-length")?.and_then(|v| v.parse::<u64>().ok());
+    if let Some(total) = total {
+        // Same message a preflighted file gets for the same size violation.
+        crate::preflight_scene(&name, Some(total)).map_err(anyhow::Error::msg)?;
+    }
+    stream_body(response, crate::MAX_SCENE_BYTES, &mut on_progress).await
 }
 
 /// Verify the zip's sha256, unzip in memory, keep exactly the required
@@ -609,11 +656,30 @@ pub fn install_zip_with(
     Ok(())
 }
 
+/// One in-memory zip with `SimpleFileOptions` entries, shared by the host
+/// tests that fabricate archives (the install tests below and sog.rs's SOG
+/// fixtures). The deflate-bomb fixture stays hand-rolled: it streams a
+/// 256 MiB entry in chunks a `&[u8]`-per-entry signature can't express.
+#[cfg(test)]
+pub(crate) fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut w = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+    for (name, data) in entries {
+        if name.ends_with('/') {
+            w.add_directory(name.to_string(), zip::write::SimpleFileOptions::default())
+                .unwrap();
+        } else {
+            w.start_file(name.to_string(), zip::write::SimpleFileOptions::default())
+                .unwrap();
+            w.write_all(data).unwrap();
+        }
+    }
+    w.finish().unwrap().into_inner()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
-    use std::io::Write;
 
     /// The oracle file set: dino onnx + tokenizer, and both SAM2 graphs
     /// with their external-data siblings.
@@ -668,21 +734,6 @@ mod tests {
         for ((rel, _), req) in FILE_SHA256.iter().zip(REQUIRED_FILES) {
             assert_eq!(*rel, req);
         }
-    }
-
-    fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
-        let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
-        for (name, data) in entries {
-            if name.ends_with('/') {
-                w.add_directory(name.to_string(), zip::write::SimpleFileOptions::default())
-                    .unwrap();
-            } else {
-                w.start_file(name.to_string(), zip::write::SimpleFileOptions::default())
-                    .unwrap();
-                w.write_all(data).unwrap();
-            }
-        }
-        w.finish().unwrap().into_inner()
     }
 
     fn scratch(tag: &str) -> PathBuf {
@@ -995,7 +1046,7 @@ mod tests {
             .collect();
         let zip = build_zip(&entries);
 
-        let mut store = ModelStore::new();
+        let mut store = ModelStore::default();
         install_zip_with(&pin_refs(&pins), &zip, &mut store).unwrap();
         assert!(store.is_complete());
         for (file, bytes) in REQUIRED_FILES.iter().zip(&CONTENTS) {
@@ -1014,7 +1065,7 @@ mod tests {
             .collect();
         let zip = build_zip(&entries);
 
-        let mut store = ModelStore::new();
+        let mut store = ModelStore::default();
         install_zip_with(&pin_refs(&pins), &zip, &mut store).unwrap();
         assert!(store.is_complete());
     }
@@ -1040,7 +1091,7 @@ mod tests {
         let owned: Vec<(&str, &[u8])> = entries.iter().map(|(n, b)| (n.as_str(), *b)).collect();
         let zip = build_zip(&owned);
 
-        let mut store = ModelStore::new();
+        let mut store = ModelStore::default();
         install_zip_with(&pin_refs(&pins), &zip, &mut store).unwrap();
         assert!(store.is_complete());
     }
@@ -1067,7 +1118,7 @@ mod tests {
             .collect();
         let zip = build_zip(&entries);
 
-        let mut store = ModelStore::new();
+        let mut store = ModelStore::default();
         let err = install_zip_with(&pin_refs(&pins), &zip, &mut store).unwrap_err();
         assert!(err.to_string().contains(REQUIRED_FILES[2]), "{err}");
         assert_eq!(store.missing(), REQUIRED_FILES.to_vec());
@@ -1083,7 +1134,7 @@ mod tests {
         assert_eq!(dropped_file, REQUIRED_FILES[5]);
         let zip = build_zip(&kept);
 
-        let mut store = ModelStore::new();
+        let mut store = ModelStore::default();
         let err = install_zip_with(&pin_refs(&pins), &zip, &mut store).unwrap_err();
         assert!(err.to_string().contains(REQUIRED_FILES[5]), "{err}");
         assert_eq!(store.missing(), REQUIRED_FILES.to_vec());
@@ -1122,7 +1173,7 @@ mod tests {
     /// unzip step.
     #[test]
     fn test_install_zip_rejects_a_zip_missing_the_release_pin() {
-        let mut store = ModelStore::new();
+        let mut store = ModelStore::default();
         let err = install_zip(b"not the release zip", &mut store).unwrap_err();
         assert!(
             err.to_string().contains("sha256 of the release zip"),

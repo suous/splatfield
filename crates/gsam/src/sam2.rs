@@ -15,11 +15,11 @@
 use anyhow::Result;
 
 #[cfg(target_arch = "wasm32")]
-use crate::{ModelStore, argmax, ortweb, preprocess};
+use crate::{ModelStore, REQUIRED_FILES, argmax, ensure_graph_inputs, ortweb, preprocess};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{
-    argmax, encoder_input, extract_f32, extract_f32_with, input_dtypes, make_input, sam_file,
-    session,
+    argmax, encoder_input, ensure_graph_inputs, expect_outputs, extract_f32, extract_f32_with,
+    input_dtypes, make_input, sam_file, session,
 };
 #[cfg(not(target_arch = "wasm32"))]
 use ort::session::{Session, SessionInputValue, builder::GraphOptimizationLevel};
@@ -30,20 +30,21 @@ use ort::tensor::TensorElementType as TE;
 /// pixel coords in this frame.
 pub(crate) const NET: u32 = 1024;
 
-/// Store keys (REQUIRED_FILES entries) for the graphs, plus — deliberately
-/// distinct — the bare external-weights location strings the ONNX protos
-/// reference at session-create time. `ModelStore::get` takes the keyed form
-/// only; passing the proto-ref form is the "absent from store" failure mode.
+/// Store keys, indexed into [`REQUIRED_FILES`] so a release-manifest rename
+/// is a compile error (dino.rs's pattern), plus — deliberately distinct —
+/// the bare external-weights location strings the ONNX protos reference at
+/// session-create time. `ModelStore::get` takes the keyed form only;
+/// passing the proto-ref form is the "absent from store" failure mode.
 #[cfg(target_arch = "wasm32")]
-const VISION_ONNX: &str = "sam2_tiny/onnx/vision_encoder_q4f16.onnx";
+const VISION_ONNX: &str = REQUIRED_FILES[2];
 #[cfg(target_arch = "wasm32")]
-const VISION_DATA_KEY: &str = "sam2_tiny/onnx/vision_encoder_q4f16.onnx_data";
+const VISION_DATA_KEY: &str = REQUIRED_FILES[3];
 #[cfg(target_arch = "wasm32")]
 const VISION_DATA_REF: &str = "vision_encoder_q4f16.onnx_data";
 #[cfg(target_arch = "wasm32")]
-const DECODER_ONNX: &str = "sam2_tiny/onnx/prompt_encoder_mask_decoder_q4f16.onnx";
+const DECODER_ONNX: &str = REQUIRED_FILES[4];
 #[cfg(target_arch = "wasm32")]
-const DECODER_DATA_KEY: &str = "sam2_tiny/onnx/prompt_encoder_mask_decoder_q4f16.onnx_data";
+const DECODER_DATA_KEY: &str = REQUIRED_FILES[5];
 #[cfg(target_arch = "wasm32")]
 const DECODER_DATA_REF: &str = "prompt_encoder_mask_decoder_q4f16.onnx_data";
 
@@ -123,11 +124,7 @@ impl Sam2 {
         let decoder_dtypes = input_dtypes(&decoder)?;
         // Mirror of the wasm load's guard: decoder_dtypes[0..=2] are indexed
         // in `segment`.
-        anyhow::ensure!(
-            decoder_dtypes.len() >= 3,
-            "SAM2 decoder declares {} inputs, expected at least 3",
-            decoder_dtypes.len()
-        );
+        ensure_graph_inputs(decoder_dtypes.len(), 3, "SAM2 decoder")?;
         Ok(Self {
             encoder: session::build(&sam_file("vision_encoder")?, GraphOptimizationLevel::Level3)?,
             decoder,
@@ -149,13 +146,9 @@ impl Sam2 {
         let labels = make_input(&[1, 1, 1], vec![-1.0], self.decoder_dtypes[1])?;
         let boxes_in = make_input(&[1, 1, 4], coords.to_vec(), self.decoder_dtypes[2])?;
         let embeddings = self.encoder.run([SessionInputValue::from(&image)])?;
-        // Mirrors of the wasm arms' fixed_outputs: the positional indexing
-        // below must not index blind.
-        anyhow::ensure!(
-            embeddings.len() == 3,
-            "SAM2 encoder returned {} outputs, expected 3",
-            embeddings.len()
-        );
+        // Same contract as the wasm arms' fixed_outputs: the positional
+        // indexing below must not index blind.
+        expect_outputs(&embeddings, 3, "SAM2 encoder")?;
         let decoded = self.decoder.run([
             SessionInputValue::from(&points),
             SessionInputValue::from(&labels),
@@ -164,11 +157,7 @@ impl Sam2 {
             SessionInputValue::from(&embeddings[1]),
             SessionInputValue::from(&embeddings[2]),
         ])?;
-        anyhow::ensure!(
-            decoded.len() == 3,
-            "SAM2 decoder returned {} outputs, expected 3",
-            decoded.len()
-        );
+        expect_outputs(&decoded, 3, "SAM2 decoder")?;
         // ious first: only the argmax-IoU mask channel is used, so the
         // [1, 1, C, mh, mw] output widens one mh·mw channel, not all C.
         let (_, ious) = extract_f32(&decoded[0])?;
@@ -215,19 +204,15 @@ impl Sam2 {
             ep,
         )
         .await?;
-        let decoder_dtypes = decoder.input_dtypes().await?;
-        anyhow::ensure!(
-            decoder_dtypes.len() >= 3,
-            "SAM2 decoder declares {} inputs, expected at least 3",
-            decoder_dtypes.len()
-        );
+        let decoder_dtypes = decoder.input_dtypes()?;
+        ensure_graph_inputs(decoder_dtypes.len(), 3, "SAM2 decoder")?;
         let encoder = ortweb::Session::load(
             store.get(VISION_ONNX)?,
             &[(VISION_DATA_REF, store.get(VISION_DATA_KEY)?)],
             ep,
         )
         .await?;
-        let encoder_dtypes = encoder.input_dtypes().await?;
+        let encoder_dtypes = encoder.input_dtypes()?;
         Ok(Self {
             pixel_dtype: *encoder_dtypes
                 .first()
@@ -321,18 +306,14 @@ mod tests {
         assert!(err.contains("iou shape mismatch"), "{err}");
     }
 
-    /// The store lookups in `load` must address REQUIRED_FILES entries; the
-    /// bare proto-ref names must never. A rename in either table fails here
-    /// instead of at first browser session create.
+    /// The keyed consts are compile-time `REQUIRED_FILES` indices, so the
+    /// "is an entry" direction needs no runtime pin — but the key-vs-proto-ref
+    /// distinction has no compiler check: a rename that fused the two
+    /// spellings would fail only at first browser session create, so the
+    /// bare references must stay distinct suffixes of the keys.
     #[test]
     #[cfg(target_arch = "wasm32")]
-    fn store_keys_are_required_files_entries() {
-        for key in [VISION_ONNX, VISION_DATA_KEY, DECODER_ONNX, DECODER_DATA_KEY] {
-            assert!(
-                crate::REQUIRED_FILES.contains(&key),
-                "{key} is not a REQUIRED_FILES entry"
-            );
-        }
+    fn store_keys_differ_from_proto_refs() {
         for (key, reference) in [
             (VISION_DATA_KEY, VISION_DATA_REF),
             (DECODER_DATA_KEY, DECODER_DATA_REF),

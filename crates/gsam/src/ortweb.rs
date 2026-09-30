@@ -315,8 +315,9 @@ impl Session {
     /// Element type per input, in positional order, from
     /// `session.inputMetadata`. ort-web versions differ on whether that is
     /// exposed — when it is not, this fails loud (the caller falls back to
-    /// graph-specific defaults); there is no probe-run guessing here.
-    pub async fn input_dtypes(&self) -> Result<Vec<DType>> {
+    /// graph-specific defaults); there is no probe-run guessing here. The
+    /// bridge read is synchronous (`Reflect::get`), so this is a plain fn.
+    pub fn input_dtypes(&self) -> Result<Vec<DType>> {
         let Some(types) = bridge_input_types(&self.obj)? else {
             bail!(
                 "this onnxruntime-web build does not expose session.inputMetadata; \

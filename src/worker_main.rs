@@ -16,7 +16,7 @@ mod wasm {
     use gsam::{Detector, ModelStore, Sam2};
     use splatfield::fetch;
     use splatfield::opfs;
-    use splatfield::pipeline::{Request, Response, decode_request, encode};
+    use splatfield::pipeline::{Request, Response, decode_request, encode, frame_bytes};
     use std::cell::{Cell, RefCell};
     use wasm_bindgen::{JsCast, JsValue, closure::Closure};
     use wasm_bindgen_futures::{JsFuture, spawn_local};
@@ -97,11 +97,7 @@ mod wasm {
             // clone of the scope, the original goes to set_onmessage below.
             let scope = scope.clone();
             Closure::<dyn FnMut(MessageEvent)>::new(move |e: MessageEvent| {
-                let bytes = e
-                    .data()
-                    .dyn_into::<js_sys::Uint8Array>()
-                    .ok()
-                    .map(|a| a.to_vec());
+                let bytes = frame_bytes(e.data());
                 let Some(bytes) = bytes else {
                     console::error_1(&"[worker] frame is not a Uint8Array".into());
                     return;

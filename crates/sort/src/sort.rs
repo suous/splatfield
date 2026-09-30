@@ -365,8 +365,8 @@ fn plane_sort_path(client: &Client) -> Option<u32> {
         return None;
     }
     let props = client.properties();
-    // Lack of subgroup (plane) ops is no longer fatal — the 4-bit fallback
-    // covers it (plane ops proven on Apple Silicon/Metal3+).
+    // Missing subgroup (plane) ops are covered by the 4-bit fallback
+    // (plane ops proven on Apple Silicon/Metal3+).
     if !props.features.plane.contains(cubecl::features::Plane::Ops) {
         return None;
     }

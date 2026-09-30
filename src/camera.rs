@@ -119,15 +119,13 @@ impl Controller {
                 || response.dragged_by(PointerButton::Primary) && mods.ctrl);
         let is_orbit = !t && response.dragged_by(PointerButton::Primary) && !is_pan && !mods.shift;
 
-        if response.hovered() {
-            ui.set_cursor_icon(if mods.shift {
-                CursorIcon::Crosshair
-            } else if mods.ctrl || is_pan {
-                CursorIcon::Move
-            } else {
-                CursorIcon::PointingHand
-            });
-        }
+        response.clone().on_hover_cursor(if mods.shift {
+            CursorIcon::Crosshair
+        } else if mods.ctrl || is_pan {
+            CursorIcon::Move
+        } else {
+            CursorIcon::PointingHand
+        });
 
         let drag = if response.drag_started() {
             Vec2::ZERO

@@ -517,8 +517,8 @@ pub fn sample_opaque_attributes(
 
 /// Opaque-DC test fixture: [`sample_opaque_attributes`] + zero SH — tests
 /// vary geometry only.
-#[cfg(test)]
-pub(crate) fn opaque_splats(client: &Client, attributes: Vec<f32>) -> Splats {
+#[cfg(any(test, feature = "test-utils"))]
+pub fn opaque_splats(client: &Client, attributes: Vec<f32>) -> Splats {
     let n = attributes.len() / layout::ATTR_PLANES;
     Splats::new(attributes, vec![0.0; n * 3], client)
 }

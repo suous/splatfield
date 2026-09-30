@@ -3,7 +3,9 @@
 // and nothing is reachable from the tombstone main.
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
+mod picker;
 mod scene;
+mod settings;
 mod ui;
 mod worker;
 
@@ -57,6 +59,15 @@ struct App {
     // paint_dirty instead.
     rendered: Option<(glam::UVec2, Arc<render::Splats>, camera::Camera)>,
     paint_dirty: bool,
+    /// The hidden `<input type=file>` bridge (picker.rs) and the landing
+    /// card's URL field — the landing state's only persistent pieces.
+    picker: picker::Picker,
+    landing_url: String,
+    /// The last-saved settings pair (settings.rs): seeded from localStorage
+    /// once at startup and updated only when the settings panel actually
+    /// changes a value — the save-on-change compares against this mirror,
+    /// so no frame ever reads storage.
+    saved_settings: settings::Settings,
 }
 
 fn wgpu_config() -> eframe::egui_wgpu::WgpuConfiguration {
@@ -118,6 +129,22 @@ impl App {
         // Take the texture id BEFORE the backbuffer moves into the slot.
         let tex_id = backbuffer.id;
         let seg = SegUi::default();
+        // The two sidebar settings persist across refreshes (settings.rs):
+        // the saved pair loads once here — before the first frame — on wasm
+        // only (the host tombstone has no storage and never draws). It both
+        // seeds the seg state and the last-saved mirror, so the panel's
+        // save-on-change never re-reads storage per frame.
+        #[cfg(target_arch = "wasm32")]
+        let saved_settings = settings::load();
+        #[cfg(target_arch = "wasm32")]
+        let seg = {
+            let mut seg = seg;
+            seg.iters = saved_settings.iters;
+            seg.heatmap = saved_settings.heatmap;
+            seg
+        };
+        #[cfg(not(target_arch = "wasm32"))]
+        let saved_settings = settings::Settings::default();
         // The pipeline worker's replies feed the seg inbox and repaint —
         // without the repaint request the pill would never draw progress.
         // (The spawn itself is lazy; installing here starts it.)
@@ -148,6 +175,9 @@ impl App {
             undo: Vec::new(),
             rendered: None,
             paint_dirty: false,
+            picker: picker::Picker::new(cc.egui_ctx.clone()),
+            landing_url: String::new(),
+            saved_settings,
         }
     }
 }

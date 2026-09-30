@@ -27,7 +27,7 @@ pub mod prompted;
 pub(crate) mod views;
 
 use crate::camera::Camera;
-use crate::layout::ELEM_WG;
+use crate::layout::{ELEM_WG, MASK_BITS};
 use crate::render::{Finalize, RenderScratch, Splats, TileIsects};
 use cubecl::calculate_cube_count_elemwise;
 use cubecl::prelude::*;
@@ -132,13 +132,13 @@ impl Mask {
             (size.x * size.y) as usize,
             "mask bytes must be one per pixel"
         );
-        let words_per_row = size.x.div_ceil(32);
+        let words_per_row = size.x.div_ceil(MASK_BITS);
         let mut bits = vec![0u32; (words_per_row * size.y) as usize];
         let mut fg_pixels = 0usize;
         for (p, &b) in bytes.iter().enumerate() {
             if b != 0 {
                 let (y, x) = ((p as u32) / size.x, (p as u32) % size.x);
-                bits[(y * words_per_row + x / 32) as usize] |= 1 << (x % 32);
+                bits[(y * words_per_row + x / MASK_BITS) as usize] |= 1 << (x % MASK_BITS);
                 fg_pixels += 1;
             }
         }

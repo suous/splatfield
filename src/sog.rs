@@ -1,9 +1,33 @@
 use crate::layout::{ATTR_PLANES, PLANE_OPACITY, PLANE_QW, PLANE_SX, PLANE_X};
+use crate::ply::MAX_PLANE_BYTES;
 use crate::render::CpuSplats;
 use anyhow::{Context, Result};
 use serde::Deserialize;
-use std::io::{Read, Seek};
+use std::io::{Cursor, Read, Seek};
 use zip::ZipArchive;
+
+/// Cap on one WebP entry's decompressed bytes: a crafted deflate stream is
+/// a bomb vector — the archive itself is size-preflighted, but its
+/// entries' decompressed length is not (the central-directory size is a
+/// lie the reader never consults). The worst legit entry is the least
+/// compressible: a budget-max no-shN scene's means sheet is ~77 MB decoded,
+/// and lossless noise's bitstream runs ≈ decoded size, so this matches the
+/// sheet cap and keeps ~3× headroom.
+const MAX_ENTRY_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Cap on the decompressed `meta.json` stream: the codebooks are
+/// `Vec<f32>` parsed straight off it, so an uncapped read grows a Vec to
+/// whatever the deflate stream emits — the same bomb vector as the sheet
+/// entries. Legit meta.json is ~20 KB (codebooks are 256 floats), so this
+/// is ~50× headroom; a value past the cap hits EOF mid-parse and errors.
+const MAX_META_BYTES: u64 = 1024 * 1024;
+
+/// Cap on one sheet's decoded RGBA buffer: the bitstream declares its own
+/// width×height, and a 16383² lossless sheet decodes to 1 GB from a few KB
+/// of compressed bytes. A means sheet is ≥ one pixel per splat, so the
+/// worst legit case — a no-shN scene at the 1 GiB plane budget, ~19.2M
+/// splats — needs ~77 MB: ~3× headroom.
+const MAX_SHEET_BYTES: u64 = 256 * 1024 * 1024;
 
 #[derive(Deserialize)]
 struct Quantized {
@@ -46,24 +70,43 @@ fn decode_rgba<R: Read + Seek>(
     name: &str,
     min_pixels: usize,
 ) -> Result<image::RgbaImage> {
-    let mut file = zip
+    use image::ImageDecoder;
+
+    let file = zip
         .by_name(name)
         .with_context(|| format!("missing {name}"))?;
-    // Zip entries aren't Seek but the WebP decoder needs it — buffer the
-    // entry. No capacity hint: the central-directory size is attacker-
-    // controlled in a crafted archive, and reserving it unchecked aborts
-    // the wasm32 heap on a lie; read_to_end grows to the real bytes.
+    // Both vectors behind this read grow from attacker-chosen lengths, so
+    // each is capped before it exists: `take` bounds the decompressed read
+    // (read_to_end would grow to whatever the stream emits), and the header
+    // dims are budgeted before the RGBA buffer is sized.
     let mut buf = Vec::new();
-    file.read_to_end(&mut buf)?;
+    file.take(MAX_ENTRY_BYTES + 1).read_to_end(&mut buf)?;
+    anyhow::ensure!(
+        buf.len() as u64 <= MAX_ENTRY_BYTES,
+        "{name} exceeds the {MAX_ENTRY_BYTES}-byte entry cap"
+    );
+    // The bitstream declares its own width×height — a 16383² lossless
+    // sheet decodes to 1 GB from a few KB — so budget the header dims
+    // before the decode allocates. The probe parses the container first:
+    // an extended VP8X file scans its chunk list here (bounded by the
+    // capped entry above, and image-webp's chunk map dedupes by kind, so
+    // the scan costs time, not allocation). ×4 bounds either pixel format
+    // (lossy no-alpha sheets decode RGB, 3 B/px).
+    let (w, h) = image::codecs::webp::WebPDecoder::new(Cursor::new(&buf))
+        .with_context(|| format!("decode {name}"))?
+        .dimensions();
+    let pixels = w as u64 * h as u64;
+    anyhow::ensure!(
+        pixels * 4 <= MAX_SHEET_BYTES,
+        "{name}: {w}x{h} exceeds the {MAX_SHEET_BYTES}-byte sheet budget"
+    );
+    if pixels < min_pixels as u64 {
+        anyhow::bail!("{name}: {w}x{h} < {min_pixels} pixels");
+    }
     let img = image::load_from_memory_with_format(&buf, image::ImageFormat::WebP)
         .with_context(|| format!("decode {name}"))?;
 
-    let rgba = img.into_rgba8();
-    let (w, h) = (rgba.width() as usize, rgba.height() as usize);
-    if w * h < min_pixels {
-        anyhow::bail!("{name}: {w}x{h} < {min_pixels} pixels");
-    }
-    Ok(rgba)
+    Ok(img.into_rgba8())
 }
 
 fn inv_log(v: f32) -> f32 {
@@ -99,14 +142,38 @@ fn rgba_pixels(px: &[u8]) -> &[[u8; 4]] {
 
 pub fn parse_sog(reader: impl Read + Seek) -> Result<CpuSplats> {
     let mut zip = ZipArchive::new(reader).context("not a SOG archive")?;
-    let meta: Meta =
-        serde_json::from_reader(zip.by_name("meta.json").context("missing meta.json")?)
-            .context("invalid meta.json")?;
+    let meta: Meta = {
+        let mut meta_file = zip
+            .by_name("meta.json")
+            .context("missing meta.json")?
+            .take(MAX_META_BYTES + 1);
+        serde_json::from_reader(&mut meta_file).context("invalid meta.json")?
+    };
 
     let n = meta.count;
     if n == 0 {
         anyhow::bail!("SOG contains no splats");
     }
+    let sh_per_ch = match meta.sh_n.as_ref() {
+        None => 1,
+        Some(s) => match s.bands {
+            1 => 4,
+            2 => 9,
+            3 => 16,
+            b => anyhow::bail!("shN.bands {b} outside 1..=3"),
+        },
+    };
+    // Guard absurd metadata before allocating the output planes — the same
+    // budget as parse_ply's. `count` comes straight from meta.json, and on
+    // wasm32 an unchecked vec![0f32; …] of that size is an alloc-failure
+    // abort before the first sheet is even read (an overflowing usize
+    // product wraps into a tiny buffer and an index abort instead).
+    anyhow::ensure!(
+        (n as u64)
+            .checked_mul((ATTR_PLANES + sh_per_ch * 3) as u64 * 4)
+            .is_some_and(|bytes| bytes <= MAX_PLANE_BYTES),
+        "SOG splat count {n} exceeds the {MAX_PLANE_BYTES}-byte output-plane budget"
+    );
     let mut attributes = vec![0f32; n * ATTR_PLANES];
 
     let lo = decode_rgba(&mut zip, &meta.means.files[0], n)?;
@@ -146,15 +213,6 @@ pub fn parse_sog(reader: impl Read + Seek) -> Result<CpuSplats> {
         }
     }
 
-    let sh_per_ch = match meta.sh_n.as_ref() {
-        None => 1,
-        Some(s) => match s.bands {
-            1 => 4,
-            2 => 9,
-            3 => 16,
-            b => anyhow::bail!("shN.bands {b} outside 1..=3"),
-        },
-    };
     let c0 = decode_rgba(&mut zip, &meta.sh0.files[0], n)?;
     let mut sh_coeffs = vec![0f32; n * sh_per_ch * 3];
     let sh0_cb = codebook(&meta.sh0.codebook, "sh0")?;
@@ -218,6 +276,7 @@ fn palette_offset(label: usize, cw: usize, sh_coeffs_per_ch: usize) -> (usize, u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::fetch::build_zip;
     use std::io::{Cursor, Write};
 
     /// Lossless-encode an RGBA8 buffer as WebP — the parser's strict input
@@ -272,31 +331,158 @@ mod tests {
         }
 
         // Quats carry tag 255 (z omitted) → the quaternion [0,0,0,1].
-        let quats = solid([0, 0, 0, 255], n, 1);
+        let quats_img = solid([0, 0, 0, 255], n, 1);
         let label_img = image::RgbaImage::from_fn(n, 1, |x, _| image::Rgba(labels(x)));
-        let mut zw = zip::ZipWriter::new(Cursor::new(Vec::new()));
-        fn entry(zw: &mut zip::ZipWriter<Cursor<Vec<u8>>>, name: &str, bytes: &[u8]) {
-            zw.start_file(name, zip::write::SimpleFileOptions::default())
-                .unwrap();
-            zw.write_all(bytes).unwrap();
-        }
-        entry(&mut zw, "meta.json", meta.to_string().as_bytes());
-        entry(&mut zw, "means_lo.webp", &webp_bytes(&solid([0; 4], n, 1)));
-        entry(&mut zw, "means_hi.webp", &webp_bytes(&solid([0; 4], n, 1)));
-        entry(&mut zw, "scales.webp", &webp_bytes(&solid([0; 4], n, 1)));
-        entry(&mut zw, "quats.webp", &webp_bytes(&quats));
-        entry(&mut zw, "sh0.webp", &webp_bytes(&solid([0; 4], n, 1)));
-        if sh_bands.is_some() {
+        let sheet_img = sh_bands.map(|_| {
             // Palette row p holds pixel bytes (p*10 + j*3 + k) for entry
             // j's channel k — distinct per (palette, entry, channel).
-            let sheet = image::RgbaImage::from_fn(sheet_w, sheet_h, |j, p| {
+            image::RgbaImage::from_fn(sheet_w, sheet_h, |j, p| {
                 let b = |k: u8| p as u8 * 10 + j as u8 * 3 + k;
                 image::Rgba([b(0), b(1), b(2), 255])
-            });
-            entry(&mut zw, "shN_cent.webp", &webp_bytes(&sheet));
-            entry(&mut zw, "shN_lab.webp", &webp_bytes(&label_img));
+            })
+        });
+        let meta = meta.to_string();
+        let blank = webp_bytes(&solid([0; 4], n, 1));
+        let quats = webp_bytes(&quats_img);
+        let label = webp_bytes(&label_img);
+        let sheet = sheet_img.as_ref().map(webp_bytes);
+        let mut files: Vec<(&str, &[u8])> = vec![
+            ("meta.json", meta.as_bytes()),
+            ("means_lo.webp", &blank),
+            ("means_hi.webp", &blank),
+            ("scales.webp", &blank),
+            ("quats.webp", &quats),
+            ("sh0.webp", &blank),
+        ];
+        if let Some(sheet) = &sheet {
+            files.push(("shN_cent.webp", sheet));
+            files.push(("shN_lab.webp", &label));
         }
-        zw.finish().unwrap().into_inner()
+        build_zip(&files)
+    }
+
+    /// A `meta.json`-only archive (plus optional raw entries) — enough to
+    /// drive every check that runs before the first sheet read.
+    fn meta_only_sog(count: u64, entries: &[(&str, Vec<u8>)]) -> Vec<u8> {
+        let meta = serde_json::json!({
+            "count": count,
+            "means": {
+                "mins": [0.0, 0.0, 0.0],
+                "maxs": [0.0, 0.0, 0.0],
+                "files": ["means_lo.webp", "means_hi.webp"],
+            },
+            "scales": {"codebook": [], "files": ["scales.webp"]},
+            "quats": {"files": ["quats.webp"]},
+            "sh0": {"codebook": [], "files": ["sh0.webp"]},
+        });
+        let meta = meta.to_string();
+        let mut files: Vec<(&str, &[u8])> = vec![("meta.json", meta.as_bytes())];
+        files.extend(
+            entries
+                .iter()
+                .map(|(name, bytes)| (*name, bytes.as_slice())),
+        );
+        build_zip(&files)
+    }
+
+    #[test]
+    fn test_sog_over_budget_count_bails_before_any_read() {
+        // 2e9 splats × 56 B (no shN) ≈ 112 GB of planes — the budget must
+        // fire before the first sheet is read, on an archive with no
+        // sheets at all.
+        let bytes = meta_only_sog(2_000_000_000, &[]);
+        let err = parse_sog(Cursor::new(bytes)).unwrap_err().to_string();
+        assert!(err.contains("budget"), "{err}");
+
+        // A count whose product overflows u64 (host usize) must take the
+        // checked_mul `None` arm and bail, not wrap into a small
+        // allocation.
+        let bytes = meta_only_sog(u64::MAX / 2, &[]);
+        let err = parse_sog(Cursor::new(bytes)).unwrap_err().to_string();
+        assert!(err.contains("budget"), "{err}");
+    }
+
+    #[test]
+    fn test_sog_entry_cap_bombs_bail() {
+        // A deflate bomb: ~260 KB compressed in, MAX_ENTRY_BYTES + 64 KiB
+        // of zeros out — the take cap bounds the read instead of growing
+        // to the stream's real length.
+        let bomb = (MAX_ENTRY_BYTES as usize / 65536 + 2) * 65536;
+        let chunk = vec![0u8; 65536];
+        let mut zw = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        zw.start_file("meta.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        zw.write_all(
+            serde_json::json!({
+                "count": 1,
+                "means": {
+                    "mins": [0.0, 0.0, 0.0],
+                    "maxs": [0.0, 0.0, 0.0],
+                    "files": ["means_lo.webp", "means_hi.webp"],
+                },
+                "scales": {"codebook": [], "files": ["scales.webp"]},
+                "quats": {"files": ["quats.webp"]},
+                "sh0": {"codebook": [], "files": ["sh0.webp"]},
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        zw.start_file("means_lo.webp", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        for _ in 0..(bomb / 65536) {
+            zw.write_all(&chunk).unwrap();
+        }
+        let bytes = zw.finish().unwrap().into_inner();
+        let err = parse_sog(Cursor::new(bytes)).unwrap_err().to_string();
+        assert!(err.contains("entry cap"), "{err}");
+    }
+
+    #[test]
+    fn test_sog_sheet_budget_bails_not_allocates() {
+        // A lossless WebP declares its own dims: a 16383² sheet is a ~1 GB
+        // decode from a 20-byte file — the header is budgeted before the
+        // pixel buffer exists. (16383, not 16384: image-webp clamps VP8L
+        // dims to 14 bits post-increment, so the spec max wraps to 0.)
+        let payload: [u8; 9] = [
+            0x2f, // lossless signature
+            0xfe, 0xbf, 0xff, 0x0f, // dims: (w-1) | (h-1) << 14, w = h = 16383
+            0, 0, 0, 0,
+        ];
+        let mut webp = b"RIFF".to_vec();
+        webp.extend_from_slice(&((4 + 8 + payload.len()) as u32).to_le_bytes());
+        webp.extend_from_slice(b"WEBPVP8L");
+        webp.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        webp.extend_from_slice(&payload);
+        let bytes = meta_only_sog(1, &[("means_lo.webp", webp)]);
+        let err = parse_sog(Cursor::new(bytes)).unwrap_err().to_string();
+        assert!(err.contains("sheet budget"), "{err}");
+    }
+
+    #[test]
+    fn test_sog_meta_cap_bombs_bail() {
+        // A numeric codebook padded past the meta cap (a string element
+        // would type-error at the first byte and never reach the cap): the
+        // parse must hit the capped EOF as an error, not grow the Vec to
+        // the stream's real length. Without the take the parse SUCCEEDS
+        // and the failure moves to codebook()'s 256-float check, so the
+        // assert pins the cap, not the codebook length.
+        let codebook = vec![0.0f64; 600_000];
+        let meta = serde_json::json!({
+            "count": 1,
+            "means": {
+                "mins": [0.0, 0.0, 0.0],
+                "maxs": [0.0, 0.0, 0.0],
+                "files": ["means_lo.webp", "means_hi.webp"],
+            },
+            "scales": {"codebook": codebook, "files": ["scales.webp"]},
+            "quats": {"files": ["quats.webp"]},
+            "sh0": {"codebook": [], "files": ["sh0.webp"]},
+        });
+        let meta = meta.to_string();
+        let bytes = build_zip(&[("meta.json", meta.as_bytes())]);
+        let err = parse_sog(Cursor::new(bytes)).unwrap_err().to_string();
+        assert!(err.contains("invalid meta.json"), "{err}");
     }
 
     #[test]

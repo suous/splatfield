@@ -99,7 +99,7 @@ pub(crate) fn candidates(
     localization: &ObjectLocalization,
     count: usize,
 ) -> Vec<crate::camera::Camera> {
-    let golden = (5.0f32.sqrt() - 1.0) / 2.0;
+    let golden = core::f32::consts::GOLDEN_RATIO - 1.0;
     // A degenerate localization (one foreground splat: r_obj = 0) would put
     // every camera inside the object and NaN the look-at quaternion.
     let radius = localization.radius.max(1e-3);

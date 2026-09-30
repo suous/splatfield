@@ -54,10 +54,6 @@ pub struct ModelStore {
 }
 
 impl ModelStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
     /// Install one release file. Keys outside [`REQUIRED_FILES`] are
     /// rejected: the store models exactly the pinned release, nothing else —
     /// a stray key would silently pass `is_complete` later while never
@@ -86,6 +82,17 @@ impl ModelStore {
     pub fn is_complete(&self) -> bool {
         self.missing().is_empty()
     }
+}
+
+/// The graph-input count both backends' loads ensure before positional
+/// dtype indexing — a short graph must error, not index blind (a wasm
+/// abort). `what` names the graph; `>=` keeps appended-input exports loadable.
+pub(crate) fn ensure_graph_inputs(declared: usize, want: usize, what: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        declared >= want,
+        "{what} graph declares {declared} inputs, expected at least {want}"
+    );
+    Ok(())
 }
 
 /// Index of the greatest element; ties go to the last maximum, NaN never
@@ -162,6 +169,22 @@ pub(crate) fn input_dtypes(session: &Session) -> Result<Vec<TE>> {
         .iter()
         .map(|i| input_ty(i.dtype()))
         .collect()
+}
+
+/// The host run's output-count ensure — positional indexing must not go in
+/// blind; the wasm arm's twin is `ortweb::fixed_outputs`.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn expect_outputs(
+    outputs: &ort::session::SessionOutputs<'_>,
+    want: usize,
+    what: &str,
+) -> Result<()> {
+    let got = outputs.len();
+    anyhow::ensure!(
+        got == want,
+        "{what} returned {got} outputs, expected {want}"
+    );
+    Ok(())
 }
 
 /// The encoders' shared input: squash-resize RGB to the graph's fixed net
@@ -273,7 +296,7 @@ mod tests {
 
     #[test]
     fn missing_lists_required_files_in_order() {
-        let mut store = ModelStore::new();
+        let mut store = ModelStore::default();
         store
             .insert(REQUIRED_FILES[1], b"tokenizer".to_vec())
             .unwrap();
@@ -292,7 +315,7 @@ mod tests {
 
     #[test]
     fn insert_rejects_paths_outside_the_release() {
-        let mut store = ModelStore::new();
+        let mut store = ModelStore::default();
         assert!(store.insert("models/evil.onnx", b"x".to_vec()).is_err());
         assert!(store.insert("../../etc/passwd", b"x".to_vec()).is_err());
         assert_eq!(store.missing(), REQUIRED_FILES.to_vec());
@@ -300,7 +323,7 @@ mod tests {
 
     #[test]
     fn complete_store_has_no_missing_and_get_works() {
-        let mut store = ModelStore::new();
+        let mut store = ModelStore::default();
         for f in REQUIRED_FILES {
             store.insert(f, vec![0u8; 4]).unwrap();
         }

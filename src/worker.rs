@@ -188,10 +188,9 @@ impl App {
 
     /// True while the numbering-sensitive edits must wait: a run is active
     /// or a cut's async readback is still staging (the flag lives on
-    /// `Loaded`, next to the staged outcome it guards). The edit paths used
-    /// to check only `busy`; a cut landing under a concurrent delete / undo
-    /// / reset / save / box-select would fold master indices against a
-    /// numbering that changed mid-readback.
+    /// `Loaded`, next to the staged outcome it guards) — a cut landing
+    /// under a concurrent delete / undo / reset / save / box-select would
+    /// fold master indices against a numbering that changed mid-readback.
     pub(crate) fn locked(&self) -> bool {
         self.seg.busy || self.splats.lock().unwrap().cut_in_flight
     }
@@ -200,9 +199,29 @@ impl App {
     /// after the status lifetime and failures after a longer one — errors
     /// get more time to be read, not eternity.
     pub(crate) fn set_status(&mut self, msg: impl Into<String>, error: bool) {
-        self.seg.status = msg.into();
+        let msg = msg.into();
+        // The egui canvas is opaque to screen readers on web (eframe ships
+        // no accesskit tree for it), so the page's aria-live region is the
+        // only channel status reaches AT through — mirror every pill line
+        // into it.
+        #[cfg(target_arch = "wasm32")]
+        announce(&msg);
+        self.seg.status = msg;
         self.seg.status_error = error;
         self.seg.status_at = web_time::Instant::now();
+    }
+}
+
+/// Mirror a status line into the page's `#sr_status` live region (see
+/// `set_status`). Best-effort: a missing element is a stale index.html,
+/// not a reason to fail the status path.
+#[cfg(target_arch = "wasm32")]
+fn announce(msg: &str) {
+    if let Some(el) = web_sys::window()
+        .and_then(|w| w.document())
+        .and_then(|d| d.get_element_by_id("sr_status"))
+    {
+        el.set_text_content(Some(msg));
     }
 }
 
@@ -408,17 +427,14 @@ impl App {
 /// bug and fails the round loud.
 #[cfg(target_arch = "wasm32")]
 async fn oracle_round(request: pipeline::Request, size: UVec2) -> anyhow::Result<Vec<u8>> {
-    use wasm_bindgen::JsCast;
     use wasm_bindgen_futures::JsFuture;
 
     let promise = web::segment_ticket(request);
     let replied = JsFuture::from(promise)
         .await
         .map_err(|e| anyhow::anyhow!("segment request failed: {e:?}"))?;
-    let bytes = replied
-        .dyn_into::<js_sys::Uint8Array>()
-        .map_err(|_| anyhow::anyhow!("segment reply is not a Uint8Array"))?
-        .to_vec();
+    let bytes = pipeline::frame_bytes(replied)
+        .ok_or_else(|| anyhow::anyhow!("segment reply is not a Uint8Array"))?;
     let pixels = (size.x * size.y) as usize;
     match pipeline::decode_response(&bytes)? {
         Response::SegmentDone { mask, .. } => {
@@ -442,7 +458,7 @@ async fn oracle_round(request: pipeline::Request, size: UVec2) -> anyhow::Result
 #[cfg(target_arch = "wasm32")]
 mod web {
     use super::Response;
-    use splatfield::pipeline::{decode_response, encode};
+    use splatfield::pipeline::{decode_response, encode, frame_bytes};
     use std::cell::RefCell;
     use wasm_bindgen::closure::Closure;
     use wasm_bindgen::{JsCast, JsValue};
@@ -480,13 +496,10 @@ mod web {
     impl Handlers {
         fn new() -> Self {
             let on_message = Closure::<dyn FnMut(MessageEvent)>::new(|e: MessageEvent| {
-                let bytes = e
-                    .data()
-                    .dyn_into::<js_sys::Uint8Array>()
-                    .ok()
-                    .map(|a| a.to_vec());
+                let bytes = frame_bytes(e.data());
                 let Some(bytes) = bytes else {
                     console::error_1(&"[worker] reply is not a Uint8Array".into());
+                    fail_parked_ticket("reply is not a Uint8Array");
                     return;
                 };
                 match decode_response(&bytes) {
@@ -517,6 +530,7 @@ mod web {
                     }
                     Err(err) => {
                         console::error_1(&format!("[worker] undecodable reply: {err:#}").into());
+                        fail_parked_ticket("undecodable reply");
                     }
                 }
             });
@@ -588,6 +602,23 @@ mod web {
         });
     }
 
+    /// Resolve a parked ticket with a `SegmentFailed` frame — the answer a
+    /// reply that can never complete the ticket still owes the oracle: a
+    /// frame the page cannot decode (not a `Uint8Array`, garbage bytes) is
+    /// wire corruption, and parking the await forever latches `busy`
+    /// (worker_main's "every request is answered"). No ticket parked: a
+    /// no-op, like [`complete_segment_ticket`]. Returns whether a ticket
+    /// was answered.
+    fn fail_parked_ticket(reason: &str) -> bool {
+        match SEGMENT_RESOLVE.with_borrow_mut(|slot| slot.take()) {
+            Some(resolve) => {
+                resolve_failed(&resolve, reason);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Resolve a ticket with a `SegmentFailed` wire frame — the same frame
     /// a real worker failure travels as, so the awaiting oracle unwinds
     /// through its ordinary error path. An encode failure is loud —
@@ -617,10 +648,7 @@ mod web {
             return;
         }
         console::error_1(&format!("[worker] link dead: {reason}").into());
-        let parked = SEGMENT_RESOLVE.with_borrow_mut(|slot| slot.take());
-        if let Some(resolve) = parked {
-            resolve_failed(&resolve, reason);
-        } else {
+        if !fail_parked_ticket(reason) {
             SINK.with_borrow_mut(|sink| {
                 if let Some(sink) = sink.as_mut() {
                     sink(Response::ModelsFailed(reason.to_owned()));
