@@ -62,23 +62,50 @@ jobs:
 
       - run: trunk build --release --public-url "$BASE_PATH"
 
-      # The deployment contract: data fetches are same-origin, next to the
-      # app — the worker fetches models.zip relatively and the help panel
-      # fetches the demo scene relatively, so both must land in dist/. The
-      # demo scene cannot be fetched from the release URL client-side: the
-      # github.com download redirect chain sends no CORS headers. No hash
-      # pin for the bear — the content-hashed name is the identity, and a
-      # bad download just fails the demo load in the status pill.
-      - name: Fetch the pinned models zip and demo scene
-        run: |
-          curl -fsSL --retry 3 -o dist/models.zip "$MODELS_URL"
-          echo "$MODELS_SHA256  dist/models.zip" | sha256sum --check -
-          test "$(stat -c%s dist/models.zip)" = "$MODELS_BYTES"
-          curl -fsSL --retry 3 -o dist/bear.3d71a266_sh1.sog "$DEMO_SCENE_URL"
+      - name: Ship the models zip as parts + the demo scene
+        run: bash scripts/ship_models.sh dist
 
       - uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9 # v5.0.0
         with:
           path: dist
+
+      - run: trunk build --release --public-url "/"
+
+      - name: Ship the models zip as parts + the demo scene (mirror)
+        run: bash scripts/ship_models.sh dist
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: edgeone-dist
+          path: dist
+
+  deploy-edgeone:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Guard on the EdgeOne API token
+        id: guard
+        env:
+          EDGEONE_API_TOKEN: ${{ secrets.EDGEONE_API_TOKEN }}
+        run: |
+          if [ -z "$EDGEONE_API_TOKEN" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "EDGEONE_API_TOKEN not configured — skipping the EdgeOne mirror deploy"
+          fi
+      - if: steps.guard.outputs.skip != 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: edgeone-dist
+          path: dist
+      - if: steps.guard.outputs.skip != 'true'
+        name: Deploy the mirror to EdgeOne Makers
+        env:
+          EDGEONE_API_TOKEN: ${{ secrets.EDGEONE_API_TOKEN }}
+        run: |
+          # Version-pinned: the token rides this process's environment, so
+          # an arbitrary @latest npm install is a supply-chain surface.
+          npx -y edgeone@1.6.41 makers deploy dist -n splatfield -t "$EDGEONE_API_TOKEN" --json
 
   deploy:
     needs: build

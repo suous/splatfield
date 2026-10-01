@@ -63,11 +63,17 @@ const MAX_RESERVE_BYTES: u64 = 256 * 1024 * 1024;
 pub const ZIP_SHA256: &str = "259ed2a989fc368b839cb32c1b43c758fa1207e4849123e603f83baedb35f740";
 
 /// The release zip's byte length — the bytes are sha-pinned
-/// ([`ZIP_SHA256`]), so the length is a release constant too. Display only
-/// (the status pill's MB figures); a new release moves it together with the
-/// pin. Never load-bearing for the install path.
+/// ([`ZIP_SHA256`]), so the length is a release constant too. Seeds the
+/// status pill's MB figures and the parts assembly's one honest reserve
+/// (a wrong value costs a realloc, never correctness — the sha256 pin
+/// gates the install); a new release moves it together with the pin.
 #[cfg(target_arch = "wasm32")]
 pub const ZIP_BYTES: u64 = 158_618_158;
+
+/// A release past the download ceiling would stream to the ceiling then
+/// die mid-install; pin the pair at compile time like the scene ceiling.
+#[cfg(target_arch = "wasm32")]
+const _: () = assert!(ZIP_BYTES <= MAX_DOWNLOAD_BYTES);
 
 /// SHA-256 of every release file, keyed by its release-relative path, in
 /// [`gsam::REQUIRED_FILES`] order — the two tables pair positionally (pinned
@@ -370,11 +376,13 @@ fn extract_into(
 }
 
 /// GET `url` from whichever scope declares fetch — a Window on the page, a
-/// WorkerGlobalScope inside the pipeline worker — and require an OK
-/// `Response`. `cache`, when given, rides the request's `RequestInit`;
-/// `None` leaves every field at its default (wire-identical to no init).
+/// WorkerGlobalScope inside the pipeline worker — and return the raw
+/// `Response`, whatever its status. The status-raw variant exists for the
+/// parts-manifest probe, which must distinguish a 404 (the dev server's
+/// single-file shape, no manifest shipped) from a real failure; everything
+/// else goes through [`fetch_ok`].
 #[cfg(target_arch = "wasm32")]
-pub(crate) async fn fetch_ok(
+pub(crate) async fn fetch_response(
     url: &str,
     cache: Option<web_sys::RequestCache>,
 ) -> Result<web_sys::Response> {
@@ -396,9 +404,21 @@ pub(crate) async fn fetch_ok(
     let response = wasm_bindgen_futures::JsFuture::from(fetch_promise)
         .await
         .map_err(|e| js_err(e).context(format!("fetching {url}")))?;
-    let response: web_sys::Response = response
+    response
         .dyn_into()
-        .map_err(|_| anyhow::anyhow!("fetch of {url} did not yield a Response"))?;
+        .map_err(|_| anyhow::anyhow!("fetch of {url} did not yield a Response"))
+}
+
+/// GET `url` from whichever scope declares fetch — a Window on the page, a
+/// WorkerGlobalScope inside the pipeline worker — and require an OK
+/// `Response`. `cache`, when given, rides the request's `RequestInit`;
+/// `None` leaves every field at its default (wire-identical to no init).
+#[cfg(target_arch = "wasm32")]
+pub(crate) async fn fetch_ok(
+    url: &str,
+    cache: Option<web_sys::RequestCache>,
+) -> Result<web_sys::Response> {
+    let response = fetch_response(url, cache).await?;
     ensure!(response.ok(), "fetch {url}: HTTP {}", response.status());
     Ok(response)
 }
@@ -473,8 +493,52 @@ pub(crate) async fn stream_body(
     }
 }
 
+/// The `models.zip` sibling naming convention shared with the split in
+/// `scripts/ship_models.sh` — the one recipe both deploy legs run: parts
+/// ship as `<base>.p0…p<N-1>` behind a `<base>.manifest.json` of
+/// `{"parts": N}`. A rename here must move the script with it — pinned by
+/// the url-contract test, the one anchor the compiler can't check across
+/// the shell script.
+#[cfg(any(target_arch = "wasm32", test))]
+fn zip_part_url(base: &str, i: u32) -> String {
+    format!("{base}.p{i}")
+}
+
+#[cfg(any(target_arch = "wasm32", test))]
+fn zip_manifest_url(base: &str) -> String {
+    format!("{base}.manifest.json")
+}
+
+/// Parse a parts manifest body: `{"parts": N}` with N in 1..=64. `None`
+/// means "not a manifest" — but a manifest that EXISTS yet parses to None
+/// is a broken parts deployment (under the 25 MB/file cap the single
+/// archive cannot coexist), so the caller fails loud instead of falling
+/// back to the single-file URL.
+#[cfg(any(target_arch = "wasm32", test))]
+fn parse_parts_manifest(body: &[u8]) -> Option<u32> {
+    let v: serde_json::Value = serde_json::from_slice(body).ok()?;
+    u32::try_from(v.get("parts")?.as_u64()?)
+        .ok()
+        .filter(|n| (1..=64).contains(n))
+}
+
+/// Streamed-manifest ceiling: the manifest is ~15 bytes, so anything past
+/// 64 KiB is a lie — cut before the JSON parse sees it.
+#[cfg(target_arch = "wasm32")]
+const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
+
 /// Stream the release zip off the network with fractional progress (0..1).
 /// Native builds never download: this is the browser branch.
+///
+/// Two deployment shapes, chosen by probing `models.zip.manifest.json`:
+/// absent (HTTP 404) — the single same-origin `models.zip` that
+/// `scripts/dev_server.py` serves; present — the zip ships as
+/// `models.zip.p0…` parts, because EdgeOne Makers caps deploy files at
+/// 25 MB and the 158 MB archive cannot exist there whole (Pages ships
+/// the same parts shape, so dev is the only single-file deployment).
+/// The parts join in memory and face the SAME whole-zip [`ZIP_SHA256`]
+/// pin as the single download — the parts change the transport, never
+/// the verification.
 #[cfg(target_arch = "wasm32")]
 pub async fn download_zip(on_progress: &mut dyn FnMut(f64)) -> Result<Vec<u8>> {
     // Revalidate before use: a same-origin cache entry from an earlier dev
@@ -482,8 +546,57 @@ pub async fn download_zip(on_progress: &mut dyn FnMut(f64)) -> Result<Vec<u8>> {
     // the pinned release and the sha256 pin rejects bytes the user cannot
     // fix except by clearing browser state. With `no-cache` a stale entry
     // costs one conditional request; a fresh file answers 200 unchanged.
-    let response = fetch_ok(ZIP_URL, Some(web_sys::RequestCache::NoCache)).await?;
-    stream_body(response, MAX_DOWNLOAD_BYTES, on_progress).await
+    let manifest = fetch_response(
+        &zip_manifest_url(ZIP_URL),
+        Some(web_sys::RequestCache::NoCache),
+    )
+    .await?;
+    if manifest.status() == 404 {
+        let response = fetch_ok(ZIP_URL, Some(web_sys::RequestCache::NoCache)).await?;
+        return stream_body(response, MAX_DOWNLOAD_BYTES, on_progress).await;
+    }
+    ensure!(
+        manifest.ok(),
+        "fetch {}: HTTP {}",
+        zip_manifest_url(ZIP_URL),
+        manifest.status()
+    );
+    let body = stream_body(manifest, MAX_MANIFEST_BYTES, &mut |_| {}).await?;
+    let parts = parse_parts_manifest(&body).with_context(|| {
+        format!(
+            "{} is not a parts manifest — a parts deployment ships {{\"parts\": N}} \
+         next to the {} parts",
+            zip_manifest_url(ZIP_URL),
+            zip_part_url(ZIP_URL, 0)
+        )
+    })?;
+    // The pinned length seeds the reserve: honest parts then never realloc
+    // (a 158 MB Vec doubling by 22 MB steps memcpy's ~300 MB inside the
+    // worker), and a wrong pin costs one realloc, never correctness — the
+    // sha256 pin still gates the install.
+    let mut zip = Vec::with_capacity(ZIP_BYTES as usize);
+    for i in 0..parts {
+        let response = fetch_ok(
+            &zip_part_url(ZIP_URL, i),
+            Some(web_sys::RequestCache::NoCache),
+        )
+        .await?;
+        let start = zip.len() as u64;
+        let chunk = stream_body(response, MAX_DOWNLOAD_BYTES, &mut |f| {
+            on_progress((i as f64 + f) / parts as f64)
+        })
+        .await?;
+        // Per-part streams are individually capped; this holds the SAME
+        // ceiling over the assembly, so 64 honest-looking parts can't
+        // sum past it.
+        ensure!(
+            start + chunk.len() as u64 <= MAX_DOWNLOAD_BYTES,
+            "assembled zip exceeds the {}-byte ceiling",
+            MAX_DOWNLOAD_BYTES
+        );
+        zip.extend_from_slice(&chunk);
+    }
+    Ok(zip)
 }
 
 /// The demo scene the landing card's Bear button loads — the SH1 bear on the
@@ -951,6 +1064,53 @@ mod tests {
             models_zip_url(),
             "https://github.com/suous/splatfield/releases/download/models-v1/splatfield-models.zip"
         );
+    }
+
+    /// The parts-manifest shape scripts/ship_models.sh writes: an integer
+    /// `parts` in 1..=64. Both extremes parse — 1 is a legal (if pointless)
+    /// parts deployment, 64 the documented sanity ceiling.
+    #[test]
+    fn parse_parts_manifest_accepts_the_deployed_shape() {
+        assert_eq!(parse_parts_manifest(br#"{"parts":7}"#), Some(7));
+        // The script's printf writes exactly this — space after the
+        // colon, trailing newline — so pin it byte-for-byte.
+        assert_eq!(parse_parts_manifest(b"{\"parts\": 7}\n"), Some(7));
+        assert_eq!(parse_parts_manifest(br#"{"parts":1}"#), Some(1));
+        assert_eq!(parse_parts_manifest(br#"{"parts": 64 }"#), Some(64));
+    }
+
+    /// Everything that is not an in-range integer part count is rejected —
+    /// the caller fails loud on these rather than falling back to the
+    /// single-file URL, because a manifest that exists means the
+    /// deployment INTENDED parts (the single archive cannot coexist under
+    /// the 25 MB/file cap).
+    #[test]
+    fn parse_parts_manifest_rejects_everything_else() {
+        assert_eq!(parse_parts_manifest(b""), None);
+        assert_eq!(parse_parts_manifest(b"not json"), None);
+        assert_eq!(parse_parts_manifest(b"[]"), None);
+        assert_eq!(parse_parts_manifest(br#"{"parts":0}"#), None);
+        assert_eq!(parse_parts_manifest(br#"{"parts":65}"#), None);
+        assert_eq!(parse_parts_manifest(br#"{"parts":-1}"#), None);
+        assert_eq!(parse_parts_manifest(br#"{"parts":7.5}"#), None);
+        assert_eq!(parse_parts_manifest(br#"{"parts":"7"}"#), None);
+        assert_eq!(parse_parts_manifest(br#"{"count":7}"#), None);
+        assert_eq!(parse_parts_manifest(br#"{"parts":7} trailing"#), None);
+        assert_eq!(
+            parse_parts_manifest(br#"{"parts":18446744073709551615}"#),
+            None
+        );
+    }
+
+    /// The URL convention the deploy workflow's split step must write and
+    /// the worker reads: `<base>.p{i}` parts behind `<base>.manifest.json`.
+    /// A rename on either side without the other 404s every part — this
+    /// pin is the one cross-artifact anchor the compiler can't check.
+    #[test]
+    fn zip_part_and_manifest_urls_follow_the_deploy_convention() {
+        assert_eq!(zip_part_url("models.zip", 0), "models.zip.p0");
+        assert_eq!(zip_part_url("models.zip", 6), "models.zip.p6");
+        assert_eq!(zip_manifest_url("models.zip"), "models.zip.manifest.json");
     }
 
     /// A legacy flat cache (family dirs directly under the models root —
