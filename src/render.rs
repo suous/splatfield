@@ -804,9 +804,14 @@ mod tests {
             ..Camera::default()
         };
         let mut scratch = RenderScratch::new(&client, 50, glam::uvec2(64, 64));
+        // Reset the bitmap between renders: the grid covers only the scene's
+        // tile bounds, so unwritten pixels hold recycled allocation content.
+        let reset = |s: &mut RenderScratch| s.bitmap.write(vec![0u32; 64 * 64]);
+        reset(&mut scratch);
         let b = splats
             .render_with(&mut scratch, &camera, glam::uvec2(64, 64))
             .read_vec::<u32>();
+        reset(&mut scratch);
         let c = splats
             .render_with(&mut scratch, &camera, glam::uvec2(64, 64))
             .read_vec::<u32>();
@@ -879,13 +884,21 @@ mod tests {
         );
         let camera = crate::camera::Camera::default();
         let mut scratch = RenderScratch::new(&client, n, glam::uvec2(64, 64));
+        // The dispatched grid covers only the scene's tile bounds; pixels
+        // outside it keep whatever the recycled allocation held. Reset the
+        // bitmap before every render so the bit-identical assertions compare
+        // only what the kernel writes.
+        let reset = |s: &mut RenderScratch| s.bitmap.write(vec![0u32; 64 * 64]);
+        reset(&mut scratch);
         let a = splats
             .render_with(&mut scratch, &camera, glam::uvec2(64, 64))
             .read_vec::<u32>();
+        reset(&mut scratch);
         let b = splats
             .render_with(&mut scratch, &camera, glam::uvec2(64, 64))
             .read_vec::<u32>();
         let mut fresh = RenderScratch::new(&client, n, glam::uvec2(64, 64));
+        fresh.bitmap.write(vec![0u32; 64 * 64]);
         let c = splats
             .render_with(&mut fresh, &camera, glam::uvec2(64, 64))
             .read_vec::<u32>();

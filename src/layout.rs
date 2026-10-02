@@ -38,7 +38,6 @@ impl From<glam::Vec3A> for Vec3FLaunch {
 }
 
 pub(crate) const TILE_WIDTH: u32 = 16;
-pub(crate) const TILE_SIZE: u32 = TILE_WIDTH * TILE_WIDTH;
 
 /// Mask word bit-width — the packed evidence mask's wire format (LSB-first
 /// within each u32 word): `seg/mod.rs` packs it on the host, the rasterize

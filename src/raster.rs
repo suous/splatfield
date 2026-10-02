@@ -78,12 +78,15 @@ fn quantize_u8(v: f32) -> u32 {
 /// The RGB mode blends per-pixel colors into `bitmap`; the ε modes
 /// (`rgb = false`) accumulate each splat's rendering weight w = α·T
 /// instead — total responsibility into `resp`, or in evidence mode split
-/// by the mask bit into foreground/background pseudo-counts. One kernel
-/// for all modes: same traversal, cutoffs, and saturation early-exit, so
-/// ε sees exactly what the RGB image shows. Comptime-dead buffer args are
-/// not always dropped from the launch signature; dead slots alias the
-/// `tile_ids` input (buffer arg 0) — see `render::Splats::finalize`, the
-/// single launch site.
+/// by the mask bit into foreground/background pseudo-counts.
+///
+/// Each pixel locates its tile's run with two lower-bound searches and
+/// walks it with direct global reads. An earlier version staged each
+/// 36-byte row through workgroup shared memory with a uniform-load-gated
+/// early exit; that variant silently produces an all-zero bitmap on
+/// WebKit's WebGPU (iOS), so the simpler direct-read form is load-bearing
+/// for WebKit compatibility — do not re-introduce the shared staging
+/// without an on-device test.
 #[cube(launch)]
 pub(crate) fn rasterize_kernel(
     img_size_x: u32,
@@ -114,33 +117,6 @@ pub(crate) fn rasterize_kernel(
     let range_start = lower_bound(tile_ids, num_isects, tile_id);
     let range_end = lower_bound(tile_ids, num_isects, tile_id + 1u32);
 
-    // Stage one workgroup-sized chunk of isects in shared memory: each 36-byte
-    // row is fetched from global memory once per tile instead of once per
-    // pixel, and every thread runs the chunk loop uniformly.
-    //
-    // The whole-tile early exit skips the remaining chunks once every pixel is
-    // saturated. The count read is `workgroup_uniform_load_atomic` because its
-    // barrier doubles as the staging fence, and only a uniform load keeps the
-    // `break` convergent: a plain load would put the next iteration's
-    // sync_cube in non-uniform control flow, which WGSL validators reject.
-    let mut stage = Shared::<[f32]>::new_slice(layout::TILE_SIZE as usize * PROJ_FLOATS);
-    let done_count = Shared::<[Atomic<u32>]>::new_slice(1usize);
-    if UNIT_POS == 0 {
-        done_count[0usize].store(0u32);
-    }
-    // The init store must be visible before finishers fetch_add: shared
-    // atomics are ordered across threads only by a barrier.
-    sync_cube();
-    if !in_bounds {
-        done_count[0usize].fetch_add(1u32);
-    }
-
-    let mut transmittance = 1.0f32;
-    let mut pix_r = 0.0;
-    let mut pix_g = 0.0;
-    let mut pix_b = 0.0;
-    let mut done = !in_bounds;
-
     let pixel_x = px as f32 + 0.5f32;
     let pixel_y = py as f32 + 0.5f32;
 
@@ -153,70 +129,61 @@ pub(crate) fn rasterize_kernel(
             & 1u32;
     }
 
-    let num_chunks = (range_end - range_start).div_ceil(layout::TILE_SIZE);
-    for c in 0..num_chunks {
-        let chunk = range_start + c * layout::TILE_SIZE;
-        let idx = chunk + UNIT_POS;
-        sync_cube();
-        if idx < range_end {
+    let mut transmittance = 1.0f32;
+    let mut pix_r = 0.0;
+    let mut pix_g = 0.0;
+    let mut pix_b = 0.0;
+    // The saturation cutoff is semantic, not an optimization: the ε modes
+    // accumulate w = α·T into per-splat counters, and post-saturation
+    // contributions — though each below one LSB — add up to real counter
+    // deltas at the ×scale rounding. Once T < 1/255 the pixel discards
+    // every remaining splat, exactly like the shared-staging variant did.
+    let mut done = false;
+
+    let num_isects_tile = range_end - range_start;
+    for j in 0..num_isects_tile {
+        if !done {
+            let idx = range_start + j;
             let src = (gaussian_ids_by_tile[idx as usize] * PROJ_FLOATS as u32) as usize;
-            let dst = UNIT_POS as usize * PROJ_FLOATS;
-            for k in 0..PROJ_FLOATS {
-                stage[dst + k] = projected[src + k];
-            }
-        }
-        // Whole tile converged: every remaining chunk would be a no-op. The
-        // uniform load's barrier doubles as the staging-write fence for the
-        // reads below, so this replaces the second sync_cube.
-        if workgroup_uniform_load_atomic(&done_count[0usize]) == layout::TILE_SIZE {
-            break;
-        }
+            let mean_x = projected[src];
+            let mean_y = projected[src + 1];
+            let conic = layout::Vec3F {
+                x: projected[src + 2],
+                y: projected[src + 3],
+                z: projected[src + 4],
+            };
+            let color_a = projected[src + 8];
 
-        let n_in_chunk = (range_end - chunk).min(layout::TILE_SIZE);
-        for j in 0..n_in_chunk {
-            if !done {
-                let base = j as usize * PROJ_FLOATS;
-                let mean_x = stage[base];
-                let mean_y = stage[base + 1];
-                let conic = layout::Vec3F {
-                    x: stage[base + 2],
-                    y: stage[base + 3],
-                    z: stage[base + 4],
-                };
-                let color_a = stage[base + 8];
+            let power = gaussian_power(conic, mean_x - pixel_x, mean_y - pixel_y);
+            let alpha = (color_a * (-power).exp()).min(0.999);
 
-                let power = gaussian_power(conic, mean_x - pixel_x, mean_y - pixel_y);
-                let alpha = (color_a * (-power).exp()).min(0.999);
-
-                if alpha >= 1.0f32 / u8::MAX as f32 {
-                    let vis = alpha * transmittance;
-                    if rgb {
-                        let color_r = stage[base + 5];
-                        let color_g = stage[base + 6];
-                        let color_b = stage[base + 7];
-                        pix_r += color_r * vis;
-                        pix_g += color_g * vis;
-                        pix_b += color_b * vis;
-                    } else {
-                        // w ≤ 1, so the fixed-point product always fits u32.
-                        let splat = gaussian_ids_by_tile[(chunk + j) as usize] as usize;
-                        let q = (vis * scale) as u32;
-                        if evidence {
-                            if inside == 1u32 {
-                                fg[splat].fetch_add(q);
-                            } else {
-                                bg[splat].fetch_add(q);
-                            }
+            if alpha >= 1.0f32 / u8::MAX as f32 {
+                let vis = alpha * transmittance;
+                if rgb {
+                    let color_r = projected[src + 5];
+                    let color_g = projected[src + 6];
+                    let color_b = projected[src + 7];
+                    pix_r += color_r * vis;
+                    pix_g += color_g * vis;
+                    pix_b += color_b * vis;
+                } else {
+                    // w ≤ 1, so the fixed-point product always fits u32.
+                    let splat = gaussian_ids_by_tile[idx as usize] as usize;
+                    let q = (vis * scale) as u32;
+                    if evidence {
+                        if inside == 1u32 {
+                            fg[splat].fetch_add(q);
                         } else {
-                            resp[splat].fetch_add(q);
+                            bg[splat].fetch_add(q);
                         }
+                    } else {
+                        resp[splat].fetch_add(q);
                     }
-                    transmittance *= 1.0f32 - alpha;
-                    // Remaining weight < 1 LSB of the final 8-bit channels.
-                    if transmittance < 1.0f32 / 255.0f32 {
-                        done = true;
-                        done_count[0usize].fetch_add(1u32);
-                    }
+                }
+                transmittance *= 1.0f32 - alpha;
+                // Remaining weight < 1 LSB of the final 8-bit channels.
+                if transmittance < 1.0f32 / 255.0f32 {
+                    done = true;
                 }
             }
         }
