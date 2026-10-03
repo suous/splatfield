@@ -58,8 +58,7 @@ fn parse(raw: &str) -> Settings {
 pub(crate) fn load() -> Settings {
     local_storage()
         .and_then(|s| s.get_item(KEY).ok().flatten())
-        .map(|raw| parse(&raw))
-        .unwrap_or_default()
+        .map_or_default(|raw| parse(&raw))
 }
 
 /// Best-effort write on change: errors ignored — private-mode browsers must

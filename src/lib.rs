@@ -61,8 +61,7 @@ pub const MAX_SCENE_BYTES: u64 = 512 * 1024 * 1024;
 pub fn preflight_scene(name: &str, size: Option<u64>) -> Result<(), String> {
     let ext = std::path::Path::new(name)
         .extension()
-        .map(|e| e.to_string_lossy().into_owned())
-        .unwrap_or_default();
+        .map_or_default(|e| e.to_string_lossy().into_owned());
     if !SCENE_EXTENSIONS.iter().any(|x| ext.eq_ignore_ascii_case(x)) {
         return Err(format!("{name} is not a .ply or .sog file"));
     }

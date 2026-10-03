@@ -458,8 +458,7 @@ impl eframe::App for App {
                 // oversized file fails with a message instead of a late OOM.
                 let name = std::path::Path::new(file.path())
                     .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_default();
+                    .map_or_default(|n| n.to_string_lossy().into_owned());
                 match splatfield::preflight_scene(&name, file.web_file().map(|f| f.size() as u64)) {
                     Ok(()) => {
                         self.set_status(format!("loading {name}…"), false);
