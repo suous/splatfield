@@ -86,11 +86,10 @@ fn build_entropy_table() -> Vec<f32> {
         .map(|i| ((i as f32 * LN_STEP) as f64).exp())
         .collect();
     let mut table = Vec::with_capacity(n * n);
-    for &a in &axis {
-        for &b in &axis {
-            table.push(beta_entropy(a, b) as f32);
-        }
-    }
+    table.extend(
+        axis.iter()
+            .flat_map(|&a| axis.iter().map(move |&b| beta_entropy(a, b) as f32)),
+    );
     table
 }
 

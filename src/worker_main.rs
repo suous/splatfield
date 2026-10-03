@@ -73,14 +73,7 @@ mod wasm {
     }
 
     fn acquire() -> bool {
-        BUSY.with(|b| {
-            if b.get() {
-                false
-            } else {
-                b.set(true);
-                true
-            }
-        })
+        BUSY.with(|b| !b.replace(true))
     }
 
     fn release() {
@@ -403,8 +396,7 @@ mod wasm {
             .await
             .map_err(|e| format!("ort module load failed: {e:?}"))?;
         let has_session = js_sys::Reflect::get(&module, &"InferenceSession".into())
-            .map(|v| !v.is_undefined())
-            .unwrap_or(false);
+            .is_ok_and(|v| !v.is_undefined());
         if !has_session {
             return Err("ort module has no InferenceSession export".into());
         }

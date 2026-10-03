@@ -144,7 +144,7 @@ impl Segmenter {
             None => {
                 let (min, max) = self.splats.bounds;
                 self.select_view_async(&ObjectLocalization {
-                    center: (min + max) * 0.5,
+                    center: min.midpoint(max),
                     radius: (max - min).max_element() * 0.5,
                 })
                 .await
@@ -348,7 +348,7 @@ mod tests {
             rgb,
             (1u8..=12)
                 .chain(17..=28)
-                .filter(|b| b % 4 != 0)
+                .filter(|b| !b.is_multiple_of(4))
                 .collect::<Vec<u8>>()
         );
     }
@@ -474,7 +474,7 @@ mod tests {
         let (pa, pb) = segmenter.posteriors();
         let means: Vec<f32> = pa.iter().zip(&pb).map(|(&a, &b)| a / (a + b)).collect();
         let fg_avg: f32 = means[..40].iter().sum::<f32>() / 40.0;
-        let bg_max = means[40..].iter().cloned().fold(0.0f32, f32::max);
+        let bg_max = means[40..].iter().copied().fold(0.0f32, f32::max);
         assert!(fg_avg > 0.7, "fg posterior average {fg_avg}");
         // No non-target splat may cross the decision boundary at all.
         assert!(bg_max < 0.5, "bg posterior max {bg_max}");

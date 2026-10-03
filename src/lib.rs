@@ -95,7 +95,7 @@ pub fn validate_scene_url(input: &str) -> Result<(String, String), String> {
     /// is no file name ("https://model.ply" is a bare host, not a file).
     fn tail_name(rest: &str) -> Option<&str> {
         let path = rest.split(['?', '#']).next().unwrap();
-        Some(path.split_once('/')?.1.rsplit('/').next().unwrap())
+        path.rsplit_once('/').map(|(_, tail)| tail)
     }
     let err = || "enter an http(s) URL that ends in .ply or .sog".to_owned();
     let url = input.trim();

@@ -45,10 +45,10 @@ pub(crate) const ITERS_RANGE: std::ops::RangeInclusive<usize> = 1..=20;
 /// IS the guard, and it falls back WHOLESALE (not per-field) so a tampered
 /// `iters` can't smuggle in a stale `heatmap` either.
 fn parse(raw: &str) -> Settings {
-    match serde_json::from_str::<Settings>(raw) {
-        Ok(s) if ITERS_RANGE.contains(&s.iters) => s,
-        _ => Settings::default(),
-    }
+    serde_json::from_str::<Settings>(raw)
+        .ok()
+        .filter(|s| ITERS_RANGE.contains(&s.iters))
+        .unwrap_or_default()
 }
 
 /// Best-effort read at startup: no window, denied storage, a failed read,

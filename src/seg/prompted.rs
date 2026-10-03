@@ -119,7 +119,7 @@ mod tests {
             .unwrap()
             .decode()
             .unwrap()
-            .to_rgb8();
+            .into_rgb8();
         let (w, h) = (image.width(), image.height());
         let rgb = image.as_raw();
         let total = (w * h) as usize;

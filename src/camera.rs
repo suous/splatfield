@@ -47,7 +47,7 @@ impl Camera {
     /// the whole model is in view. Returns the focus distance used.
     pub fn frame_bounds(&mut self, (min, max): (Vec3, Vec3)) -> f32 {
         let d = (max - min).max_element() * 2.0;
-        self.position = (min + max) * 0.5 - Vec3::Y * d;
+        self.position = min.midpoint(max) - Vec3::Y * d;
         self.rotation = Quat::from_rotation_x(-core::f32::consts::FRAC_PI_2);
         d
     }

@@ -781,7 +781,7 @@ pub(crate) fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
             w.add_directory(name.to_string(), zip::write::SimpleFileOptions::default())
                 .unwrap();
         } else {
-            w.start_file(name.to_string(), zip::write::SimpleFileOptions::default())
+            w.start_file(name, zip::write::SimpleFileOptions::default())
                 .unwrap();
             w.write_all(data).unwrap();
         }

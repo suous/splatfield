@@ -33,7 +33,7 @@ impl GpuTensor {
     pub fn empty(client: &Client, shape: impl Into<Shape>) -> GpuTensor {
         let shape = shape.into();
         // All buffers hold 4-byte elements (f32/u32), so f32 sizing covers both.
-        let handle = client.empty(shape.iter().product::<usize>() * size_of::<f32>());
+        let handle = client.empty(shape.num_elements() * size_of::<f32>());
         Self {
             client: client.clone(),
             handle,
@@ -59,8 +59,7 @@ impl GpuTensor {
     /// Blocking read: cubecl polls once and panics on wasm — test/host paths
     /// only; wasm callers need [`Self::read_vec_async`].
     pub fn read_vec<T: bytemuck::Pod>(&self) -> Vec<T> {
-        let bytes = self.client.read_one_unchecked(self.handle.clone());
-        bytemuck::cast_slice(&bytes).to_vec()
+        cubecl::future::block_on(self.read_vec_async())
     }
 
     /// Overwrite the buffer in place — stream-ordered, non-blocking, no kernel.
@@ -79,6 +78,6 @@ impl GpuTensor {
 
     pub fn as_buffer_arg(&self) -> BufferArg {
         // SAFETY: handle originates from a valid GPU allocation with matching dtype and shape.
-        unsafe { BufferArg::from_raw_parts(self.handle.clone(), self.shape.iter().product()) }
+        unsafe { BufferArg::from_raw_parts(self.handle.clone(), self.shape.num_elements()) }
     }
 }

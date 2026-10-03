@@ -597,7 +597,7 @@ mod web {
     pub(crate) fn complete_segment_ticket(bytes: &[u8]) {
         SEGMENT_RESOLVE.with_borrow_mut(|slot| {
             if let Some(resolve) = slot.take() {
-                let _ = resolve.call1(&js_sys::global(), &js_sys::Uint8Array::from(bytes));
+                let _ = resolve.call1(&JsValue::NULL, &js_sys::Uint8Array::from(bytes));
             }
         });
     }
@@ -626,10 +626,7 @@ mod web {
     fn resolve_failed(resolve: &js_sys::Function, reason: &str) {
         match encode(&Response::SegmentFailed(reason.to_owned())) {
             Ok(bytes) => {
-                let _ = resolve.call1(
-                    &js_sys::global(),
-                    &js_sys::Uint8Array::from(bytes.as_slice()),
-                );
+                let _ = resolve.call1(&JsValue::NULL, &js_sys::Uint8Array::from(bytes.as_slice()));
             }
             Err(e) => console::error_1(
                 &format!("[worker] cannot encode failure frame ({reason}): {e}").into(),

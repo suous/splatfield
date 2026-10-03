@@ -155,10 +155,8 @@ pub fn grounding_tokenizer() -> anyhow::Result<PathBuf> {
 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn input_ty(t: &ValueType) -> Result<TE> {
-    match t {
-        ValueType::Tensor { ty, .. } => Ok(*ty),
-        t => bail!("unsupported value type {t:?}"),
-    }
+    t.tensor_type()
+        .ok_or_else(|| anyhow::anyhow!("unsupported value type {t:?}"))
 }
 
 /// Element types the session's graph inputs declare, in input order.
@@ -208,7 +206,7 @@ pub(crate) fn encoder_input(
     let shape = [1, 3, net as i64, net as i64];
     if want == TE::Float16 {
         let buf = preprocess::normalize_chw::<f16>(&canvas, f16::from_f32);
-        return Ok(Tensor::from_array((shape.to_vec(), buf))?.into_dyn());
+        return Ok(Tensor::from_array((shape, buf))?.into_dyn());
     }
     make_input(&shape, preprocess::normalize_chw(&canvas, |x| x), want)
 }
@@ -217,16 +215,15 @@ pub(crate) fn encoder_input(
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn make_input(shape: &[i64], data: Vec<f32>, want: TE) -> Result<DynValue> {
     Ok(match want {
-        TE::Float32 => Tensor::from_array((shape.to_vec(), data))?.into_dyn(),
+        TE::Float32 => Tensor::from_array((shape, data))?.into_dyn(),
         TE::Float16 => {
             let buf: Vec<f16> = Vec::from_f32_slice(&data);
-            Tensor::from_array((shape.to_vec(), buf))?.into_dyn()
+            Tensor::from_array((shape, buf))?.into_dyn()
         }
-        TE::Int64 => Tensor::from_array((
-            shape.to_vec(),
-            data.iter().map(|&x| x as i64).collect::<Vec<_>>(),
-        ))?
-        .into_dyn(),
+        TE::Int64 => {
+            Tensor::from_array((shape, data.iter().map(|&x| x as i64).collect::<Vec<_>>()))?
+                .into_dyn()
+        }
         t => bail!("unsupported input dtype {t:?}"),
     })
 }

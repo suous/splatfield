@@ -498,10 +498,7 @@ mod tests {
 
     #[test]
     fn into_f32_widens_f16_and_rejects_i64() {
-        let bits: Vec<u16> = [1.0f32, -2.0, 0.5]
-            .iter()
-            .map(|&x| half::f16::from_f32(x).to_bits())
-            .collect();
+        let bits: Vec<u16> = Vec::<half::f16>::from_f32_slice(&[1.0, -2.0, 0.5]).reinterpret_into();
         let (dims, data) = OrtTensor::from_f16_bits(bits, &[3])
             .unwrap()
             .into_f32()
@@ -528,10 +525,8 @@ mod tests {
     /// while the dims stay full so mh/mw stay readable.
     #[test]
     fn into_f32_slice_widens_only_the_picked_range() {
-        let bits: Vec<u16> = [1.0f32, 2.0, 3.0, 4.0]
-            .iter()
-            .map(|&x| half::f16::from_f32(x).to_bits())
-            .collect();
+        let bits: Vec<u16> =
+            Vec::<half::f16>::from_f32_slice(&[1.0, 2.0, 3.0, 4.0]).reinterpret_into();
         let (dims, data) = OrtTensor::from_f16_bits(bits, &[1, 1, 2, 2])
             .unwrap()
             .into_f32_slice(|shape, len| {
@@ -547,10 +542,7 @@ mod tests {
     fn make_input_converts_f32_source_to_each_dtype() {
         let mk = |dt| make_input(&[1, 2], vec![1.0, 2.0], dt).unwrap();
         assert_eq!(mk(DType::F32), OrtTensor::F32(vec![1.0, 2.0], vec![1, 2]));
-        let bits: Vec<u16> = [1.0f32, 2.0]
-            .iter()
-            .map(|&x| half::f16::from_f32(x).to_bits())
-            .collect();
+        let bits: Vec<u16> = Vec::<half::f16>::from_f32_slice(&[1.0, 2.0]).reinterpret_into();
         assert_eq!(mk(DType::F16), OrtTensor::F16(bits, vec![1, 2]));
         assert_eq!(mk(DType::I64), OrtTensor::I64(vec![1, 2], vec![1, 2]));
     }

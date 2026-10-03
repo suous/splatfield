@@ -22,7 +22,7 @@ use crate::{
     grounding_tokenizer, input_dtypes, make_input, session,
 };
 #[cfg(not(target_arch = "wasm32"))]
-use ort::session::{Session, SessionInputValue, builder::GraphOptimizationLevel};
+use ort::session::{Session, builder::GraphOptimizationLevel};
 #[cfg(not(target_arch = "wasm32"))]
 use ort::value::DynValue;
 
@@ -242,13 +242,9 @@ impl Detector {
         let pixel_values = encoder_input(&self.session, rgb, (width, height), NET)?;
         let (logits_dims, logits, boxes) = {
             let [ids, types, attention, pixels] = &self.consts;
-            let outputs = self.session.run([
-                SessionInputValue::from(&pixel_values),
-                SessionInputValue::from(ids),
-                SessionInputValue::from(types),
-                SessionInputValue::from(attention),
-                SessionInputValue::from(pixels),
-            ])?;
+            let outputs =
+                self.session
+                    .run(ort::inputs![&pixel_values, ids, types, attention, pixels])?;
             // Mirror of the wasm arm's fixed_outputs::<2>.
             expect_outputs(&outputs, 2, "grounding-dino")?;
             let (logits_dims, logits) = extract_f32(&outputs[0])?;
@@ -284,8 +280,8 @@ impl Detector {
     pub async fn load(store: &ModelStore, prompt: &str, ep: ortweb::Ep) -> Result<Self> {
         // tokenizers errors are Box<dyn Error + Send + Sync>, not Sized:
         // from_boxed lifts them while keeping the source() chain anyhow! would flatten.
-        let json = std::str::from_utf8(store.get(DINO_TOKENIZER)?)?;
-        let tokenizer = Tokenizer::from_bytes(json).map_err(anyhow::Error::from_boxed)?;
+        let tokenizer =
+            Tokenizer::from_bytes(store.get(DINO_TOKENIZER)?).map_err(anyhow::Error::from_boxed)?;
         let (ids, content) = encode_prompt(&tokenizer, prompt)?;
         let session = ortweb::Session::load(store.get(DINO_ONNX)?, &[], ep).await?;
         let dtypes = session.input_dtypes()?;
