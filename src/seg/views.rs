@@ -56,22 +56,19 @@ fn localize_from(a: &[f32], b: &[f32], splats: &Splats) -> Option<ObjectLocaliza
     let n = splats.attributes.shape[0];
     let attr = &splats.positions;
 
-    let mut sums = [0f32; 4];
+    let mut sw = 0f32;
+    let mut sum = Vec3::ZERO;
     for i in 0..n {
         if a[i] > b[i] {
             let m = a[i] / (a[i] + b[i]);
-            let p = splat_position(attr, n, i);
-            sums[0] += m;
-            sums[1] += m * p.x;
-            sums[2] += m * p.y;
-            sums[3] += m * p.z;
+            sum += m * splat_position(attr, n, i);
+            sw += m;
         }
     }
-    let [sw, sx, sy, sz] = sums;
     if sw <= 0.0 {
         return None;
     }
-    let center = Vec3::new(sx / sw, sy / sw, sz / sw);
+    let center = sum / sw;
 
     let mut total = 0f32;
     for i in 0..n {

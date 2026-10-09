@@ -100,7 +100,7 @@ pub(crate) fn mask_bytes(
     .expect("logits hold mask_w*mask_h samples");
     let up = image::imageops::resize(&src, width, height, image::imageops::FilterType::Triangle)
         .into_raw();
-    up.iter().map(|&x| if x > 0.5 { 255 } else { 0 }).collect()
+    up.iter().map(|&x| (x > 0.5) as u8 * 255).collect()
 }
 
 /// The host backend: two ort CPU sessions, encoder + decoder per segment.

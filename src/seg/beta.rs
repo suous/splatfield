@@ -110,8 +110,8 @@ fn entropy_table() -> &'static [f32] {
 fn table_entropy(a: f32, b: f32, table: &[f32]) -> f32 {
     let xa = a.ln() / LN_STEP;
     let xb = b.ln() / LN_STEP;
-    let ia = xa.floor().max(0f32).min((GRID_PTS - 2) as f32);
-    let ib = xb.floor().max(0f32).min((GRID_PTS - 2) as f32);
+    let ia = xa.floor().clamp(0f32, (GRID_PTS - 2) as f32);
+    let ib = xb.floor().clamp(0f32, (GRID_PTS - 2) as f32);
     let ta = (xa - ia).clamp(0f32, 1f32);
     let tb = (xb - ib).clamp(0f32, 1f32);
     let row = (ia as u32 * GRID_PTS + ib as u32) as usize;

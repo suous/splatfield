@@ -246,7 +246,7 @@ pub fn parse_sog(reader: impl Read + Seek) -> Result<CpuSplats> {
         let palette_count = centroids.len() / 4 / sh_coeffs_per_ch;
 
         for (i, c) in rgba_pixels(labels.as_raw()).iter().enumerate().take(n) {
-            let label = c[0] as usize | (c[1] as usize) << 8;
+            let label = u16::from_le_bytes([c[0], c[1]]) as usize;
             if label >= palette_count {
                 anyhow::bail!("shN label {label} >= palette size {palette_count}");
             }
