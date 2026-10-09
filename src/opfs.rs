@@ -31,14 +31,17 @@ pub struct CacheManifest {
 }
 
 impl CacheManifest {
-    /// Bincode, not JSON: the pipeline wire codec is already bincode and no
-    /// serde_json dependency is wanted for one file.
+    /// Bincode, not JSON: the pipeline wire codec is already bincode, and a
+    /// second cache format would be a second thing to version.
     pub fn encode(&self) -> Result<Vec<u8>> {
-        bincode::serialize(self).context("encoding the cache manifest")
+        bincode::serde::encode_to_vec(self, crate::pipeline::config())
+            .context("encoding the cache manifest")
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        bincode::deserialize(bytes).context("decoding the cache manifest")
+        let (manifest, _) = bincode::serde::decode_from_slice(bytes, crate::pipeline::config())
+            .context("decoding the cache manifest")?;
+        Ok(manifest)
     }
 }
 

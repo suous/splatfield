@@ -307,8 +307,8 @@ pub(crate) async fn bitmap_to_rgb_async(bitmap: &GpuTensor, width: u32) -> Vec<u
 /// once is what stops the sync and async bodies from drifting.
 fn unpack_rgb(words: &[u32], stride: usize, height: usize, width: u32) -> Vec<u8> {
     let mut rgb = Vec::with_capacity(height * width as usize * 3);
-    for row in 0..height {
-        for px in bytemuck::cast_slice::<u32, [u8; 4]>(&words[row * stride..][..width as usize]) {
+    for row in words.chunks(stride).take(height) {
+        for px in bytemuck::cast_slice::<u32, [u8; 4]>(&row[..width as usize]) {
             rgb.extend_from_slice(&px[..3]);
         }
     }

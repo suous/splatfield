@@ -266,7 +266,10 @@ impl App {
         // dashes take a closed point path, so close it and dash. Dash 6 /
         // gap 5: the reference mock's rhythm.
         let mut path = Vec::new();
-        egui::epaint::tessellator::path::rounded_rectangle(&mut path, card, 16.0.into());
+        egui::epaint::tessellator::path::rounded_rectangle(
+            &mut path,
+            egui::epaint::RoundedRect::new(card, 16.0),
+        );
         path.push(path[0]);
         painter.extend(egui::Shape::dashed_line(&path, stroke, 6.0, 5.0));
 
@@ -278,7 +281,8 @@ impl App {
 
         // Upload badge: the circle + up-arrow as a non-interactive button —
         // egui's bundled NotoEmoji ships ⬆ compiled into the binary, so the
-        // glyph is identical on every platform.
+        // glyph is identical on every platform. The font rides egui's
+        // `monochrome_emoji_fonts` feature (see the manifest).
         inner.add(
             egui::Button::new(
                 egui::RichText::new("⬆")
@@ -542,7 +546,7 @@ impl eframe::App for App {
         if !self.seg.status.is_empty() {
             let error = self.seg.status_error;
             let status = &self.seg.status;
-            let response = egui::Area::new(egui::Id::new("seg-progress"))
+            let response = egui::Area::new(egui::Id::unique("seg-progress"))
                 .anchor(egui::Align2::CENTER_TOP, [0.0, 14.0])
                 .show(ui, |ui| {
                     egui::Frame::popup(ui.style())

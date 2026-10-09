@@ -20,8 +20,7 @@ use half::{f16, slice::HalfFloatSliceExt, vec::HalfFloatVecExt};
 #[cfg(not(target_arch = "wasm32"))]
 use ort::{
     session::Session,
-    tensor::TensorElementType as TE,
-    value::{DynValue, Tensor, ValueType},
+    value::{DynValue, Tensor, TensorElementType as TE, ValueType},
 };
 #[cfg(not(target_arch = "wasm32"))]
 use std::path::PathBuf;

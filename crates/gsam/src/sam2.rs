@@ -24,7 +24,7 @@ use crate::{
 #[cfg(not(target_arch = "wasm32"))]
 use ort::session::{Session, SessionInputValue, builder::GraphOptimizationLevel};
 #[cfg(not(target_arch = "wasm32"))]
-use ort::tensor::TensorElementType as TE;
+use ort::value::TensorElementType as TE;
 
 /// Fixed input size; the aspect ratio is squashed, and box prompts are
 /// pixel coords in this frame.

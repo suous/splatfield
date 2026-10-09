@@ -11,7 +11,7 @@ edition = "2024"
 # `storage, read` instead of read_write; without it the WGSL uniformity
 # analysis rejects barrier loops bounded by a loaded value — e.g. the
 # rasterizer's per-tile intersection ranges.
-cubecl = { version = "=0.11.0-pre.4", default-features = false, features = ["wgpu", "exclusive-memory-only"] }
+cubecl = { version = "=0.11.0", default-features = false, features = ["wgpu", "exclusive-memory-only"] }
 bytemuck = "1.25"
 anyhow = "1.0.104"
 serde = { version = "1", features = ["derive"] }
@@ -44,15 +44,15 @@ required-features = ["worker"]
 [dependencies]
 cubecl.workspace = true
 # Direct dep (also transitively pinned by cubecl) for the stream-policy API.
-cubecl-environment = "=0.11.0-pre.4"
+cubecl-environment = "=0.11.0"
 bytemuck.workspace = true
-glam = "0.33"
+glam = "0.34"
 # beta.rs's ln Γ — the entropy table's generator and the tests' f64 oracle.
 # Pure-Rust no_std: compiles unchanged on both targets.
 libm = "0.2"
 anyhow.workspace = true
 image = { version = "0.25", default-features = false, features = ["webp"] }
-zip = { version = "8", default-features = false, features = ["deflate-flate2"] }
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
 serde.workspace = true
 serde_json.workspace = true
 # Install-time integrity: the cache files' SHA-256 pins are verified during
@@ -62,8 +62,17 @@ sha2 = "0.10"
 # cache manifest. serde is already in the tree; bincode is the only new
 # package — the payloads are binary, and the same encode/decode runs on the
 # host tests and the wire.
-bincode = "1"
-eframe = { version = "0.36", default-features = false, features = ["default_fonts", "links", "wgpu", "x11", "wayland"] }
+bincode = { version = "2", features = ["serde"] }
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "links", "wgpu", "x11", "wayland"] }
+# egui 0.37 moved the bundled monochrome emoji font behind its own feature,
+# and eframe has no passthrough for it. The landing card draws its upload
+# badge (⬆) and its example row (🐻) from NotoEmoji, so without the
+# feature they render as missing glyphs. Same crate `eframe::egui`
+# re-exports -- the code keeps using the re-export; this dependency only
+# turns the feature on.
+egui = { version = "0.37", default-features = false, features = [
+    "monochrome_emoji_fonts",
+] }
 splat-sort = { path = "crates/sort" }
 # Both targets: the host build gets the ort session layer, the wasm build
 # the release data model (REQUIRED_FILES + ModelStore) the fetch/install and

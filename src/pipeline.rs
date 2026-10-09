@@ -64,17 +64,29 @@ pub enum Response {
 }
 
 pub fn encode(msg: &impl Serialize) -> Result<Vec<u8>> {
-    Ok(bincode::serialize(msg)?)
+    Ok(bincode::serde::encode_to_vec(msg, config())?)
 }
 
 pub fn decode_request(bytes: &[u8]) -> Result<Request> {
-    let req = bincode::deserialize(bytes)?;
+    let req = decode(bytes)?;
     ensure_valid(&req)?;
     Ok(req)
 }
 
 pub fn decode_response(bytes: &[u8]) -> Result<Response> {
-    Ok(bincode::deserialize(bytes)?)
+    decode(bytes)
+}
+
+/// The one wire configuration, named once for the whole app: little-endian,
+/// fixed-width integers, no size limit — the same bytes bincode 1 wrote, so
+/// the pinned wire layout below still holds.
+pub(crate) fn config() -> impl bincode::config::Config {
+    bincode::config::legacy()
+}
+
+fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+    let (value, _) = bincode::serde::decode_from_slice(bytes, config())?;
+    Ok(value)
 }
 
 /// Decode an inbound frame's payload to raw wire bytes (the shared

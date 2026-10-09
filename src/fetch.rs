@@ -330,7 +330,7 @@ fn extract_into(
     let mut installed: Vec<PathBuf> = Vec::new();
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
-        let Some(slot) = pin_slot(entry.name(), manifest) else {
+        let Some(slot) = pin_slot(&entry.name()?, manifest) else {
             continue;
         };
         let (rel, want) = manifest[slot];
@@ -728,7 +728,7 @@ pub fn install_zip_with(
         if entry.is_dir() {
             continue;
         }
-        let Some(slot) = pin_slot(entry.name(), pins) else {
+        let Some(slot) = pin_slot(&entry.name()?, pins) else {
             continue;
         };
         // `position` bounds `slot` below `pins.len()`.
