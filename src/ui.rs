@@ -65,6 +65,7 @@ fn help_body(ui: &mut egui::Ui) {
             ui.end_row();
         });
     ui.separator();
+    ui.hyperlink("https://github.com/suous/splatfield");
     ui.hyperlink("https://sony.github.io/B3-Seg-project");
 }
 

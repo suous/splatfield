@@ -7,28 +7,23 @@
 //! prompt's token count) with a 0.35 sigmoid confidence gate, normalized
 //! cxcywh → pixel xyxy. Best-confidence detection first.
 //!
-//! The session layer is the only backend split: host loads an `ort` CPU
-//! session from the release cache, wasm builds an `ortweb::Session` from the
-//! [`crate::ModelStore`] — the decode below is shared verbatim.
+//! The session layer is wasm-only: an `ortweb::Session` built from the
+//! [`crate::ModelStore`] — the decode below is platform-neutral and
+//! host-tested.
 
+#[cfg(any(target_arch = "wasm32", test))]
 use anyhow::Result;
+#[cfg(target_arch = "wasm32")]
 use tokenizers::Tokenizer;
 
 #[cfg(target_arch = "wasm32")]
 use crate::{ModelStore, REQUIRED_FILES, ensure_graph_inputs, ortweb, preprocess};
-#[cfg(not(target_arch = "wasm32"))]
-use crate::{
-    encoder_input, ensure_graph_inputs, expect_outputs, extract_f32, grounding_file,
-    grounding_tokenizer, input_dtypes, make_input, session,
-};
-#[cfg(not(target_arch = "wasm32"))]
-use ort::session::{Session, builder::GraphOptimizationLevel};
-#[cfg(not(target_arch = "wasm32"))]
-use ort::value::DynValue;
 
 /// Fixed input size; the aspect ratio is squashed.
+#[cfg(any(target_arch = "wasm32", test))]
 pub(crate) const NET: u32 = 800;
 /// Confidence gate on the sigmoid of the best token logit.
+#[cfg(any(target_arch = "wasm32", test))]
 pub(crate) const BOX_CONF: f32 = 0.35;
 
 /// Store keys this detector reads, indexed into [`REQUIRED_FILES`] so a
@@ -50,6 +45,7 @@ pub struct Detection {
 /// Non-content token = no class evidence: specials ([CLS]/[SEP]) and the
 /// label's terminating period. Derived from the encoded token *strings*, so
 /// vocab drift can't reclassify a special token as class-bearing.
+#[cfg(any(target_arch = "wasm32", test))]
 pub(crate) fn content_flags(tokens: &[String]) -> Vec<bool> {
     tokens
         .iter()
@@ -58,6 +54,7 @@ pub(crate) fn content_flags(tokens: &[String]) -> Vec<bool> {
 }
 
 /// Sigmoid — the logit → confidence map used by the gate.
+#[cfg(any(target_arch = "wasm32", test))]
 pub(crate) fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
@@ -73,6 +70,7 @@ pub(crate) fn sigmoid(x: f32) -> f32 {
 /// prompt token. Argmax
 /// is taken over content positions only: a stray high [CLS]/[SEP]/period
 /// logit must not veto (or fabricate) a detection.
+#[cfg(any(target_arch = "wasm32", test))]
 pub(crate) fn decode_detections(
     logits: &[f32],
     boxes_cxcywh: &[f32],
@@ -113,12 +111,12 @@ pub(crate) fn decode_detections(
     hits
 }
 
-/// The shared prompt-encode chain (both backends' `Detector::load`s call
-/// this after building their different-source tokenizer): trim +
-/// lowercase + the trailing "." — the terminating `.` must survive
-/// verbatim so [`content_flags`] can classify it as non-content; a
-/// re-spelled prompt silently shifts every token id the graph sees —
-/// then tokenize and derive the flags from the encoded token strings.
+/// The prompt-encode chain: trim + lowercase + the trailing "." — the
+/// terminating `.` must survive verbatim so [`content_flags`] can classify
+/// it as non-content; a re-spelled prompt silently shifts every token id
+/// the graph sees — then tokenize and derive the flags from the encoded
+/// token strings.
+#[cfg(target_arch = "wasm32")]
 fn encode_prompt(tokenizer: &Tokenizer, prompt: &str) -> Result<(Vec<u32>, Vec<bool>)> {
     let label = prompt.trim().to_ascii_lowercase();
     anyhow::ensure!(!label.is_empty(), "at least one text label is required");
@@ -141,6 +139,7 @@ fn encode_prompt(tokenizer: &Tokenizer, prompt: &str) -> Result<(Vec<u32>, Vec<b
 /// not the prompt's token count) and run [`decode_detections`]. The
 /// call sites do their own backend-specific tensor extraction first;
 /// this starts where the two converge on plain slices.
+#[cfg(any(target_arch = "wasm32", test))]
 fn decode_outputs(
     logits_dims: &[i64],
     logits: &[f32],
@@ -184,6 +183,7 @@ fn decode_outputs(
 /// The four prompt-constant fills in graph input order after pixel_values
 /// (ids as f32, type-0s, attention-1s, all-ones NET² mask) — shared by both
 /// cfg arms, so the platforms' consts cannot drift.
+#[cfg(any(target_arch = "wasm32", test))]
 fn prompt_fills(ids: &[u32]) -> [Vec<f32>; 4] {
     let ntok = ids.len();
     [
@@ -194,68 +194,7 @@ fn prompt_fills(ids: &[u32]) -> [Vec<f32>; 4] {
     ]
 }
 
-/// The host backend: one ort CPU session plus the prompt-constant tensors.
-#[cfg(not(target_arch = "wasm32"))]
-pub struct Detector {
-    session: Session,
-    /// Content-token flags (false for [CLS]/[SEP] and the label's
-    /// terminating period).
-    content: Vec<bool>,
-    /// The four prompt-constant inputs - token ids, type ids, attention and
-    /// pixel masks - in session input order, built once against the graph's
-    /// declared dtypes.
-    consts: [DynValue; 4],
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl Detector {
-    pub fn load(prompt: &str) -> Result<Self> {
-        // tokenizers errors are Box<dyn Error + Send + Sync>, not Sized:
-        // from_boxed lifts them while keeping the source() chain anyhow! would flatten.
-        let tokenizer =
-            Tokenizer::from_file(grounding_tokenizer()?).map_err(anyhow::Error::from_boxed)?;
-        let (ids, content) = encode_prompt(&tokenizer, prompt)?;
-        let session = session::build(&grounding_file()?, GraphOptimizationLevel::Level1)?;
-        let dtypes = input_dtypes(&session)?;
-        // Mirror of the wasm load's guard: dtypes[1..=4] are indexed below.
-        ensure_graph_inputs(dtypes.len(), 5, "grounding-dino")?;
-        let ntok = ids.len() as i64;
-        let [ids_t, types_t, attn_t, mask_t] = prompt_fills(&ids);
-        let consts = [
-            make_input(&[1, ntok], ids_t, dtypes[1])?,
-            make_input(&[1, ntok], types_t, dtypes[2])?,
-            make_input(&[1, ntok], attn_t, dtypes[3])?,
-            make_input(&[1, NET as i64, NET as i64], mask_t, dtypes[4])?,
-        ];
-        Ok(Self {
-            session,
-            content,
-            consts,
-        })
-    }
-
-    /// Detect the prompt's object; detections come back best-confidence
-    /// first, empty when nothing passed the gate. The wasm twin returns
-    /// the same `Vec<Detection>` (async there), so consumers need no cfg
-    /// split.
-    pub fn detect(&mut self, rgb: &[u8], width: u32, height: u32) -> Result<Vec<Detection>> {
-        let pixel_values = encoder_input(&self.session, rgb, (width, height), NET)?;
-        let (logits_dims, logits, boxes) = {
-            let [ids, types, attention, pixels] = &self.consts;
-            let outputs =
-                self.session
-                    .run(ort::inputs![&pixel_values, ids, types, attention, pixels])?;
-            // Mirror of the wasm arm's fixed_outputs::<2>.
-            expect_outputs(&outputs, 2, "grounding-dino")?;
-            let (logits_dims, logits) = extract_f32(&outputs[0])?;
-            let (_, boxes) = extract_f32(&outputs[1])?;
-            (logits_dims, logits, boxes)
-        };
-        decode_outputs(&logits_dims, &logits, &boxes, &self.content, width, height)
-    }
-}
-
-/// The wasm backend: same prompt tensors over an onnxruntime-web session.
+/// The wasm backend: prompt tensors over an onnxruntime-web session.
 #[cfg(target_arch = "wasm32")]
 pub struct Detector {
     session: ortweb::Session,
@@ -315,29 +254,9 @@ impl Detector {
     }
 }
 
-// Host-only: `grounding_tokenizer` (and the tokenizer it loads) exist on the
-// host build — wasm has no assets dir to point at.
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use crate::grounding_tokenizer;
-
-    /// The tokenizer behind [`Detector`]'s prompt encoding, with the same
-    /// loud-fail-on-missing-asset contract as the model smoke tests.
-    fn tokenizer() -> Option<Tokenizer> {
-        let p = grounding_tokenizer().ok()?;
-        if !p.exists() {
-            if std::env::var_os("SPLATFIELD_ALLOW_MISSING_ASSETS").is_none() {
-                panic!(
-                    "missing {} - these tests are the only tokenizer coverage; set SPLATFIELD_ALLOW_MISSING_ASSETS=1 to skip",
-                    p.display()
-                );
-            }
-            eprintln!("skipping: grounding-dino/tokenizer.json not cached");
-            return None;
-        }
-        Some(Tokenizer::from_file(&p).unwrap())
-    }
 
     /// The prompt-constant fills in graph input order: ids as f32, type ids
     /// 0, attention 1, all-ones NET² pixel mask — both backends' consts
@@ -350,65 +269,6 @@ mod tests {
         assert_eq!(attn_t, vec![1.0, 1.0]);
         assert_eq!(mask_t.len(), (NET * NET) as usize);
         assert!(mask_t.iter().all(|&x| x == 1.0));
-    }
-
-    /// Ids hand-verified against the bert-base-uncased vocab: person=2711,
-    /// teddy=11389, bear=4562.
-    #[test]
-    fn test_wordpiece_ids() {
-        let Some(t) = tokenizer() else {
-            eprintln!("skipping: grounding-dino/tokenizer.json not cached");
-            return;
-        };
-        assert_eq!(
-            t.encode("person", true).unwrap().get_ids().to_vec(),
-            vec![101, 2711, 102]
-        );
-        assert_eq!(
-            t.encode("teddy bear", true).unwrap().get_ids().to_vec(),
-            vec![101, 11389, 4562, 102]
-        );
-        assert_eq!(
-            t.encode("teddy-bear", true).unwrap().get_ids().to_vec(),
-            vec![101, 11389, 1011, 4562, 102]
-        );
-        // The prompt path appends a period (Detector::load); its token must
-        // survive verbatim so the content flags can classify it.
-        let enc = t.encode("person.", true).unwrap();
-        assert_eq!(enc.get_tokens(), ["[CLS]", "person", ".", "[SEP]"]);
-        // ...and the flags the detector derives from those strings.
-        assert_eq!(
-            content_flags(enc.get_tokens()),
-            vec![false, true, false, false]
-        );
-    }
-
-    /// Accents strip before lookup, case folds, punctuation splits.
-    #[test]
-    fn test_wordpiece_normalization() {
-        let Some(t) = tokenizer() else {
-            eprintln!("skipping: grounding-dino/tokenizer.json not cached");
-            return;
-        };
-        assert_eq!(
-            t.encode("café", true).unwrap().get_ids().to_vec(),
-            vec![101, 7668, 102]
-        );
-        assert_eq!(
-            t.encode("Bus!", true).unwrap().get_ids().to_vec(),
-            vec![101, 3902, 999, 102]
-        );
-        // A char absent from the vocab even after lowercasing (nothing
-        // matches, not even one piece) -> whole-word [UNK]; 'ß' (1096)
-        // tokenizes.
-        assert_eq!(
-            t.encode("\u{1F600}", true).unwrap().get_ids().to_vec(),
-            vec![101, 100, 102]
-        );
-        assert_eq!(
-            t.encode("ß", true).unwrap().get_ids().to_vec(),
-            vec![101, 1096, 102]
-        );
     }
 
     #[test]

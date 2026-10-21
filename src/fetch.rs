@@ -2,23 +2,15 @@
 //! release zip, verify its sha256, unpack exactly the release files against
 //! the per-file pins, and hand back a [`gsam::ModelStore`].
 //!
-//! Split by target. The host half downloads the zip into the gsam on-disk
-//! cache for the native oracle path (`seg::prompted`). The wasm half does
-//! the network (release zip, demo scene, user scene URLs) with the browser
-//! `fetch` API — no test reaches the network half — while the install
-//! logic is shared verbatim between the halves and host-tested, so both
-//! targets verify the identical pin tables.
+//! The network half (release zip, demo scene, user scene URLs) is the
+//! browser `fetch` API — no test reaches it — while the install logic is
+//! platform-neutral and host-tested.
 
 use anyhow::{Context, Result, bail, ensure};
 use gsam::{ModelStore, REQUIRED_FILES};
-#[cfg(not(target_arch = "wasm32"))]
-use sha2::Digest;
-#[cfg(target_arch = "wasm32")]
 use std::io::Read as _;
-#[cfg(not(target_arch = "wasm32"))]
-use std::io::{Read, Seek, Write};
-#[cfg(not(target_arch = "wasm32"))]
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::io::Write as _;
 
 /// The release zip URL on the web — relative on purpose: in the pipeline
 /// worker it resolves against the worker script's base URL (same directory,
@@ -29,21 +21,10 @@ use std::path::{Path, PathBuf};
 #[cfg(target_arch = "wasm32")]
 pub const ZIP_URL: &str = "models.zip";
 
-/// The release asset URL — the tag is gsam's release identity, so a new
-/// release moves the URL and the cache leaf together. The asset name is
-/// pinned in the format string because the release doesn't name it after
-/// the tag.
-#[cfg(not(target_arch = "wasm32"))]
-fn models_zip_url() -> String {
-    format!(
-        "https://github.com/suous/splatfield/releases/download/{0}/splatfield-models.zip",
-        gsam::RELEASE_TAG
-    )
-}
-
 /// Streamed-download byte ceiling — the stream aborts past it, so a
-/// sentinel or corrupt URL pointing at some huge file can't fill the disk
-/// (or, on the web, the tab's memory).
+/// sentinel or corrupt URL pointing at some huge file can't fill the
+/// tab's memory.
+#[cfg(target_arch = "wasm32")]
 const MAX_DOWNLOAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// The stream buffer's reserve ceiling: content-length is untrusted, and
@@ -105,35 +86,6 @@ const FILE_SHA256: [(&str, &str); 6] = [
     ),
 ];
 
-/// Cache files the text-prompted oracle needs — grounding-dino as one
-/// self-contained onnx, its tokenizer, and SAM2 encoder/decoder plus their
-/// external `*.onnx_data` weights.
-#[cfg(not(target_arch = "wasm32"))]
-fn required_files() -> Result<Vec<PathBuf>> {
-    let mut files = vec![gsam::grounding_file()?, gsam::grounding_tokenizer()?];
-    for stem in ["vision_encoder", "prompt_encoder_mask_decoder"] {
-        let onnx = gsam::sam_file(stem)?;
-        files.push(onnx.clone());
-        files.push(onnx.with_extension("onnx_data"));
-    }
-    Ok(files)
-}
-
-/// Make sure the oracle models exist in the gsam cache, downloading the
-/// release zip when they don't. `on_progress` is never called when the cache
-/// is already complete.
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn ensure_models(on_progress: &mut dyn FnMut(&str)) -> Result<()> {
-    let files = required_files()?;
-    ensure_release(
-        &gsam::models_dir()?,
-        &gsam::release_dir()?,
-        &files,
-        &pair_manifest(&files)?,
-        on_progress,
-    )
-}
-
 /// Download + install the pinned release into a fresh store — or build it
 /// straight from the OPFS cache when one survives from an earlier load.
 /// The bool answers "came from the cache": a cache hit needs no persist (the
@@ -154,152 +106,6 @@ pub async fn ensure_models(on_progress: &mut dyn FnMut(f64)) -> Result<(ModelSto
     Ok((store, false))
 }
 
-/// Pair gsam's cache paths with the pins — same length, and each
-/// absolute path ending in its relative twin, so layout drift fails
-/// loud instead of silently skipping verification.
-#[cfg(not(target_arch = "wasm32"))]
-fn pair_manifest(files: &[PathBuf]) -> Result<Vec<(&'static str, &'static str)>> {
-    ensure!(
-        files.len() == FILE_SHA256.len(),
-        "{} required files but {} pins — cache layout drift",
-        files.len(),
-        FILE_SHA256.len()
-    );
-    files
-        .iter()
-        .zip(FILE_SHA256)
-        .map(|(f, (rel, sum))| {
-            ensure!(
-                f.ends_with(rel),
-                "{} is not …/{rel} — cache layout drift",
-                f.display()
-            );
-            Ok((rel, sum))
-        })
-        .collect()
-}
-
-/// Stream `path` through sha256 and require an exact pin match — the same
-/// check guards extraction and legacy adoption, so no corrupt file
-/// survives either install path.
-#[cfg(not(target_arch = "wasm32"))]
-fn verify_sha256(path: &Path, want: &str, leaf: &Path) -> Result<()> {
-    let mut hasher = sha2::Sha256::new();
-    std::io::copy(&mut std::fs::File::open(path)?, &mut hasher)?;
-    let got = format!("{:x}", hasher.finalize());
-    ensure!(
-        got == *want,
-        "sha256 of {} is {got}, expected {want} — delete {} and rerun to re-download",
-        path.display(),
-        leaf.display()
-    );
-    Ok(())
-}
-
-/// Ensure `dir` (the release leaf) holds the pinned models. A legacy flat
-/// install — family dirs directly under the models `root`, the shape
-/// caches had before release versioning — is adopted by whole-dir renames
-/// instead of a 2 GB re-download, each moved file hash-verified so a
-/// corrupt legacy install fails loud. Then the complete fast-path, else
-/// download the release zip and extract exactly the manifest into `dir`.
-#[cfg(not(target_arch = "wasm32"))]
-fn ensure_release(
-    root: &Path,
-    dir: &Path,
-    files: &[PathBuf],
-    manifest: &[(&str, &str)],
-    on_progress: &mut dyn FnMut(&str),
-) -> Result<()> {
-    std::fs::create_dir_all(dir)?;
-    if !files.iter().all(|f| f.is_file()) {
-        // Adopt a legacy flat install by whole-dir renames instead of a
-        // 2 GB re-download. Each family is verified before the next one
-        // moves: the rename is one-way, so the error's delete-and-rerun
-        // advice is the recovery, not an undo.
-        for family in ["grounding_dino_tiny", "sam2_tiny"] {
-            let (src, dst) = (root.join(family), dir.join(family));
-            if !src.is_dir() || dst.exists() {
-                continue;
-            }
-            std::fs::rename(&src, &dst)
-                .with_context(|| format!("adopting legacy {family} into {}", dir.display()))?;
-            // Files pair with pins positionally — the same manifest that
-            // drives extraction — so every moved file has a pin here.
-            for (f, (_, want)) in files.iter().zip(manifest) {
-                if f.starts_with(&dst) {
-                    verify_sha256(f, want, dir)?;
-                }
-            }
-        }
-    }
-    if files.iter().all(|f| f.is_file()) {
-        return Ok(());
-    }
-
-    // Stream to `.part` and rename only on success, so an interrupted
-    // download never masquerades as a complete zip.
-    let part = dir.join("models.zip.part");
-    let zip = dir.join("models.zip");
-    download(&part, on_progress).with_context(|| format!("fetching {}", models_zip_url()))?;
-
-    let _ = std::fs::remove_file(&zip); // fs::rename won't replace on Windows
-    std::fs::rename(&part, &zip)?;
-    let mut archive = zip::ZipArchive::new(std::fs::File::open(&zip)?)
-        .context("downloaded models.zip is not a zip")?;
-    extract_into(&mut archive, dir, manifest, on_progress)
-        .with_context(|| format!("unpacking {}", zip.display()))?;
-
-    let missing: Vec<String> = files
-        .iter()
-        .filter(|f| !f.is_file())
-        .map(|f| f.display().to_string())
-        .collect();
-    ensure!(
-        missing.is_empty(),
-        "models zip lacks {} — it must package the cache layout \
-         (grounding_dino_tiny/, sam2_tiny/)",
-        missing.join(", ")
-    );
-    let _ = std::fs::remove_file(&zip);
-    on_progress("models ready");
-    Ok(())
-}
-
-/// Stream the zip to `part`.
-#[cfg(not(target_arch = "wasm32"))]
-fn download(part: &Path, on_progress: &mut dyn FnMut(&str)) -> Result<()> {
-    let res = ureq::get(&models_zip_url()).call()?;
-    let total = res.body().content_length();
-    let mut reader = res
-        .into_body()
-        .into_with_config()
-        .limit(MAX_DOWNLOAD_BYTES)
-        .reader();
-
-    let mut out = std::io::BufWriter::new(std::fs::File::create(part)?);
-    let mut buf = [0u8; 64 * 1024];
-    let mut received = 0u64;
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        out.write_all(&buf[..n])?;
-        received += n as u64;
-        on_progress(&match total {
-            Some(total) => format!(
-                "fetching models {:.0}% ({:.1}/{:.1} MB)",
-                100.0 * received as f64 / total.max(1) as f64,
-                received as f64 / 1e6,
-                total as f64 / 1e6
-            ),
-            None => format!("fetching models… {:.1} MB", received as f64 / 1e6),
-        });
-    }
-    out.flush()?;
-    Ok(())
-}
-
 /// The zip-entry name's pin slot: strip one optional top-level `models/`
 /// component (whole-component only — `models_x/…` does not strip), then
 /// match a pin exactly, so strays and zip-slip paths never qualify. Both
@@ -308,71 +114,6 @@ fn download(part: &Path, on_progress: &mut dyn FnMut(&str)) -> Result<()> {
 fn pin_slot(entry_name: &str, pins: &[(&str, &str)]) -> Option<usize> {
     let name = entry_name.strip_prefix("models/").unwrap_or(entry_name);
     pins.iter().position(|(p, _)| *p == name)
-}
-
-/// Unpack exactly the manifest entries into `dest`: a zip path qualifies
-/// only after the single top-level wrapper folder is stripped and it equals
-/// a manifest path, so `..` escapes, `__MACOSX` cruft, strays, and
-/// unlisted files inside allowed roots are all skipped (a `..` escape
-/// never matches a pin, and the written path is the pin's own relative
-/// path, never an archive string). Each entry lands on a `.part` sibling
-/// and is renamed into place only after its hash passes; a mismatch wipes
-/// every file this call wrote, and a wipe that itself fails is loud — a
-/// leftover file would pass the launch-time presence check and feed
-/// corrupt weights to the oracle forever.
-#[cfg(not(target_arch = "wasm32"))]
-fn extract_into(
-    archive: &mut zip::ZipArchive<impl Read + Seek>,
-    dest: &Path,
-    manifest: &[(&str, &str)],
-    on_progress: &mut dyn FnMut(&str),
-) -> Result<()> {
-    let mut installed: Vec<PathBuf> = Vec::new();
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
-        let Some(slot) = pin_slot(&entry.name()?, manifest) else {
-            continue;
-        };
-        let (rel, want) = manifest[slot];
-        let rel = Path::new(rel);
-        if entry.is_dir() {
-            continue;
-        }
-        let out = dest.join(rel);
-        std::fs::create_dir_all(out.parent().expect("zip file entries have parents"))?;
-        // The final path appears only after its hash passes: a kill mid-copy
-        // leaves at most a `.part` sibling, which the launch-time presence check
-        // ignores. The part path aliases across entries sharing a stem
-        // (`x.onnx` and `x.onnx_data` both → `x.part`) — benign because every
-        // iteration consumes the part (renames or removes it) before the next
-        // begins.
-        let part = out.with_extension("part");
-        std::io::copy(&mut entry, &mut std::fs::File::create(&part)?)
-            .with_context(|| format!("writing {}", rel.display()))?;
-        match verify_sha256(&part, want, dest) {
-            Ok(()) => {
-                std::fs::rename(&part, &out)?;
-                installed.push(out);
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(&part);
-                for p in &installed {
-                    std::fs::remove_file(p).with_context(|| {
-                        format!(
-                            "rolling back {} after a hash mismatch — a leftover file \
-                             passes the presence check forever",
-                            p.display()
-                        )
-                    })?;
-                }
-                // The mismatch was found on the `.part`, but the entry is
-                // known by its final name.
-                return Err(e.context(format!("verifying {}", rel.display())));
-            }
-        }
-        on_progress(&format!("unpacking models… {}", rel.display()));
-    }
-    Ok(())
 }
 
 /// GET `url` from whichever scope declares fetch — a Window on the page, a
@@ -792,51 +533,6 @@ pub(crate) fn build_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
-
-    /// The oracle file set: dino onnx + tokenizer, and both SAM2 graphs
-    /// with their external-data siblings.
-    #[test]
-    fn test_required_files_shape() {
-        let files = required_files().unwrap();
-        let names: Vec<_> = files
-            .iter()
-            .map(|f| f.file_name().unwrap().to_string_lossy().into_owned())
-            .collect();
-        assert_eq!(
-            names,
-            [
-                "model_q4f16.onnx",
-                "tokenizer.json",
-                "vision_encoder_q4f16.onnx",
-                "vision_encoder_q4f16.onnx_data",
-                "prompt_encoder_mask_decoder_q4f16.onnx",
-                "prompt_encoder_mask_decoder_q4f16.onnx_data",
-            ]
-        );
-    }
-
-    /// The pins pair with gsam's file list positionally; a length or
-    /// suffix mismatch is layout drift and must fail loud rather than
-    /// silently skip verification.
-    #[test]
-    fn test_pair_manifest_rejects_drift() {
-        let files: Vec<PathBuf> = FILE_SHA256
-            .iter()
-            .map(|(rel, _)| PathBuf::from("cache").join(rel))
-            .collect();
-        assert!(pair_manifest(&files).is_ok());
-
-        let err = pair_manifest(&files[..files.len() - 1])
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("layout drift"), "{err}");
-
-        let mut wrong = files.clone();
-        wrong[0] = PathBuf::from("cache").join("elsewhere/model_q4f16.onnx");
-        let err = pair_manifest(&wrong).unwrap_err().to_string();
-        assert!(err.contains("layout drift"), "{err}");
-    }
 
     /// The pin table and gsam's required-file list must describe the same
     /// release: same length, same order — the host extraction, the wasm
@@ -847,14 +543,6 @@ mod tests {
         for ((rel, _), req) in FILE_SHA256.iter().zip(REQUIRED_FILES) {
             assert_eq!(*rel, req);
         }
-    }
-
-    fn scratch(tag: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("splatfield-fetch-{}-{tag}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
     }
 
     /// Pins for one synthetic release: each required file's real sha256.
@@ -881,189 +569,6 @@ mod tests {
             .iter()
             .map(|f| format!("models/{f}"))
             .collect()
-    }
-
-    /// A legacy flat install at `root` — the pre-release-versioning cache
-    /// shape — with `weights` as the third file's on-disk bytes; the
-    /// manifest pins stay honest either way. Shared setup for the two
-    /// migration tests.
-    fn legacy_install(
-        tag: &str,
-        weights: &[u8],
-    ) -> (PathBuf, PathBuf, Vec<PathBuf>, Vec<(&'static str, String)>) {
-        let manifest: Vec<(&'static str, String)> = [
-            ("grounding_dino_tiny/onnx/model.onnx", zip_sha256(b"onnx")),
-            ("grounding_dino_tiny/tokenizer.json", zip_sha256(b"{}")),
-            (
-                "sam2_tiny/onnx/vision_encoder.onnx_data",
-                zip_sha256(b"weights"),
-            ),
-        ]
-        .into();
-        let root = scratch(tag);
-        let leaf = root.join(gsam::RELEASE_TAG);
-        std::fs::create_dir_all(root.join("grounding_dino_tiny/onnx")).unwrap();
-        std::fs::create_dir_all(root.join("sam2_tiny/onnx")).unwrap();
-        std::fs::write(root.join("grounding_dino_tiny/onnx/model.onnx"), b"onnx").unwrap();
-        std::fs::write(root.join("grounding_dino_tiny/tokenizer.json"), b"{}").unwrap();
-        std::fs::write(
-            root.join("sam2_tiny/onnx/vision_encoder.onnx_data"),
-            weights,
-        )
-        .unwrap();
-        let files: Vec<_> = manifest.iter().map(|(rel, _)| leaf.join(rel)).collect();
-        (root, leaf, files, manifest)
-    }
-
-    /// Extraction installs exactly the manifest entries — through a
-    /// `models/` wrapper — and drops everything else: `..` escapes,
-    /// `__MACOSX` cruft, root strays, directory stubs.
-    #[test]
-    fn test_extract_keeps_layout_and_skips_the_rest() {
-        let onnx_sum = zip_sha256(b"onnx");
-        let weights_sum = zip_sha256(b"weights");
-        let manifest = [
-            ("grounding_dino_tiny/onnx/model.onnx", onnx_sum.as_str()),
-            (
-                "sam2_tiny/onnx/vision_encoder.onnx_data",
-                weights_sum.as_str(),
-            ),
-        ];
-        let zip = build_zip(&[
-            ("models/", &[]),
-            ("models/grounding_dino_tiny/onnx/model.onnx", b"onnx"),
-            ("models/sam2_tiny/onnx/vision_encoder.onnx_data", b"weights"),
-            ("../escape.txt", b"no"),
-            ("__MACOSX/junk", b"no"),
-            ("stray.txt", b"no"),
-        ]);
-        let dir = scratch("extract");
-        let mut archive = zip::ZipArchive::new(Cursor::new(zip)).unwrap();
-        let mut extracted = 0usize;
-        extract_into(&mut archive, &dir, &manifest, &mut |_| extracted += 1).unwrap();
-
-        assert_eq!(
-            std::fs::read(dir.join("grounding_dino_tiny/onnx/model.onnx")).unwrap(),
-            b"onnx"
-        );
-        assert_eq!(
-            std::fs::read(dir.join("sam2_tiny/onnx/vision_encoder.onnx_data")).unwrap(),
-            b"weights"
-        );
-        assert!(!dir.join("stray.txt").exists());
-        assert!(!dir.parent().unwrap().join("escape.txt").exists());
-        assert_eq!(extracted, 2);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A file inside an allowed root but absent from the manifest is junk —
-    /// exact-match filtering skips it rather than installing it.
-    #[test]
-    fn test_extract_skips_junk_inside_allowed_roots() {
-        let tok_sum = zip_sha256(b"{}");
-        let manifest = [("grounding_dino_tiny/tokenizer.json", tok_sum.as_str())];
-        let zip = build_zip(&[
-            ("grounding_dino_tiny/tokenizer.json", b"{}"),
-            ("grounding_dino_tiny/junk.bin", b"junk"),
-        ]);
-        let dir = scratch("junk-root");
-        let mut archive = zip::ZipArchive::new(Cursor::new(zip)).unwrap();
-        let mut extracted = 0usize;
-        extract_into(&mut archive, &dir, &manifest, &mut |_| extracted += 1).unwrap();
-
-        assert_eq!(
-            std::fs::read(dir.join("grounding_dino_tiny/tokenizer.json")).unwrap(),
-            b"{}"
-        );
-        assert!(!dir.join("grounding_dino_tiny/junk.bin").exists());
-        assert_eq!(extracted, 1);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A payload that doesn't match its pinned hash aborts the install and
-    /// wipes every file this extraction wrote — a half-installed cache
-    /// would pass the launch-time presence check and feed corrupt weights
-    /// to the oracle.
-    #[test]
-    fn test_extract_tampered_payload_wipes_install() {
-        let good_sum = zip_sha256(b"good");
-        let weights_sum = zip_sha256(b"good weights");
-        let manifest = [
-            ("grounding_dino_tiny/tokenizer.json", good_sum.as_str()),
-            (
-                "sam2_tiny/onnx/vision_encoder.onnx_data",
-                weights_sum.as_str(),
-            ),
-        ];
-        let zip = build_zip(&[
-            ("grounding_dino_tiny/tokenizer.json", b"good"),
-            ("sam2_tiny/onnx/vision_encoder.onnx_data", b"tampered"),
-        ]);
-        let dir = scratch("tampered");
-        let mut archive = zip::ZipArchive::new(Cursor::new(zip)).unwrap();
-        let err = extract_into(&mut archive, &dir, &manifest, &mut |_| {}).unwrap_err();
-        assert!(err.to_string().contains("vision_encoder.onnx_data"));
-        assert!(!dir.join("grounding_dino_tiny/tokenizer.json").exists());
-        assert!(!dir.join("sam2_tiny/onnx/vision_encoder.onnx_data").exists());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// An entry whose checksum fails while it is read — a kill mid-copy —
-    /// leaves no final file behind: at most a `.part` sibling the
-    /// launch-time presence check ignores. Earlier verified entries stay —
-    /// copy errors do not roll back.
-    #[test]
-    fn test_extract_corrupt_entry_leaves_no_final_file() {
-        let good_sum = zip_sha256(b"good");
-        let weights_sum = zip_sha256(b"good weights");
-        let manifest = [
-            ("grounding_dino_tiny/tokenizer.json", good_sum.as_str()),
-            (
-                "sam2_tiny/onnx/vision_encoder.onnx_data",
-                weights_sum.as_str(),
-            ),
-        ];
-        let mut zip = build_zip(&[
-            ("grounding_dino_tiny/tokenizer.json", b"good"),
-            ("sam2_tiny/onnx/vision_encoder.onnx_data", b"good weights"),
-        ]);
-        // Byte surgery: the central directory ends the zip, one
-        // `PK\x01\x02` record per entry in file order. Flip a byte of the
-        // second record's CRC-32 (sig 4 + version 2 + version 2 + flags 2 +
-        // method 2 + time 2 + date 2 → CRC at +16): the entry's bytes are
-        // untouched, but zip-rs now reads it against the wrong checksum and
-        // the read fails mid-entry.
-        let needle: &[u8] = b"PK\x01\x02";
-        let record = zip
-            .windows(4)
-            .enumerate()
-            .filter(|(_, w)| *w == needle)
-            .map(|(i, _)| i)
-            .nth(1)
-            .expect("second central directory record");
-        zip[record + 16] ^= 0xFF;
-
-        let dir = scratch("corrupt-entry");
-        let mut archive = zip::ZipArchive::new(Cursor::new(zip)).unwrap();
-        let err = extract_into(&mut archive, &dir, &manifest, &mut |_| {}).unwrap_err();
-        assert!(
-            err.to_string().contains("vision_encoder.onnx_data"),
-            "{err}"
-        );
-        assert!(!dir.join("sam2_tiny/onnx/vision_encoder.onnx_data").exists());
-        assert!(dir.join("grounding_dino_tiny/tokenizer.json").exists());
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Pins today's release URL byte-for-byte: the asset name isn't
-    /// `<tag>.zip`, so a tag bump must consciously carry the asset name
-    /// along instead of silently 404ing.
-    #[test]
-    fn test_models_zip_url_pins_current_release() {
-        assert_eq!(
-            models_zip_url(),
-            "https://github.com/suous/splatfield/releases/download/models-v1/splatfield-models.zip"
-        );
     }
 
     /// The parts-manifest shape scripts/ship_models.sh writes: an integer
@@ -1111,87 +616,6 @@ mod tests {
         assert_eq!(zip_part_url("models.zip", 0), "models.zip.p0");
         assert_eq!(zip_part_url("models.zip", 6), "models.zip.p6");
         assert_eq!(zip_manifest_url("models.zip"), "models.zip.manifest.json");
-    }
-
-    /// A legacy flat cache (family dirs directly under the models root —
-    /// the pre-versioning shape) is adopted into the release leaf by
-    /// whole-dir renames instead of a 2 GB re-download.
-    #[test]
-    fn test_migration_moves_flat_cache_into_release_leaf() {
-        let (root, leaf, files, manifest) = legacy_install("migrate", b"weights");
-
-        ensure_release(&root, &leaf, &files, &pin_refs(&manifest), &mut |_| {}).unwrap();
-
-        assert_eq!(
-            std::fs::read(leaf.join("grounding_dino_tiny/onnx/model.onnx")).unwrap(),
-            b"onnx"
-        );
-        assert_eq!(
-            std::fs::read(leaf.join("grounding_dino_tiny/tokenizer.json")).unwrap(),
-            b"{}"
-        );
-        assert_eq!(
-            std::fs::read(leaf.join("sam2_tiny/onnx/vision_encoder.onnx_data")).unwrap(),
-            b"weights"
-        );
-        assert!(!root.join("grounding_dino_tiny").exists());
-        assert!(!root.join("sam2_tiny").exists());
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A corrupt legacy install fails loud on the moved files — it must
-    /// never pass as adopted and feed the oracle bad weights; the message
-    /// says how to recover.
-    #[test]
-    fn test_migration_corrupt_legacy_fails_loud() {
-        let (root, leaf, files, manifest) = legacy_install("migrate-corrupt", b"tampered");
-
-        let err =
-            ensure_release(&root, &leaf, &files, &pin_refs(&manifest), &mut |_| {}).unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("vision_encoder.onnx_data"), "{msg}");
-        assert!(msg.contains("delete"), "{msg}");
-        assert!(
-            leaf.join("sam2_tiny/onnx/vision_encoder.onnx_data")
-                .exists()
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A complete leaf returns before any download or migration — a
-    /// root-level legacy tree stays put and the leaf bytes are untouched.
-    #[test]
-    fn test_complete_leaf_skips_migration_and_download() {
-        let (onnx_sum, tok_sum) = (zip_sha256(b"onnx"), zip_sha256(b"{}"));
-        let manifest = [
-            ("grounding_dino_tiny/onnx/model.onnx", onnx_sum.as_str()),
-            ("grounding_dino_tiny/tokenizer.json", tok_sum.as_str()),
-        ];
-        let root = scratch("complete");
-        let leaf = root.join(gsam::RELEASE_TAG);
-        std::fs::create_dir_all(leaf.join("grounding_dino_tiny/onnx")).unwrap();
-        std::fs::write(leaf.join("grounding_dino_tiny/onnx/model.onnx"), b"onnx").unwrap();
-        std::fs::write(leaf.join("grounding_dino_tiny/tokenizer.json"), b"{}").unwrap();
-        std::fs::create_dir_all(root.join("sam2_tiny/onnx")).unwrap();
-        std::fs::write(
-            root.join("sam2_tiny/onnx/vision_encoder.onnx_data"),
-            b"root copy",
-        )
-        .unwrap();
-        let files: Vec<_> = manifest.iter().map(|(rel, _)| leaf.join(rel)).collect();
-
-        ensure_release(&root, &leaf, &files, &manifest, &mut |_| {
-            panic!("on_progress called — a complete leaf must return before any download")
-        })
-        .unwrap();
-
-        assert_eq!(
-            std::fs::read(leaf.join("grounding_dino_tiny/onnx/model.onnx")).unwrap(),
-            b"onnx"
-        );
-        assert!(root.join("sam2_tiny").exists());
-        assert!(!leaf.join("sam2_tiny").exists());
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Six files through the `models/` wrapper, hashes checked byte-for-byte.

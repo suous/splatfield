@@ -1,31 +1,21 @@
 // Same contract as the root crate: `pub` only for the exported API
-// (Detector, Sam2, the model-path helpers); everything else pub(crate).
+// (ModelStore, REQUIRED_FILES, and on wasm the Detector/Sam2 sessions);
+// everything else pub(crate).
 #![deny(unreachable_pub)]
 
-// The ort session layer is native-only: ort cannot target wasm32. The web
-// build runs the same graphs through onnxruntime-web instead (`ortweb`,
-// driven over js_sys) — everything above the session layer (ModelStore,
-// tokenizer, prompt tensors, pre/post-processing) is cfg-dual and shared.
+// Web inference runs the graphs through onnxruntime-web (`ortweb`, driven
+// over js_sys). There is no native backend: the workspace targets wasm32
+// only — host builds exist for the test suite, which exercises the
+// platform-neutral halves (decode logic, ModelStore, the pin tables).
 mod dino;
 pub mod ortweb;
 mod preprocess;
 mod sam2;
-#[cfg(not(target_arch = "wasm32"))]
-mod session;
 
-#[cfg(not(target_arch = "wasm32"))]
-use anyhow::{Result, bail};
-#[cfg(not(target_arch = "wasm32"))]
-use half::{f16, slice::HalfFloatSliceExt, vec::HalfFloatVecExt};
-#[cfg(not(target_arch = "wasm32"))]
-use ort::{
-    session::Session,
-    value::{DynValue, Tensor, TensorElementType as TE, ValueType},
-};
-#[cfg(not(target_arch = "wasm32"))]
-use std::path::PathBuf;
-
-pub use dino::{Detection, Detector};
+pub use dino::Detection;
+#[cfg(target_arch = "wasm32")]
+pub use dino::Detector;
+#[cfg(target_arch = "wasm32")]
 pub use sam2::Sam2;
 
 /// Every file the release zip must provide, keyed relative to the release
@@ -44,9 +34,9 @@ pub const REQUIRED_FILES: [&str; 6] = [
 ];
 
 /// In-memory stand-in for the on-disk model cache: the verified files of one
-/// release, keyed by cache-relative path ([`REQUIRED_FILES`]). On the web it
-/// lives only as long as the page — the durable copy is the OPFS cache
-/// (`splatfield::opfs`); on the host it holds what fetch extracted.
+/// release, keyed by cache-relative path ([`REQUIRED_FILES`]). It lives only
+/// as long as the page — the durable copy is the OPFS cache
+/// (`splatfield::opfs`).
 #[derive(Debug, Default)]
 pub struct ModelStore {
     files: std::collections::HashMap<&'static str, Vec<u8>>,
@@ -86,6 +76,7 @@ impl ModelStore {
 /// The graph-input count both backends' loads ensure before positional
 /// dtype indexing — a short graph must error, not index blind (a wasm
 /// abort). `what` names the graph; `>=` keeps appended-input exports loadable.
+#[cfg(target_arch = "wasm32")]
 pub(crate) fn ensure_graph_inputs(declared: usize, want: usize, what: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
         declared >= want,
@@ -97,6 +88,7 @@ pub(crate) fn ensure_graph_inputs(declared: usize, want: usize, what: &str) -> a
 /// Index of the greatest element; ties go to the last maximum, NaN never
 /// wins. Both backends' postprocessors share the selection rule so
 /// detections can't drift between platforms.
+#[cfg(any(target_arch = "wasm32", test))]
 pub(crate) fn argmax(xs: &[f32]) -> usize {
     let mut best = 0;
     let mut max = f32::NEG_INFINITY;
@@ -109,174 +101,9 @@ pub(crate) fn argmax(xs: &[f32]) -> usize {
     best
 }
 
-/// App model cache root (`{cache}/splatfield/models`, per the platform
-/// convention), overridable with `SPLATFIELD_MODELS_DIR`.
-#[cfg(not(target_arch = "wasm32"))]
-pub fn models_dir() -> anyhow::Result<PathBuf> {
-    if let Some(dir) = std::env::var_os("SPLATFIELD_MODELS_DIR") {
-        return Ok(PathBuf::from(dir));
-    }
-    dirs::cache_dir()
-        .map(|dir| dir.join("splatfield/models"))
-        .ok_or_else(|| anyhow::anyhow!("no user cache directory on this platform"))
-}
-
-/// The model release identity: the fetch URL's release tag (splatfield::fetch)
-/// AND the cache leaf directory under `models_dir()`. One const so a new
-/// release moves URL and cache together and the previous leaf survives
-/// for instant revert.
-#[cfg(not(target_arch = "wasm32"))]
-pub const RELEASE_TAG: &str = "models-v1";
-
-/// The directory this release's models live in — always the versioned
-/// leaf, never the root: a leaf pinned to the root (e.g. by adopting a
-/// legacy flat layout in place) would make every future release a
-/// silent no-op, its files matching the presence check by name forever.
-#[cfg(not(target_arch = "wasm32"))]
-pub fn release_dir() -> anyhow::Result<PathBuf> {
-    Ok(models_dir()?.join(RELEASE_TAG))
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub fn grounding_file() -> anyhow::Result<PathBuf> {
-    Ok(release_dir()?.join("grounding_dino_tiny/onnx/model_q4f16.onnx"))
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub fn sam_file(stem: &str) -> anyhow::Result<PathBuf> {
-    Ok(release_dir()?.join(format!("sam2_tiny/onnx/{stem}_q4f16.onnx")))
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub fn grounding_tokenizer() -> anyhow::Result<PathBuf> {
-    Ok(release_dir()?.join("grounding_dino_tiny/tokenizer.json"))
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn input_ty(t: &ValueType) -> Result<TE> {
-    t.tensor_type()
-        .ok_or_else(|| anyhow::anyhow!("unsupported value type {t:?}"))
-}
-
-/// Element types the session's graph inputs declare, in input order.
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn input_dtypes(session: &Session) -> Result<Vec<TE>> {
-    session
-        .inputs()
-        .iter()
-        .map(|i| input_ty(i.dtype()))
-        .collect()
-}
-
-/// The host run's output-count ensure — positional indexing must not go in
-/// blind; the wasm arm's twin is `ortweb::fixed_outputs`.
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn expect_outputs(
-    outputs: &ort::session::SessionOutputs<'_>,
-    want: usize,
-    what: &str,
-) -> Result<()> {
-    let got = outputs.len();
-    anyhow::ensure!(
-        got == want,
-        "{what} returned {got} outputs, expected {want}"
-    );
-    Ok(())
-}
-
-/// The encoders' shared input: squash-resize RGB to the graph's fixed net
-/// size, ImageNet-normalize to CHW, and wrap in the session's element type.
-/// The f16 graphs (both releases are q4f16) normalize straight into the
-/// tensor buffer — the f32 CHW plane never exists.
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn encoder_input(
-    session: &Session,
-    rgb: &[u8],
-    (w, h): (u32, u32),
-    net: u32,
-) -> Result<DynValue> {
-    let want = input_ty(session.inputs()[0].dtype())?;
-    // Normalized f32 has no meaningful i64 cast — fail loud, not with a
-    // cast tensor (parity: preprocess::encoder_input, test-pinned there).
-    if want == TE::Int64 {
-        bail!("pixel_values as int64 is not a valid encoder input");
-    }
-    let canvas = preprocess::resize_rgb8(rgb, (w, h), (net, net));
-    let shape = [1, 3, net as i64, net as i64];
-    if want == TE::Float16 {
-        let buf = preprocess::normalize_chw::<f16>(&canvas, f16::from_f32);
-        return Ok(Tensor::from_array((shape, buf))?.into_dyn());
-    }
-    make_input(&shape, preprocess::normalize_chw(&canvas, |x| x), want)
-}
-
-/// Build an input tensor in the element type the session declares.
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn make_input(shape: &[i64], data: Vec<f32>, want: TE) -> Result<DynValue> {
-    Ok(match want {
-        TE::Float32 => Tensor::from_array((shape, data))?.into_dyn(),
-        TE::Float16 => {
-            let buf: Vec<f16> = Vec::from_f32_slice(&data);
-            Tensor::from_array((shape, buf))?.into_dyn()
-        }
-        TE::Int64 => {
-            Tensor::from_array((shape, data.iter().map(|&x| x as i64).collect::<Vec<_>>()))?
-                .into_dyn()
-        }
-        t => bail!("unsupported input dtype {t:?}"),
-    })
-}
-
-/// Extract a tensor as f32 (f16 widened), returning (dims, data).
-#[cfg(not(target_arch = "wasm32"))]
-pub(crate) fn extract_f32(v: &DynValue) -> Result<(Vec<i64>, Vec<f32>)> {
-    extract_f32_with(v, |_, len| Ok(0..len))
-}
-
-/// [`extract_f32`] with the flat range picked from the dims/len before any
-/// widening: a [.., C, H, W] output whose one used channel is `chan` (SAM2's
-/// argmax-IoU mask) widens len/C elements instead of all of them. Host twin
-/// of ortweb's `into_f32_slice`; the fallible-range contract is its docs.
-#[cfg(not(target_arch = "wasm32"))]
-fn extract_f32_with(
-    v: &DynValue,
-    take: impl FnOnce(&[i64], usize) -> Result<std::ops::Range<usize>>,
-) -> Result<(Vec<i64>, Vec<f32>)> {
-    match v.dtype() {
-        ValueType::Tensor {
-            ty: TE::Float32, ..
-        } => {
-            let (shape, data) = v.try_extract_tensor::<f32>()?;
-            let range = take(shape, data.len())?;
-            Ok((shape.to_vec(), data[range].to_vec()))
-        }
-        ValueType::Tensor {
-            ty: TE::Float16, ..
-        } => {
-            let (shape, data) = v.try_extract_tensor::<f16>()?;
-            let range = take(shape, data.len())?;
-            Ok((shape.to_vec(), data[range].to_f32_vec()))
-        }
-        t => bail!("unsupported output dtype {t:?}"),
-    }
-}
-
-// Host-only: `RELEASE_TAG`/`release_dir` are host-gated (download-side);
-// the wasm build ships no release dir to resolve.
-#[cfg(all(test, not(target_arch = "wasm32")))]
+#[cfg(test)]
 mod tests {
-    use super::{ModelStore, RELEASE_TAG, REQUIRED_FILES, argmax, release_dir};
-
-    /// The release leaf is ALWAYS the versioned directory under the
-    /// models root — resolving a legacy flat root in place would pin the
-    /// leaf to the root: its files pass the presence check by name
-    /// forever, unverified, and every future release becomes a silent
-    /// no-op.
-    #[test]
-    fn test_release_dir_is_versioned_leaf() {
-        let dir = release_dir().unwrap();
-        assert_eq!(dir.file_name().unwrap(), RELEASE_TAG);
-    }
+    use super::{ModelStore, REQUIRED_FILES, argmax};
 
     /// Pins the postprocessors' shared argmax contract: ties resolve
     /// last-wins and NaNs never win.

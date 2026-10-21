@@ -14,16 +14,12 @@
 //! cubecl's blocking reads poll once and panic on wasm — the sync paths are
 //! host-only and drive the same futures with `cubecl::future::block_on`,
 //! which is what keeps the host GPU tests on the same bodies the wasm app
-//! runs. Only
-//! `prompted` (the host ort session glue that loads the oracle models)
-//! stays host-only: the web app's oracle is the pipeline worker's
-//! detect→encode→decode, reached over the app's own async loop.
+//! runs. The web app's oracle is the pipeline worker's detect→encode→decode,
+//! reached over the app's own async loop.
 
 pub mod active;
 pub mod beta;
 pub(crate) mod paint;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod prompted;
 pub(crate) mod views;
 
 use crate::camera::Camera;

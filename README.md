@@ -21,6 +21,29 @@ Built with [egui](https://github.com/emilk/egui), [wgpu](https://github.com/gfx-
 
 Built to learn the details of [3D Gaussian Splatting](https://arxiv.org/abs/2308.04079). Learned a lot from [Brush](https://github.com/ArthurBrussee/brush).
 
+## Run in the browser
+
+**[www.splatfield.cn](https://www.splatfield.cn)** serves the wasm app —
+nothing to install, and nothing to upload: `.ply`/`.sog` files stay on your
+device; everything runs locally in the browser. The same static build also
+deploys to [GitHub Pages](https://suous.github.io/splatfield/) (see
+`deploy.yml`: Pages plus the EdgeOne mirror; the 158 MB model zip ships as
+`models.zip.p*` parts behind the 25 MB/file deploy cap).
+
+## Run locally (wasm)
+
+```sh
+trunk build --release              # rebuild dist/ after code changes
+python3 scripts/dev_server.py      # http://127.0.0.1:8931
+```
+
+The dev server serves `dist/` plus the app's same-origin data fetches
+(`/models.zip` and the demo scene) straight from `data/` — and, critically,
+a clean **404** for `/models.zip.manifest.json`, which selects the
+single-file download path. `trunk serve` does NOT work for the model
+fetch: its fallback answers the manifest probe with a 200 HTML page, which
+the fetcher rejects as "not a parts manifest".
+
 ## How to use
 
 1. Grab a native binary from [Releases](https://github.com/suous/splatfield/releases/tag/v0.2.0-rc.2) — Windows, Linux, macOS (Apple Silicon).
@@ -162,10 +185,13 @@ cargo bench --workspace
 ## TODO
 
 - [ ] **Box-selection segmentation** — feed Shift+drag rect straight to SAM2 (no detector pass); `Oracle` seam unchanged.
-- [ ] **WASM support** — viewer side is proven; `ort` has no browser backend,
-  model fetch is native-only, wasm memory ceilings need a plan.
+- [x] **WASM support** — the app IS wasm now: inference runs on
+  onnxruntime-web, the model zip fetches through the browser into an OPFS
+  cache, and the native target is gone.
 - [ ] Multi-instance prompts — palette per instance.
-- [ ] CoreML/GPU execution provider for the oracle — CPU oracle is the long pole (~4.3 s/view).
+- [x] **GPU inference** — the worker probes `navigator.gpu` and runs the
+  oracle on onnxruntime-web's WebGPU execution provider when one resolves
+  (wasm EP otherwise).
 
 ## References
 

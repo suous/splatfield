@@ -3,10 +3,10 @@ name = "gsam"
 version.workspace = true
 edition.workspace = true
 
-# Both targets: the release data model (REQUIRED_FILES + ModelStore) is shared
-# verbatim by the host fetch path and the wasm OPFS cache, and the inference
-# pipeline above the session layer (tokenizer, prompt tensors, pre/post-
-# processing) is cfg-dual over the two backends.
+# Wasm-only inference (onnxruntime-web via ortweb). The release data model
+# (REQUIRED_FILES + ModelStore) and the platform-neutral halves (tokenizer,
+# prompt tensors, pre/post-processing) also compile on host, where the test
+# suite exercises them.
 [dependencies]
 anyhow.workspace = true
 # f16 bit handling for the q4f16 graphs' tensor payloads.
@@ -14,17 +14,6 @@ half = "2.7"
 # imageops resize only (Triangle); decode stays in the app layer.
 image = { version = "0.25", default-features = false }
 tokenizers = { version = "=0.23.2", default-features = false, features = ["fancy-regex"] }
-
-# Native-only: ort cannot target wasm32, and its support cast (the cache-root
-# helper) follows it. Web inference goes through ortweb instead.
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-ort = { version = "=2.0.0-rc.15", default-features = false, features = [
-    "download-binaries",
-    "tls-rustls",
-    "half",
-    "std",
-] }
-dirs = "7"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"

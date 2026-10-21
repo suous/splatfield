@@ -835,11 +835,17 @@ mod tests {
         // frees and pool reclaim land inside the measurement window and can
         // spike a single reading. Fail only on sustained growth — systematic
         // per-frame allocation trips every attempt.
-        let mut prev = client.memory_report(cubecl::MemoryScope::Device).usage().bytes_in_use;
+        let mut prev = client
+            .memory_report(cubecl::MemoryScope::Device)
+            .usage()
+            .bytes_in_use;
         let mut steady = false;
         for _ in 0..5 {
             splats.render_with(&mut scratch, &camera, glam::uvec2(64, 64));
-            let cur = client.memory_report(cubecl::MemoryScope::Device).usage().bytes_in_use;
+            let cur = client
+                .memory_report(cubecl::MemoryScope::Device)
+                .usage()
+                .bytes_in_use;
             if cur <= prev + 65_536 {
                 steady = true;
                 break;

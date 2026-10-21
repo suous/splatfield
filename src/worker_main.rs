@@ -304,9 +304,8 @@ mod wasm {
         // Detections come back best-confidence first. An empty result is NOT
         // a failure: the only consumer is the B3-Seg loop, whose stop rule
         // reads the mask's zero foreground count (src/seg/active.rs
-        // `missed && !any_fg`), exactly like the native oracle
-        // (seg/prompted.rs: "nothing found means an all-background mask and
-        // no decode"). A SegmentFailed here would force the loop to
+        // `missed && !any_fg`): nothing found means an all-background
+        // mask and no decode. A SegmentFailed here would force the loop to
         // string-match prose. Parity means an all-background mask, zero
         // confidence, and no decode — encode+decode are skipped entirely
         // (encode_ms/decode_ms = 0.0 marks the empty path; see pipeline.rs).

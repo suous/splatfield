@@ -54,7 +54,7 @@ jobs:
 
       # Pinned to the version the app's data-* attributes (worker loader
       # shim, wasm-opt params) are validated against.
-      - run: cargo binstall --no-confirm trunk@0.21.14
+      - run: cargo binstall --no-confirm trunk@0.22.0
 
       # Project Pages serves the app under /<repo>/; the same subpath is
       # baked into index.html's <base> and every asset reference.

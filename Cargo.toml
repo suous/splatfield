@@ -63,7 +63,10 @@ sha2 = "0.10"
 # package — the payloads are binary, and the same encode/decode runs on the
 # host tests and the wire.
 bincode = { version = "2", features = ["serde"] }
-eframe = { version = "0.37", default-features = false, features = ["default_fonts", "links", "wgpu", "x11", "wayland"] }
+# Native window backends (x11/wayland) are deliberately off: this branch
+# ships wasm only — main.rs's native path is a tombstone, and host builds
+# exist for tests, which never open a window.
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "links", "wgpu"] }
 # egui 0.37 moved the bundled monochrome emoji font behind its own feature,
 # and eframe has no passthrough for it. The landing card draws its upload
 # badge (⬆) and its example row (🐻) from NotoEmoji, so without the
@@ -81,13 +84,6 @@ gsam = { path = "crates/gsam" }
 # std::time::Instant on host, performance.now on wasm — the status pill's
 # clock, and the worker's stage timers.
 web-time = "1"
-
-# Native-only: ort (inside gsam) cannot target wasm32. Web inference is the
-# worker bin's job (see src/worker_main.rs).
-[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
-# First-run oracle model fetch (fetch module): one release-zip download into
-# the gsam cache.
-ureq = "3"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 wasm-bindgen = "0.2"
@@ -136,9 +132,6 @@ web-sys = { version = "0.3", features = [
     "FileSystemGetDirectoryOptions",
     "FileSystemGetFileOptions",
     "FileSystemRemoveOptions",
-    # settings.rs: the two sidebar settings persist in the page's
-    # localStorage (load once at startup, save on change).
-    "Storage",
     # picker.rs: the change listener on the hidden input — a file dialog
     # fires no canvas event, so the listener's only job is a repaint
     # request (add_event_listener_with_callback lives on EventTarget).

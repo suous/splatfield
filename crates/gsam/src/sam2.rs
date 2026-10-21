@@ -6,28 +6,21 @@
 //! the 3 encoder outputs, argmax-IoU channel, bilinear resize to source,
 //! 0.5 threshold → 255/0 bytes.
 //!
-//! The session layer is the only backend split: host builds two `ort` CPU
-//! sessions from the release cache and re-runs the encoder per segment;
-//! wasm builds `ortweb::Session`s from the [`crate::ModelStore`] and caches
-//! the encoder outputs between decodes. The box scaling and mask bytes are
-//! shared verbatim.
+//! The session layer is wasm-only: `ortweb::Session`s built from the
+//! [`crate::ModelStore`], caching the encoder outputs between decodes. The
+//! box scaling and mask bytes are platform-neutral and host-tested.
 
+#[cfg(any(target_arch = "wasm32", test))]
 use anyhow::Result;
 
+#[cfg(any(target_arch = "wasm32", test))]
+use crate::argmax;
 #[cfg(target_arch = "wasm32")]
-use crate::{ModelStore, REQUIRED_FILES, argmax, ensure_graph_inputs, ortweb, preprocess};
-#[cfg(not(target_arch = "wasm32"))]
-use crate::{
-    argmax, encoder_input, ensure_graph_inputs, expect_outputs, extract_f32, extract_f32_with,
-    input_dtypes, make_input, sam_file, session,
-};
-#[cfg(not(target_arch = "wasm32"))]
-use ort::session::{Session, builder::GraphOptimizationLevel};
-#[cfg(not(target_arch = "wasm32"))]
-use ort::value::TensorElementType as TE;
+use crate::{ModelStore, REQUIRED_FILES, ensure_graph_inputs, ortweb, preprocess};
 
 /// Fixed input size; the aspect ratio is squashed, and box prompts are
 /// pixel coords in this frame.
+#[cfg(any(target_arch = "wasm32", test))]
 pub(crate) const NET: u32 = 1024;
 
 /// Store keys, indexed into [`REQUIRED_FILES`] so a release-manifest rename
@@ -49,6 +42,7 @@ const DECODER_DATA_KEY: &str = REQUIRED_FILES[5];
 const DECODER_DATA_REF: &str = "prompt_encoder_mask_decoder_q4f16.onnx_data";
 
 /// Scale a source-frame xyxy box into the squash-mapped NET frame.
+#[cfg(any(target_arch = "wasm32", test))]
 pub(crate) fn scale_box(box_prompt: [f32; 4], width: u32, height: u32) -> [f32; 4] {
     let (sx, sy) = (NET as f32 / width as f32, NET as f32 / height as f32);
     [
@@ -64,6 +58,7 @@ pub(crate) fn scale_box(box_prompt: [f32; 4], width: u32, height: u32) -> [f32; 
 /// they guard it: a rank or count mismatch, or a zero channel count,
 /// must error rather than slice or divide blind. mh/mw live at
 /// dims[3]/[4], so anything but [1, 1, C, mh, mw] is a mismatch.
+#[cfg(any(target_arch = "wasm32", test))]
 fn iou_channel(ious: &[f32], shape: &[i64], len: usize) -> Result<std::ops::Range<usize>> {
     anyhow::ensure!(
         shape.len() == 5,
@@ -85,6 +80,7 @@ fn iou_channel(ious: &[f32], shape: &[i64], len: usize) -> Result<std::ops::Rang
 /// export's mask plane is square (256²), which is the only reason a
 /// transposed call is invisible: a non-square mask export would stretch
 /// the mask axes into each other if the pair order drifts back.
+#[cfg(any(target_arch = "wasm32", test))]
 pub(crate) fn mask_bytes(
     logits: &[f32],
     mask_w: usize,
@@ -101,66 +97,6 @@ pub(crate) fn mask_bytes(
     let up = image::imageops::resize(&src, width, height, image::imageops::FilterType::Triangle)
         .into_raw();
     up.iter().map(|&x| (x > 0.5) as u8 * 255).collect()
-}
-
-/// The host backend: two ort CPU sessions, encoder + decoder per segment.
-#[cfg(not(target_arch = "wasm32"))]
-pub struct Sam2 {
-    encoder: Session,
-    decoder: Session,
-    /// Decoder input dtypes, resolved once at load (session metadata never
-    /// changes). The `points`/`labels` tensors themselves stay per-call in
-    /// `segment` — cloning an ort `DynValue` may deep-copy the buffer.
-    decoder_dtypes: Vec<TE>,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl Sam2 {
-    pub fn load() -> Result<Self> {
-        let decoder = session::build(
-            &sam_file("prompt_encoder_mask_decoder")?,
-            GraphOptimizationLevel::Level3,
-        )?;
-        let decoder_dtypes = input_dtypes(&decoder)?;
-        // Mirror of the wasm load's guard: decoder_dtypes[0..=2] are indexed
-        // in `segment`.
-        ensure_graph_inputs(decoder_dtypes.len(), 3, "SAM2 decoder")?;
-        Ok(Self {
-            encoder: session::build(&sam_file("vision_encoder")?, GraphOptimizationLevel::Level3)?,
-            decoder,
-            decoder_dtypes,
-        })
-    }
-
-    pub fn segment(
-        &mut self,
-        rgb: &[u8],
-        width: u32,
-        height: u32,
-        box_prompt: &[f32; 4],
-    ) -> Result<Vec<u8>> {
-        let image = encoder_input(&self.encoder, rgb, (width, height), NET)?;
-
-        let coords = scale_box(*box_prompt, width, height);
-        let points = make_input(&[1, 1, 1, 2], vec![0.0, 0.0], self.decoder_dtypes[0])?;
-        let labels = make_input(&[1, 1, 1], vec![-1.0], self.decoder_dtypes[1])?;
-        let boxes_in = make_input(&[1, 1, 4], coords.to_vec(), self.decoder_dtypes[2])?;
-        let embeddings = self.encoder.run(ort::inputs![&image])?;
-        // Same contract as the wasm arms' fixed_outputs: the positional
-        // indexing below must not index blind.
-        expect_outputs(&embeddings, 3, "SAM2 encoder")?;
-        let decoded = self.decoder.run(
-            ort::inputs![&points, &labels, &boxes_in, &embeddings[0], &embeddings[1], &embeddings[2]],
-        )?;
-        expect_outputs(&decoded, 3, "SAM2 decoder")?;
-        // ious first: only the argmax-IoU mask channel is used, so the
-        // [1, 1, C, mh, mw] output widens one mh·mw channel, not all C.
-        let (_, ious) = extract_f32(&decoded[0])?;
-        let (mask_dims, soft) =
-            extract_f32_with(&decoded[1], |shape, len| iou_channel(&ious, shape, len))?;
-        let (mh, mw) = (mask_dims[3] as u32, mask_dims[4] as u32);
-        Ok(mask_bytes(&soft, mw as usize, mh as usize, width, height))
-    }
 }
 
 /// The wasm backend: the encoder runs once per image and its outputs are
