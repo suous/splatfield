@@ -353,17 +353,14 @@ pub fn bits_for(max_exclusive: u32) -> u32 {
 /// count (SORT_WG / hardware plane size minimum). `None` selects the 4-bit
 /// fallback.
 ///
-/// Web is excluded by target, before any capability probe: cubecl's WGSL
-/// backend emits `subgroupBallot`/`subgroupShuffle` without the `enable
-/// subgroups;` directive (its feature pass only inserts f16), which every
-/// conforming browser validator rejects — and cubecl fabricates subgroup
-/// sizes (8..128) for WebGPU adapters that report none, so the probe below
-/// would wrongly pass. With the directive gap and non-universal browser
-/// subgroup support, the fallback is the only web path for now.
+/// No target gate: the probe self-selects on the web. cubecl 0.11 emits the
+/// `enable subgroups;` WGSL directive for plane ops on wasm and sets
+/// Plane::Ops only when the adapter has SUBGROUP — which wgpu 28's WebGPU
+/// backend never reports (native-only feature), and its fabricated 4..128
+/// subgroup sizes fail the plane_size_max check below anyway. The day wgpu
+/// maps the browser's subgroups feature, this path gets its first real
+/// browser exercise and needs a validation pass there.
 fn plane_sort_path(client: &Client) -> Option<u32> {
-    if cfg!(target_arch = "wasm32") {
-        return None;
-    }
     let props = client.properties();
     // Missing subgroup (plane) ops are covered by the 4-bit fallback
     // (plane ops proven on Apple Silicon/Metal3+).

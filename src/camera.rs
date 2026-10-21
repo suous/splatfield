@@ -1,5 +1,5 @@
 use eframe::egui::{self, CursorIcon, PointerButton, Response};
-use glam::{Affine3A, Quat, UVec2, Vec2, Vec3};
+use glam::{Affine3A, Quat, UVec2, Vec2, Vec3, Vec3Swizzles};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Camera {
@@ -74,9 +74,10 @@ pub(crate) fn guide_point(camera: &Camera, point: Vec3, img: UVec2) -> Option<Ve
     }
     let f = camera.focal(img);
     let c = img.as_vec2() * 0.5;
-    // Exact inverse of the (px + 0.5 − c)/f ray convention.
-    let uv = Vec2::new(q.x / q.z * f.x + c.x - 0.5, q.y / q.z * f.y + c.y - 0.5) / img.as_vec2();
-    (uv.x >= 0.0 && uv.x <= 1.0 && uv.y >= 0.0 && uv.y <= 1.0).then_some(uv)
+    // Exact inverse of the (px + 0.5 − c)/f ray convention. Lane-wise
+    // cmpge/cmple (not min/max_element, which would discard a NaN lane).
+    let uv = (q.xy() / q.z * f + c - 0.5) / img.as_vec2();
+    (uv.cmpge(Vec2::ZERO).all() && uv.cmple(Vec2::ONE).all()).then_some(uv)
 }
 
 pub struct Controller {
