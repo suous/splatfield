@@ -12,7 +12,7 @@
 //! host-tested.
 
 #[cfg(any(target_arch = "wasm32", test))]
-use anyhow::Result;
+use anyhow::{Context, Result};
 #[cfg(target_arch = "wasm32")]
 use tokenizers::Tokenizer;
 
@@ -150,11 +150,11 @@ fn decode_outputs(
 ) -> Result<Vec<Detection>> {
     let nq = *logits_dims
         .get(1)
-        .ok_or_else(|| anyhow::anyhow!("logits dims {logits_dims:?} lack a query axis"))?
+        .with_context(|| format!("logits dims {logits_dims:?} lack a query axis"))?
         as usize;
     let vocab = *logits_dims
         .get(2)
-        .ok_or_else(|| anyhow::anyhow!("logits dims {logits_dims:?} lack a token axis"))?
+        .with_context(|| format!("logits dims {logits_dims:?} lack a token axis"))?
         as usize;
     // The slices below stride by these dims — a buffer that disagrees is a
     // graph/export drift and must error, not slice blind (abort on wasm).

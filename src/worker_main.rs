@@ -344,28 +344,16 @@ mod wasm {
 
     /// One navigator.gpu adapter request: [`Ep::WebGpu`] iff an adapter
     /// resolves, wasm otherwise — a null adapter is a GPU the page cannot
-    /// use, the same fallback as no GPU at all. Every JS touch is guarded;
-    /// the probe's whole output defaults to [`Ep::Wasm`] (a wasm panic is
-    /// an abort, so nothing in here may unwind).
+    /// use, the same fallback as no GPU at all. The probe's whole output
+    /// defaults to [`Ep::Wasm`] (a wasm panic is an abort, so nothing in
+    /// here may unwind).
     async fn probe_webgpu() -> Ep {
         async {
-            let nav = js_sys::Reflect::get(&js_sys::global(), &"navigator".into())
-                .ok()?
-                .dyn_into::<js_sys::Object>()
+            let scope: DedicatedWorkerGlobalScope = js_sys::global().dyn_into().ok()?;
+            let adapter = JsFuture::from(scope.navigator().gpu().request_adapter())
+                .await
                 .ok()?;
-            let gpu = js_sys::Reflect::get(&nav, &"gpu".into()).ok()?;
-            if gpu.is_undefined() || gpu.is_null() {
-                return None;
-            }
-            let gpu = gpu.dyn_into::<js_sys::Object>().ok()?;
-            let request_adapter: js_sys::Function =
-                js_sys::Reflect::get(&gpu, &"requestAdapter".into())
-                    .ok()?
-                    .dyn_into()
-                    .ok()?;
-            let promise: js_sys::Promise = request_adapter.call0(&gpu).ok()?.into();
-            let adapter = JsFuture::from(promise).await.ok()?;
-            adapter.is_truthy().then_some(Ep::WebGpu)
+            (!adapter.is_empty()).then_some(Ep::WebGpu)
         }
         .await
         .unwrap_or(Ep::Wasm)

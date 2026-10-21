@@ -7,15 +7,15 @@ const STD: [f32; 3] = [0.229, 0.224, 0.225];
 /// f32 value is computed — the f16 closure fills the encoders' u16 bit
 /// buffer directly (the identity closure is the generic f32 path), so the
 /// intermediate f32 plane never has to exist.
-pub(crate) fn normalize_chw<T: Clone>(canvas: &[u8], into: impl Fn(f32) -> T) -> Vec<T> {
-    let n = canvas.len() / 3;
-    let mut image = vec![into(0.0); 3 * n];
-    for (i, px) in canvas.as_chunks::<3>().0.iter().enumerate() {
-        for c in 0..3 {
-            image[c * n + i] = into((px[c] as f32 / 255.0 - MEAN[c]) / STD[c]);
-        }
-    }
-    image
+pub(crate) fn normalize_chw<T>(canvas: &[u8], into: impl Fn(f32) -> T) -> Vec<T> {
+    let px = canvas.as_chunks::<3>().0;
+    let into = &into;
+    (0..3)
+        .flat_map(|c| {
+            px.iter()
+                .map(move |p| into((p[c] as f32 / 255.0 - MEAN[c]) / STD[c]))
+        })
+        .collect()
 }
 
 /// Bilinear resize, interleaved RGB u8 - the encoders' squashed canvas.

@@ -109,9 +109,7 @@ pub fn validate_scene_url(input: &str) -> Result<(String, String), String> {
         .or_else(|| lower.strip_prefix("http://"))
         .ok_or_else(err)?;
     let name = tail_name(&url[url.len() - rest.len()..]).ok_or_else(err)?;
-    if preflight_scene(name, None).is_err() {
-        return Err(err());
-    }
+    preflight_scene(name, None).map_err(|_| err())?;
     Ok((url.to_owned(), name.to_owned()))
 }
 
@@ -223,7 +221,9 @@ mod scene_source_tests {
             .0;
         for ext in super::SCENE_EXTENSIONS {
             assert!(
-                accept.split(',').any(|entry| entry == format!(".{ext}")),
+                accept
+                    .split(',')
+                    .any(|entry| entry.strip_prefix('.') == Some(ext)),
                 "{ext} is missing from #scene_picker"
             );
         }

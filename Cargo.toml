@@ -125,6 +125,11 @@ web-sys = { version = "0.3", features = [
     "DedicatedWorkerGlobalScope",
     "Navigator",
     "WorkerNavigator",
+    # worker_main.rs's EP probe: navigator.gpu.requestAdapter() — typed
+    # WebGPU bindings (unstable API: needs --cfg=web_sys_unstable_apis,
+    # set for the wasm target in .cargo/config.toml).
+    "Gpu",
+    "GpuAdapter",
     "StorageManager",
     "FileSystemDirectoryHandle",
     "FileSystemFileHandle",

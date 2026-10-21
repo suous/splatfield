@@ -56,28 +56,21 @@ fn localize_from(a: &[f32], b: &[f32], splats: &Splats) -> Option<ObjectLocaliza
     let n = splats.attributes.shape[0];
     let attr = &splats.positions;
 
-    let mut sw = 0f32;
-    let mut sum = Vec3::ZERO;
-    for i in 0..n {
-        if a[i] > b[i] {
-            let m = a[i] / (a[i] + b[i]);
-            sum += m * splat_position(attr, n, i);
-            sw += m;
-        }
-    }
+    // Foreground splats (a-dominant posteriors) weighted by m = a/(a+b).
+    let fg = |i: usize| (a[i] > b[i]).then(|| a[i] / (a[i] + b[i]));
+    let (sum, sw) = (0..n)
+        .filter_map(|i| fg(i).map(|m| (i, m)))
+        .fold((Vec3::ZERO, 0f32), |(sum, sw), (i, m)| {
+            (sum + m * splat_position(attr, n, i), sw + m)
+        });
     if sw <= 0.0 {
         return None;
     }
     let center = sum / sw;
 
-    let mut total = 0f32;
-    for i in 0..n {
-        if a[i] > b[i] {
-            let m = a[i] / (a[i] + b[i]);
-            let d = (splat_position(attr, n, i) - center).length();
-            total += m * d;
-        }
-    }
+    let total: f32 = (0..n)
+        .filter_map(|i| fg(i).map(|m| m * (splat_position(attr, n, i) - center).length()))
+        .sum();
     Some(ObjectLocalization {
         center,
         radius: total / sw,

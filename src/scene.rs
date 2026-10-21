@@ -109,11 +109,7 @@ impl Loaded {
     /// landing cut over a renumbered scene, and a box-select's tint lands
     /// in the cut's undo-level colors.
     pub(crate) fn drain_cut(&mut self) -> Option<CutStaged> {
-        let staged = self.cut.take();
-        if staged.is_some() {
-            self.cut_in_flight = false;
-        }
-        staged
+        self.cut.take().inspect(|_| self.cut_in_flight = false)
     }
 }
 
@@ -477,8 +473,10 @@ impl App {
         wasm_bindgen_futures::spawn_local(async move {
             let (pa, pb) = (a.read_vec_async().await, b.read_vec_async().await);
             let labels = map_labels(&pa, &pb);
-            let cut: Vec<usize> = (0..kept.len())
-                .filter_map(|i| (!labels[i]).then_some(kept[i]))
+            let cut: Vec<usize> = kept
+                .iter()
+                .zip(&labels)
+                .filter_map(|(&k, &l)| (!l).then_some(k))
                 .collect();
             let apply = if cut.is_empty() || cut.len() == kept.len() {
                 None

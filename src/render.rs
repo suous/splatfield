@@ -81,7 +81,7 @@ impl CpuSplats {
                         // guide_point yields pixel-index space; the drag rect is
                         // continuous, where pixel i spans [i, i+1).
                         let q = uv * pixel.as_vec2() + 0.5;
-                        (q.x >= min.x && q.x <= max.x && q.y >= min.y && q.y <= max.y).then_some(d)
+                        (q.cmpge(min).all() && q.cmple(max).all()).then_some(d)
                     })
             })
             .collect()
@@ -127,7 +127,7 @@ pub struct RenderScratch {
 /// Tile grid for `img_size`: `(bounds, count)`.
 fn tile_grid(img_size: glam::UVec2) -> (glam::UVec2, usize) {
     let bounds = img_size.map(|c| c.div_ceil(layout::TILE_WIDTH));
-    (bounds, (bounds.x * bounds.y) as usize)
+    (bounds, bounds.element_product() as usize)
 }
 
 impl RenderScratch {

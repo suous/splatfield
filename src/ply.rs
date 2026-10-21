@@ -249,10 +249,15 @@ mod tests {
         // `end_header` is followed by a newline before the binary data.
         let data_off = bytes.windows(10).position(|w| w == b"end_header").unwrap() + 11;
         let stride = 17;
-        let file = |i: usize, j: usize| {
-            let start = data_off + (i * stride + j) * 4;
-            f32::from_le_bytes(bytes[start..start + 4].try_into().unwrap())
-        };
+        // Hoisted LE decode: one pass over the record region instead of a
+        // per-element slice+try_into inside the closure.
+        let floats: Vec<f32> = bytes[data_off..]
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
+            .collect();
+        let file = |i: usize, j: usize| floats[i * stride + j];
 
         // Field-major attribute planes: [x | y | z | qw.. | sx.. | opacity],
         // plane k of splat i at attributes[k * n + i] (n = 3 here).

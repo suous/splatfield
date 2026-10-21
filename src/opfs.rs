@@ -76,18 +76,16 @@ pub fn validate(manifest: &CacheManifest) -> Result<()> {
         manifest.files.len(),
         REQUIRED_FILES.len(),
     );
+    let mut seen = std::collections::HashSet::new();
     for (name, size) in &manifest.files {
         anyhow::ensure!(
             REQUIRED_FILES.contains(&name.as_str()),
             "cache manifest lists {name}, which is not a release file",
         );
         anyhow::ensure!(*size > 0, "cache manifest lists {name} at 0 bytes");
-    }
-    for file in REQUIRED_FILES {
-        let count = manifest.files.iter().filter(|(n, _)| n == file).count();
         anyhow::ensure!(
-            count == 1,
-            "cache manifest lists {file} {count} times, expected exactly once",
+            seen.insert(name.as_str()),
+            "cache manifest lists {name} more than once, expected exactly once",
         );
     }
     Ok(())

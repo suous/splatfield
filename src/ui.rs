@@ -643,7 +643,7 @@ impl eframe::App for App {
                 );
                 let (min, max) = (a.min(b), a.max(b));
                 // Below ~2 px on both axes it's a stray click, not a box.
-                if max.x - min.x > 2.0 || max.y - min.y > 2.0 {
+                if (max - min).max_elem() > 2.0 {
                     self.select_in_rect(pixel, glam::vec2(min.x, min.y), glam::vec2(max.x, max.y));
                 }
             }

@@ -10,6 +10,8 @@
 //! [`crate::ModelStore`], caching the encoder outputs between decodes. The
 //! box scaling and mask bytes are platform-neutral and host-tested.
 
+#[cfg(target_arch = "wasm32")]
+use anyhow::Context;
 #[cfg(any(target_arch = "wasm32", test))]
 use anyhow::Result;
 
@@ -147,7 +149,7 @@ impl Sam2 {
         Ok(Self {
             pixel_dtype: *encoder_dtypes
                 .first()
-                .ok_or_else(|| anyhow::anyhow!("SAM2 encoder declares no inputs"))?,
+                .context("SAM2 encoder declares no inputs")?,
             encoder,
             decoder,
             decoder_dtypes,
@@ -172,10 +174,7 @@ impl Sam2 {
         width: u32,
         height: u32,
     ) -> Result<Vec<u8>> {
-        let (embeds, encoded) = self
-            .image
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("decode called before encode"))?;
+        let (embeds, encoded) = self.image.as_ref().context("decode called before encode")?;
         anyhow::ensure!(
             *encoded == (width, height),
             "decode frame {width}x{height} doesn't match the encoded {}x{}",

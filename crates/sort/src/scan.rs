@@ -267,7 +267,7 @@ fn scan_and_apply(client: &Client, n: u32, scratch: &ScanScratch, buf: &GpuTenso
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rand::{RngExt, SeedableRng};
+    use rand::{RngExt, SeedableRng, seq::SliceRandom};
 
     #[test]
     fn test_scan_gather_matches_cpu() {
@@ -277,10 +277,7 @@ mod tests {
             let counts: Vec<u32> = (0..n).map(|_| rng.random_range(0..20)).collect();
             // Random permutation as the gather indices.
             let mut gids: Vec<u32> = (0..n as u32).collect();
-            for i in (1..n).rev() {
-                let j = rng.random_range(0..=i);
-                gids.swap(i, j);
-            }
+            gids.shuffle(&mut rng);
             let gids_t = GpuTensor::from(&client, [n], &gids[..]);
             let counts_t = GpuTensor::from(&client, [n], &counts[..]);
             let offsets_t = GpuTensor::empty(&client, [n]);

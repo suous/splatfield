@@ -1,0 +1,4 @@
+# web-sys gates its WebGPU bindings (Navigator.gpu, Gpu.requestAdapter —
+# src/worker_main.rs's EP probe) behind the unstable-APIs cfg.
+[target.wasm32-unknown-unknown]
+rustflags = ["--cfg=web_sys_unstable_apis"]
