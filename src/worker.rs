@@ -346,7 +346,7 @@ impl App {
         let cancel = Arc::new(AtomicBool::new(false));
         self.seg.cancel = Some(cancel.clone());
         let mut cam = self.controller.camera;
-        cam.fov = glam::Vec2::splat(cam.fov.x.min(cam.fov.y));
+        cam.fov = glam::Vec2::splat(cam.fov.min_element());
         let iterations = self.seg.iters;
         self.seg.posterior = None;
         // Display color → SH DC coefficient.

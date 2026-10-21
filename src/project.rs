@@ -389,7 +389,7 @@ fn sh_to_rgb(chs: u32, dir: Vec3F, splat: u32, n: u32, shs: &[f32]) -> (f32, f32
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cubecl::calculate_cube_count_elemwise;
+    use cubecl::prelude::CubeCount;
     use splat_sort::tensor::GpuTensor;
 
     const SENTINEL: u32 = 0xDEAD_BEEF;
@@ -412,7 +412,7 @@ mod tests {
 
         project_splats::launch(
             &client,
-            calculate_cube_count_elemwise(&client, 1, CubeDim::new_1d(crate::layout::ELEM_WG)),
+            CubeCount::new_single(),
             CubeDim::new_1d(crate::layout::ELEM_WG),
             CameraViewLaunch::for_camera(
                 &crate::camera::Camera::default(),

@@ -39,9 +39,7 @@ impl CacheManifest {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self> {
-        let (manifest, _) = bincode::serde::decode_from_slice(bytes, crate::pipeline::config())
-            .context("decoding the cache manifest")?;
-        Ok(manifest)
+        crate::pipeline::decode(bytes).context("decoding the cache manifest")
     }
 }
 

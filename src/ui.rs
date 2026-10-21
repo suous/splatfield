@@ -321,18 +321,11 @@ impl App {
             const ROW_H: f32 = 32.0;
             let button_w = 116.0;
             let edit_w = ui.available_width() - button_w - ui.spacing().item_spacing.x;
-            // TextEdit's builder min_size only binds the WIDTH (the height
-            // derives from the text's line height plus the text margin), so
-            // pad the margin from the measured line height up to the row
-            // height — matching the download button exactly.
-            let line_h =
-                ui.text_style_height(&egui::TextStyle::Body) + ui.spacing().extra_text_line_spacing;
-            let pad_y = ((ROW_H - line_h) / 2.0).round().max(2.0) as i8;
+            // Pin the row to the download button's height.
             let edit = ui.add(
                 egui::TextEdit::singleline(&mut self.landing_url)
                     .hint_text("https://example.com/model.ply")
-                    .desired_width(edit_w)
-                    .margin(egui::Margin::symmetric(8, pad_y)),
+                    .min_size(egui::vec2(edit_w, ROW_H)),
             );
             // The button evaluates FIRST and unconditionally: `|` binds
             // tighter than `&&`, so `lost_focus && enter | button` would

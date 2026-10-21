@@ -84,7 +84,7 @@ pub(crate) fn config() -> impl bincode::config::Config {
     bincode::config::legacy()
 }
 
-fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+pub(crate) fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
     let (value, _) = bincode::serde::decode_from_slice(bytes, config())?;
     Ok(value)
 }

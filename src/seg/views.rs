@@ -11,7 +11,7 @@
 
 use super::beta::BetaState;
 use crate::render::{Splats, splat_position};
-use glam::Vec3;
+use glam::{Vec2, Vec3};
 
 /// Where the object is, per the current posterior.
 #[derive(Debug, Clone, Copy)]
@@ -106,7 +106,7 @@ pub(crate) fn candidates(
             let z = 1.0 - 2.0 * (k as f32 + 0.5) / count as f32;
             let r = (1.0 - z * z).sqrt();
             let theta = 2.0 * core::f32::consts::PI * golden * k as f32;
-            let dir = Vec3::new(r * theta.cos(), r * theta.sin(), z);
+            let dir = (Vec2::from_angle(theta) * r).extend(z);
             let position = localization.center + dist * dir;
             crate::camera::Camera::look_at(position, localization.center)
         })

@@ -56,26 +56,16 @@ fn parse(raw: &str) -> Settings {
 /// see its hazard note).
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn load() -> Settings {
-    local_storage()
-        .and_then(|s| s.get_item(KEY).ok().flatten())
-        .map_or_default(|raw| parse(&raw))
+    eframe::web::storage::local_storage_get(KEY).map_or_default(|raw| parse(&raw))
 }
 
-/// Best-effort write on change: errors ignored — private-mode browsers must
-/// not break the UI over a preference. Encode can't fail for two plain
-/// fields, but the guard keeps the write honest anyway.
+/// Best-effort write on change: eframe logs and drops storage errors, so
+/// denied storage can't break the UI over a preference.
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn save(s: &Settings) {
-    if let (Some(storage), Ok(json)) = (local_storage(), serde_json::to_string(s)) {
-        let _ = storage.set_item(KEY, &json);
+    if let Ok(json) = serde_json::to_string(s) {
+        eframe::web::storage::local_storage_set(KEY, &json);
     }
-}
-
-/// `window().local_storage()`, flattened: `None` on a no-window build or a
-/// storage the browser refuses to hand out.
-#[cfg(target_arch = "wasm32")]
-fn local_storage() -> Option<web_sys::Storage> {
-    web_sys::window().and_then(|w| w.local_storage().ok().flatten())
 }
 
 #[cfg(test)]

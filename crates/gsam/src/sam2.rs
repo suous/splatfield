@@ -22,7 +22,7 @@ use crate::{
     input_dtypes, make_input, sam_file, session,
 };
 #[cfg(not(target_arch = "wasm32"))]
-use ort::session::{Session, SessionInputValue, builder::GraphOptimizationLevel};
+use ort::session::{Session, builder::GraphOptimizationLevel};
 #[cfg(not(target_arch = "wasm32"))]
 use ort::value::TensorElementType as TE;
 
@@ -145,18 +145,13 @@ impl Sam2 {
         let points = make_input(&[1, 1, 1, 2], vec![0.0, 0.0], self.decoder_dtypes[0])?;
         let labels = make_input(&[1, 1, 1], vec![-1.0], self.decoder_dtypes[1])?;
         let boxes_in = make_input(&[1, 1, 4], coords.to_vec(), self.decoder_dtypes[2])?;
-        let embeddings = self.encoder.run([SessionInputValue::from(&image)])?;
+        let embeddings = self.encoder.run(ort::inputs![&image])?;
         // Same contract as the wasm arms' fixed_outputs: the positional
         // indexing below must not index blind.
         expect_outputs(&embeddings, 3, "SAM2 encoder")?;
-        let decoded = self.decoder.run([
-            SessionInputValue::from(&points),
-            SessionInputValue::from(&labels),
-            SessionInputValue::from(&boxes_in),
-            SessionInputValue::from(&embeddings[0]),
-            SessionInputValue::from(&embeddings[1]),
-            SessionInputValue::from(&embeddings[2]),
-        ])?;
+        let decoded = self.decoder.run(
+            ort::inputs![&points, &labels, &boxes_in, &embeddings[0], &embeddings[1], &embeddings[2]],
+        )?;
         expect_outputs(&decoded, 3, "SAM2 decoder")?;
         // ious first: only the argmax-IoU mask channel is used, so the
         // [1, 1, C, mh, mw] output widens one mh·mw channel, not all C.
